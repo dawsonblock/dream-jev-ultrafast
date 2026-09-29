@@ -11,7 +11,7 @@
 Give it one goal. A finite-choice decision backend picks an operation and an observed element. A small LLM writes text only when the operation is `TYPE_TEXT`. The default backend remains TypeSafe SystemOne/Jev, and any compatible endpoint or injected `DecisionBackend` can be used.
 
 > [!NOTE]
-> **v0.4 hardens DREAM-Jev into a qualification control plane.** v0.2's isolated-world browser executor remains fixed and v0.3's bounded replay policy remains the only self-improvable surface. v0.4 adds cross-process hash-chain serialization, replay-evidence binding, train/validation/holdout candidate selection, matched live-canary evidence, latency/action/token regression gates, policy lineage checks, suspension, health monitoring, and rollback. A replay winner still cannot activate itself.
+> **v0.4 hardens DREAM-Jev into a qualification control plane.** v0.2's isolated-world browser executor remains fixed and v0.3's bounded replay policy remains the only self-improvable surface. v0.4 adds cross-process hash-chain and policy-registry serialization, replay-evidence binding, train/validation/holdout candidate selection, matched live-canary evidence bound to post-staging runs and the staged parent digest, latency/action/token regression gates, policy lineage checks, suspension, health monitoring, and rollback. A replay winner still cannot activate itself.
 
 **Zürich → London on Google Flights in 7.1 seconds.** One natural-language goal, actual text generation, and loading waits included.
 
@@ -56,8 +56,8 @@ There are no site-specific action scripts or prepared field strings in the polic
 ## Try it
 
 ```bash
-git clone https://github.com/browser-use/jev-ultrafast.git
-cd jev-ultrafast
+git clone https://github.com/dawsonblock/dream-jev-ultrafast.git
+cd dream-jev-ultrafast
 uv sync
 cp .env.example .env
 # Add TYPESAFE_API_KEY and TEXT_MODEL_API_KEY.
@@ -70,7 +70,7 @@ Chrome connects through [Browser Harness](https://github.com/browser-use/browser
 
 `TEXT_MODEL_API_KEY` is an OpenRouter key in the example configuration. The current example uses `inception/mercury-2.5` with reasoning disabled. Gemini, GLM, and DeepSeek can also use the OpenAI-compatible text helper. The finite-choice backend can be redirected with `JEV_DECISION_BASE_URL`, `JEV_DECISION_API_KEY`, and `JEV_DECISION_MODEL`, or replaced in-process through the `decision_backend=` argument.
 
-`JEV_MODEL_PRIVACY=basic` is the default. It bounds serialized strings and redacts incidental email addresses, card/account-like long numbers, API-secret patterns, and values from obviously sensitive fields before page observations are sent to a model. This is a useful reduction layer, not a complete DLP system.
+`JEV_MODEL_PRIVACY=basic` is the default. It bounds serialized strings and redacts incidental email addresses, card/account-like long numbers, API-secret patterns, common credential query parameters (API keys, access/refresh/ID tokens, client secrets, session and CSRF values), and values from obviously sensitive fields before page observations are sent to a model. This is a useful reduction layer, not a complete DLP system.
 
 ## Use the library
 
@@ -128,7 +128,7 @@ uv run jev-dream improve .jev/experience.jsonl \
   --stage
 ```
 
-The old v0.3 command form (`jev-dream EXPERIENCE ...`) still maps to `improve`. Staging is not activation. Run matched baseline/candidate canaries, then promote from the same hash-verified trace store:
+The old v0.3 command form (`jev-dream EXPERIENCE ...`) still maps to `improve`. Staging is not activation. Run matched baseline/candidate canaries, then promote from the same hash-verified trace store. Only candidate runs recorded after staging count toward promotion, and the paired baseline digest must match the staged policy's parent digest:
 
 ```bash
 uv run jev-dream verify .jev/experience.jsonl
@@ -136,7 +136,7 @@ uv run jev-dream promote .jev/experience.jsonl --registry .jev/policy-registry.j
 uv run jev-dream health .jev/experience.jsonl --registry .jev/policy-registry.json --recent-tasks 20
 ```
 
-Default activation gates require at least 12 baseline and 12 candidate canary tasks across at least four candidate task families, at least four paired task families, no verified-success/risk regression, and no more than 25% live regression in average latency, action count, or token use. A failing active policy can be suspended so `Agent(policy_registry=...)` falls back to the baseline policy, and prior active policies can be restored with `jev-dream rollback`. Replay never fabricates a browser/model counterfactual: it follows the action actually recorded only if the proposed candidate-allocation policy would still have offered that action; otherwise the trajectory ends as a coverage miss. See [DREAM-Jev design](docs/dream-rsi-integration.md).
+Default activation gates require at least 12 baseline and 12 candidate canary tasks across at least four candidate task families, at least four paired task families, no verified-success/risk regression, and no more than 25% live regression in average latency, action count, or token use. Runs abandoned before a terminal decision (`aborted`) do not count as task outcomes. A failing active policy can be suspended so `Agent(policy_registry=...)` falls back to the baseline policy, and prior active policies can be restored with `jev-dream rollback`. Replay never fabricates a browser/model counterfactual: it follows the action actually recorded only if the proposed candidate-allocation policy would still have offered that action; otherwise the trajectory ends as a coverage miss. See [DREAM-Jev design](docs/dream-rsi-integration.md).
 
 ## Why it moves
 
