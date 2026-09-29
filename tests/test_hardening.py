@@ -205,3 +205,69 @@ def test_model_url_redacts_sensitive_query_values(monkeypatch):
     assert "abc123" not in clean
     assert "dawson%40example.com" not in clean and "dawson@example.com" not in clean
     assert "city=Zurich" in clean
+
+
+@pytest.mark.parametrize("param", [
+    "api_key", "apikey", "access_key", "access_token", "refresh_token", "id_token",
+    "client_secret", "private_key", "session_id", "csrf", "xsrf", "jwt", "otp", "passwd",
+])
+def test_common_sensitive_query_names_are_redacted(monkeypatch, param):
+    monkeypatch.setenv("JEV_MODEL_PRIVACY", "basic")
+    clean = sanitize_url(f"https://example.test/cb?{param}=s3cr3tv4lu3&city=Zurich")
+    assert "s3cr3tv4lu3" not in clean
+    assert "city=Zurich" in clean
+
+
+@pytest.mark.parametrize("error", [
+    "stale-page", "stale-target", "unavailable", "offscreen",
+    "covered", "readonly", "unsupported-select", "stale-option",
+])
+def test_select_premutation_errors_reobserve_instead_of_aborting(monkeypatch, error):
+    # The guarded script returns these errors before its single mutation statement,
+    # so re-observing is safe: no dropdown value could have been written.
+    cdp = Mock(return_value={"result": {"value": {"error": error}}})
+    monkeypatch.setattr(browser, "cdp", cdp)
+    with pytest.raises(StalePage):
+        browser_operation({
+            "operation": "act",
+            "session": "test",
+            "expected": {"page_key": [1], "guard": [1]},
+            "action": {
+                "id": "e1", "kind": "select", "node": 1, "value": "Design",
+                "option_index": 1, "option_label": "Design",
+            },
+        })
+    assert cdp.call_count == 1
+
+
+def test_verifier_internal_typeerror_is_not_retried_as_one_argument():
+    calls = []
+
+    def verifier(_page, _snapshot):
+        calls.append(True)
+        raise TypeError("internal verifier bug")
+
+    a = terminal_runner(verifier=verifier)
+    with pytest.raises(TypeError, match="internal verifier bug"):
+        a.command("act", {"fingerprint": a.state["page"]["fingerprint"]})
+    assert len(calls) == 1
+
+
+def test_verifier_signature_dispatch_covers_supported_shapes():
+    def two(_page, _snapshot):
+        return {"passed": True}
+
+    def optional(_page, _snapshot=None):
+        return {"passed": True}
+
+    def variadic(*args):
+        assert len(args) == 2
+        return {"passed": True}
+
+    def one(_page):
+        return True
+
+    for verifier in (two, optional, variadic, one):
+        a = terminal_runner(verifier=verifier)
+        state = a.command("act", {"fingerprint": a.state["page"]["fingerprint"]})
+        assert state["status"] == "done"

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from .dream import ExperienceStore, candidate_catalog_digest, new_run_id, summarize_usage, task_key
-from .privacy import redact_text, sanitize_action, sanitize_url
+from .privacy import redact_text, sanitize_action, sanitize_url, tokenize
+
+_RESERVED_EVENT_KEYS = {"run_id", "task_key", "sequence"}
 
 
 class DreamTraceRecorder:
@@ -17,6 +19,8 @@ class DreamTraceRecorder:
         self.finished = False
 
     def _append(self, event: dict):
+        if _RESERVED_EVENT_KEYS & event.keys():
+            raise ValueError(f"Trace event cannot set reserved keys: {sorted(_RESERVED_EVENT_KEYS & event.keys())}")
         self.sequence += 1
         self.store.append({
             "run_id": self.run_id,
@@ -51,7 +55,7 @@ class DreamTraceRecorder:
     ):
         selected = sanitize_action(action)
         compact_candidates = []
-        goal_tokens = set(_tokens(self.goal))
+        goal_tokens = set(tokenize(self.goal))
         for candidate in candidates:
             clean = sanitize_action(candidate)
             searchable = " ".join(str(clean.get(k, "")) for k in ("label", "value", "current_value", "option_label"))
@@ -60,7 +64,7 @@ class DreamTraceRecorder:
                 "kind": candidate.get("kind"),
                 "label": clean.get("label", ""),
                 "value": clean.get("value", clean.get("current_value", "")),
-                "goal_overlap": len(goal_tokens & set(_tokens(searchable))),
+                "goal_overlap": len(goal_tokens & set(tokenize(searchable))),
             })
         selected_rank = next(
             (index for index, candidate in enumerate(compact_candidates) if candidate.get("id") == action.get("id")),
@@ -95,19 +99,3 @@ class DreamTraceRecorder:
             return
         self.finished = True
         self._append({"event": "run_finished", "status": status, "verified": bool(verified)})
-
-
-def _tokens(value: str):
-    current = []
-    for char in value.lower():
-        if char.isalnum():
-            current.append(char)
-        elif current:
-            word = "".join(current)
-            if len(word) >= 2:
-                yield word
-            current = []
-    if current:
-        word = "".join(current)
-        if len(word) >= 2:
-            yield word

@@ -10,13 +10,33 @@ _EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 _CARD = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
 _API_SECRET = re.compile(r"\b(?:sk|pk|api|token)[-_][A-Za-z0-9_-]{16,}\b", re.I)
 _SENSITIVE_QUERY = re.compile(
-    r"^(?:access_?token|token|auth|authorization|code|key|password|secret|session|sig|signature)$", re.I
+    r"^(?:access_?token|refresh_?token|id_?token|token|auth(?:entication|orization)?|code|"
+    r"api_?key|apikey|access_?key|client_?secret|private_?key|secret(?:_?key)?|key|"
+    r"pass(?:word|wd)|pwd|session(?:_?id)?|sig(?:nature)?|jwt|bearer|csrf|xsrf|otp|totp|ssn)$",
+    re.I,
 )
 _SENSITIVE_LABEL = re.compile(
     r"\b(password|passcode|secret|api key|access token|credit card|card number|cvv|cvc|"
     r"social security|\bsin\b|routing number|bank account|account number)\b",
     re.I,
 )
+
+
+def tokenize(value):
+    """Shared Unicode-aware tokenization for candidate scoring and trace evidence."""
+    token = []
+    for char in str(value).lower():
+        if char.isalnum():
+            token.append(char)
+        elif token:
+            joined = "".join(token)
+            if len(joined) >= 2:
+                yield joined
+            token = []
+    if token:
+        joined = "".join(token)
+        if len(joined) >= 2:
+            yield joined
 
 
 def _mode():

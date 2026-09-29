@@ -201,8 +201,8 @@ def test_canary_gate_requires_real_verified_success():
     gate = CanaryGate(min_tasks=3, min_baseline_tasks=3)
     baseline = CanaryMetrics(tasks=3, verified_successes=2)
     assert not gate.assess(baseline, CanaryMetrics(tasks=2, verified_successes=2)).approved
-    assert not gate.assess(baseline, CanaryMetrics(tasks=3, verified_successes=0)).approved
-    assert gate.assess(baseline, CanaryMetrics(tasks=3, verified_successes=3)).approved
+    assert not gate.assess(baseline, CanaryMetrics(tasks=3, verified_successes=0, task_families=4)).approved
+    assert gate.assess(baseline, CanaryMetrics(tasks=3, verified_successes=3, task_families=4)).approved
 
 
 def test_policy_registry_requires_replay_then_canary(tmp_path):
@@ -445,6 +445,200 @@ def test_registry_rollback_restores_prior_active_policy(tmp_path):
     restored = registry.rollback(first["digest"])
     assert restored["digest"] == first["digest"]
     assert registry.active_policy().digest == first["digest"]
+
+
+def test_canary_gate_rejects_zero_task_families():
+    gate = CanaryGate(min_tasks=3, min_baseline_tasks=3)
+    baseline = CanaryMetrics(tasks=3, verified_successes=3, task_families=4)
+    candidate = CanaryMetrics(tasks=3, verified_successes=3, task_families=0)
+    decision = gate.assess(baseline, candidate)
+    assert not decision.approved
+    assert "task families" in decision.reason
+
+
+def test_experience_store_rejects_reserved_event_keys(tmp_path):
+    store = ExperienceStore(tmp_path / "reserved.jsonl")
+    for key in ("schema", "tcb_version", "recorded_at_ms", "prev_hash", "event_hash"):
+        with pytest.raises(ValueError, match="reserved"):
+            store.append({"run_id": "x", "event": "a", key: "spoof"})
+    assert store.load() == []
+
+
+def test_trace_recorder_rejects_reserved_payload_keys(tmp_path):
+    store = ExperienceStore(tmp_path / "trace-reserved.jsonl")
+    recorder = DreamTraceRecorder(store, goal="goal")
+    for key in ("run_id", "task_key", "sequence"):
+        with pytest.raises(ValueError, match="reserved"):
+            recorder.event("policy_denied", **{key: "spoof"})
+    assert store.load() == []
+
+
+def test_aborted_runs_do_not_count_as_canary_outcomes(tmp_path):
+    store = ExperienceStore(tmp_path / "aborted.jsonl")
+    transition = [{
+        "state": "S", "next_state": "D", "selected": {"id": "go", "kind": "click"},
+        "candidates": [{"id": "go", "kind": "click", "label": "Go", "goal_overlap": 1}],
+        "page_changed": True, "latency_ms": 10, "model_calls": 1, "tokens": 5,
+        "stale_or_failure": 0, "risk_events": 0,
+    }]
+    policy = ExplorationPolicy()
+    _append_run(store, "abandoned", "goal", transition, status="aborted", verified=False, policy=policy)
+    _append_run(store, "blocked-run", "goal", transition, status="blocked", verified=False, policy=policy)
+    metrics = CanaryMetrics.from_events(store.load(), policy.digest)
+    assert metrics.tasks == 1
+    assert metrics.run_ids == ("blocked-run",)
+
+
+def test_candidate_runs_before_the_bound_time_do_not_count(tmp_path):
+    baseline = ExplorationPolicy()
+    candidate = ExplorationPolicy(name="candidate", version=2, model_action_limit=218)
+    store = _canary_pair_store(tmp_path, baseline, candidate)
+    events = store.load()
+    future = max(event["recorded_at_ms"] for event in events) + 1
+    evidence = CanaryEvidence.from_events(
+        events, baseline.digest, candidate.digest, candidate_since_ms=future,
+    )
+    assert evidence.candidate.tasks == 0
+    # Baseline evidence is intentionally unbounded below: the baseline has been live.
+    assert evidence.baseline.tasks == 12
+
+
+def test_promotion_binds_candidate_evidence_to_staging_time(tmp_path, monkeypatch):
+    import jev_ultrafast.dream as dream_module
+
+    worlds = _efficiency_world(tmp_path)
+    baseline = ExplorationPolicy()
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(worlds, baseline)
+
+    class Clock:
+        t = 100.0
+
+        @staticmethod
+        def time():
+            return Clock.t
+
+    monkeypatch.setattr(dream_module, "time", Clock)
+    store = ExperienceStore(tmp_path / "temporal.jsonl")
+    transition = [{
+        "state": "S", "next_state": "D", "selected": {"id": "go", "kind": "click"},
+        "candidates": [{"id": "go", "kind": "click", "label": "Go", "goal_overlap": 1}],
+        "page_changed": True, "latency_ms": 10, "model_calls": 1, "tokens": 5,
+        "stale_or_failure": 0, "risk_events": 0,
+    }]
+    # Baseline and an identical candidate policy ran before this candidate was staged.
+    _append_run(store, "b1", "goal", transition, status="done", verified=True, policy=baseline)
+    _append_run(store, "pre-stage", "goal", transition, status="done", verified=True, policy=report.selected)
+    Clock.t = 200.0
+    registry = PolicyRegistry(tmp_path / "temporal-policy.json")
+    registry.stage(report)
+    Clock.t = 300.0
+    _append_run(store, "post-stage", "goal", transition, status="done", verified=True, policy=report.selected)
+    permissive = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=1,
+        min_paired_task_families=1, min_pair_coverage=0.0,
+    )
+    active = registry.promote_from_store(store, gate=permissive)
+    assert active["canary"]["baseline"]["tasks"] == 1
+    assert active["canary"]["candidate"]["tasks"] == 1
+    assert tuple(active["canary"]["candidate"]["run_ids"]) == ("post-stage",)
+
+
+def test_promotion_rejects_baseline_digest_mismatch(tmp_path):
+    worlds = _efficiency_world(tmp_path)
+    baseline = ExplorationPolicy()
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(worlds, baseline)
+    registry = PolicyRegistry(tmp_path / "mismatch-policy.json")
+    registry.stage(report)
+    store = _canary_pair_store(tmp_path, baseline, report.selected)
+    with pytest.raises(ValueError, match="parent digest"):
+        registry.promote_from_store(store, baseline_policy_digest=report.selected.digest)
+
+
+def test_promote_bound_rejects_unbound_evidence_digests(tmp_path):
+    worlds = _efficiency_world(tmp_path)
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(worlds, ExplorationPolicy())
+    registry = PolicyRegistry(tmp_path / "digest-policy.json")
+    staged = registry.stage(report)
+    permissive = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=0, min_paired_task_families=0,
+    )
+    metrics = CanaryMetrics(12, 12, task_families=4)
+    evidence = CanaryEvidence(
+        baseline=metrics, candidate=metrics,
+        paired_task_families=4, candidate_wins=0, baseline_wins=0, ties=4,
+        event_head_hash="0" * 64, evidence_digest="0" * 64,
+        baseline_digest=staged["parent_digest"], candidate_digest="f" * 64,
+    )
+    with pytest.raises(ValueError, match="staged policy digest"):
+        registry._promote_bound(evidence, permissive)
+    evidence = CanaryEvidence(
+        baseline=metrics, candidate=metrics,
+        paired_task_families=4, candidate_wins=0, baseline_wins=0, ties=4,
+        event_head_hash="0" * 64, evidence_digest="0" * 64,
+        baseline_digest="f" * 64, candidate_digest=staged["digest"],
+    )
+    with pytest.raises(ValueError, match="parent digest"):
+        registry._promote_bound(evidence, permissive)
+
+
+def _registry_concurrent_worker(path, rounds):
+    registry = PolicyRegistry(path)
+    for index in range(rounds):
+        registry.suspend(f"drift {index}")
+        registry.resume()
+
+
+def test_policy_registry_serializes_concurrent_writers(tmp_path):
+    worlds = _efficiency_world(tmp_path)
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(worlds, ExplorationPolicy())
+    path = str(tmp_path / "locked-policy.json")
+    registry = PolicyRegistry(path)
+    registry.stage(report)
+    permissive = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=0, min_paired_task_families=0,
+    )
+    registry.promote(
+        CanaryMetrics(1, 1), CanaryMetrics(1, 1), gate=permissive, allow_unbound_metrics=True,
+    )
+    base_revision = registry.load()["revision"]
+    context = multiprocessing.get_context("spawn")
+    workers = [
+        context.Process(target=_registry_concurrent_worker, args=(path, 5))
+        for _ in range(3)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(30)
+        assert worker.exitcode == 0
+    payload = registry.load()
+    # Every suspend/resume pair must survive: lost updates would shrink the revision.
+    assert payload["revision"] == base_revision + 30
+    assert payload["active"]["suspended"] is False
+
+
+def test_tokenizer_is_consistent_across_scoring_and_trace(tmp_path):
+    from jev_ultrafast.model import _candidate_score, _goal_tokens
+    from jev_ultrafast.privacy import tokenize
+
+    goal = "Find the Gödel numbering paper"
+    goal_tokens = _goal_tokens(goal)
+    assert "gödel" in goal_tokens
+    action = {"id": "a", "kind": "click", "label": "Gödel numbering", "node": 1}
+    overlap = len(goal_tokens & set(tokenize(action["label"])))
+    assert overlap == 2
+    policy = ExplorationPolicy()
+    # Default parameters: policy path and baseline path must score identically.
+    assert _candidate_score(action, goal_tokens, 0) == policy.candidate_score(action, goal_tokens, 0)
+    store = ExperienceStore(tmp_path / "tokens.jsonl")
+    recorder = DreamTraceRecorder(store, goal=goal)
+    recorder.start({"fingerprint": "A", "url": "https://example.test"}, policy)
+    recorder.transition(
+        before={"fingerprint": "A"}, after={"fingerprint": "B"},
+        action=action, decision={"latency_ms": 1, "usage": {}}, candidates=[action],
+    )
+    event = next(item for item in store.load() if item["event"] == "transition")
+    assert event["candidates"][0]["goal_overlap"] == overlap
 
 
 def test_health_gate_can_suspend_drifted_active_policy(tmp_path):

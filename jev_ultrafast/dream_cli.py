@@ -34,7 +34,7 @@ def build_parser():
     promote.add_argument("--registry", required=True)
     promote.add_argument(
         "--baseline-digest",
-        help="Override the baseline policy digest used for paired canary evidence",
+        help="Explicit baseline policy digest; must match the staged policy parent digest",
     )
 
     status = sub.add_parser("status", help="Show registry state")

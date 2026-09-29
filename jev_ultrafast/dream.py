@@ -21,6 +21,8 @@ from pathlib import Path
 from statistics import fmean
 from typing import Iterable
 
+from .privacy import tokenize
+
 SCHEMA_VERSION = "jev-dream/2"
 SUPPORTED_SCHEMAS = {"jev-dream/1", SCHEMA_VERSION}
 TCB_VERSION = "jev-ultrafast-tcb/0.4"
@@ -30,6 +32,35 @@ ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
 
 def _stable_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+@contextmanager
+def _file_lock(lock_path: Path):
+    """Cross-process advisory lock shared by the experience store and the registry."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def task_key(goal: str) -> str:
@@ -104,7 +135,7 @@ class ExplorationPolicy:
         searchable = " ".join(
             str(action.get(k, "")) for k in ("label", "value", "current_value", "option_label")
         ).lower()
-        tokens = set(_tokenize(searchable))
+        tokens = set(tokenize(searchable))
         overlap = len(goal_tokens & tokens)
         bonus = {
             "fill": self.fill_bonus,
@@ -135,22 +166,6 @@ class ExplorationPolicy:
     def digest(self) -> str:
         encoded = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
         return _stable_hash(encoded)
-
-
-def _tokenize(value: str):
-    token = []
-    for char in value.lower():
-        if char.isalnum():
-            token.append(char)
-        elif token:
-            joined = "".join(token)
-            if len(joined) >= 2:
-                yield joined
-            token = []
-    if token:
-        joined = "".join(token)
-        if len(joined) >= 2:
-            yield joined
 
 
 @dataclass(frozen=True)
@@ -214,33 +229,6 @@ class ExperienceStore:
         material = {k: v for k, v in payload.items() if k != "event_hash"}
         return _stable_hash(json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
-    @contextmanager
-    def _process_lock(self):
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock_path.open("a+b") as handle:
-            if os.name == "nt":
-                import msvcrt
-
-                handle.seek(0, os.SEEK_END)
-                if handle.tell() == 0:
-                    handle.write(b"\0")
-                    handle.flush()
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                try:
-                    yield
-                finally:
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
     def _tail_event_unlocked(self) -> dict | None:
         if not self.path.exists() or self.path.stat().st_size == 0:
             return None
@@ -263,8 +251,14 @@ class ExperienceStore:
                         raise ValueError("Invalid DREAM event JSON at store tail") from exc
         return None
 
+    _RESERVED_EVENT_KEYS = {"schema", "tcb_version", "recorded_at_ms", "prev_hash", "event_hash"}
+
     def append(self, event: dict) -> dict:
-        with self._lock, self._process_lock():
+        if self._RESERVED_EVENT_KEYS & event.keys():
+            raise ValueError(
+                f"DREAM event cannot set reserved chain keys: {sorted(self._RESERVED_EVENT_KEYS & event.keys())}"
+            )
+        with self._lock, _file_lock(self.lock_path):
             tail = self._tail_event_unlocked()
             if tail:
                 if tail.get("schema") not in SUPPORTED_SCHEMAS or tail.get("tcb_version") not in SUPPORTED_TCB_VERSIONS:
@@ -313,7 +307,7 @@ class ExperienceStore:
         return events
 
     def load(self) -> list[dict]:
-        with self._lock, self._process_lock():
+        with self._lock, _file_lock(self.lock_path):
             return self._load_unlocked()
 
     def verify(self) -> dict:
@@ -1001,8 +995,9 @@ class CanaryMetrics:
         policy_digest: str,
         *,
         max_runs: int | None = None,
+        since_ms: int | None = None,
     ) -> "CanaryMetrics":
-        runs = _canary_run_summaries(events, policy_digest)
+        runs = _canary_run_summaries(events, policy_digest, since_ms=since_ms)
         if max_runs is not None:
             runs = runs[-max(0, int(max_runs)) :]
         return _metrics_from_canary_runs(runs)
@@ -1023,7 +1018,9 @@ class CanaryRunSummary:
 
 
 
-def _canary_run_summaries(events: Iterable[dict], policy_digest: str) -> list[CanaryRunSummary]:
+def _canary_run_summaries(
+    events: Iterable[dict], policy_digest: str, *, since_ms: int | None = None
+) -> list[CanaryRunSummary]:
     grouped: dict[str, list[dict]] = defaultdict(list)
     for event in events:
         if event.get("run_id"):
@@ -1035,7 +1032,11 @@ def _canary_run_summaries(events: Iterable[dict], policy_digest: str) -> list[Ca
         if not start or start.get("policy_digest") != policy_digest:
             continue
         final = next((e for e in reversed(run_events) if e.get("event") == "run_finished"), None)
-        if not final:
+        # Runs abandoned before a terminal decision are not task outcomes.
+        if not final or final.get("status") == "aborted":
+            continue
+        finished_at_ms = max(int(final.get("recorded_at_ms", 0)), int(start.get("recorded_at_ms", 0)))
+        if since_ms is not None and finished_at_ms < since_ms:
             continue
         risk = latency = actions = model_calls = tokens = offered = 0
         for event in run_events:
@@ -1056,7 +1057,7 @@ def _canary_run_summaries(events: Iterable[dict], policy_digest: str) -> list[Ca
             model_calls=model_calls,
             tokens=tokens,
             offered_candidates=offered,
-            finished_at_ms=max(int(final.get("recorded_at_ms", 0)), int(start.get("recorded_at_ms", 0))),
+            finished_at_ms=finished_at_ms,
         ))
     summaries.sort(key=lambda run: (run.finished_at_ms, run.run_id))
     return summaries
@@ -1093,12 +1094,21 @@ class CanaryEvidence:
     ties: int
     event_head_hash: str
     evidence_digest: str
+    baseline_digest: str = ""
+    candidate_digest: str = ""
 
     @classmethod
-    def from_events(cls, events: Iterable[dict], baseline_digest: str, candidate_digest: str):
+    def from_events(
+        cls,
+        events: Iterable[dict],
+        baseline_digest: str,
+        candidate_digest: str,
+        *,
+        candidate_since_ms: int | None = None,
+    ):
         events = list(events)
         baseline_runs = _canary_run_summaries(events, baseline_digest)
-        candidate_runs = _canary_run_summaries(events, candidate_digest)
+        candidate_runs = _canary_run_summaries(events, candidate_digest, since_ms=candidate_since_ms)
         baseline = _metrics_from_canary_runs(baseline_runs)
         candidate = _metrics_from_canary_runs(candidate_runs)
         base_groups: dict[str, list[CanaryRunSummary]] = defaultdict(list)
@@ -1149,6 +1159,8 @@ class CanaryEvidence:
             ties=ties,
             event_head_hash=head,
             evidence_digest=digest,
+            baseline_digest=baseline_digest,
+            candidate_digest=candidate_digest,
         )
 
 
@@ -1199,7 +1211,7 @@ class CanaryGate:
             return CanaryDecision(False, f"need at least {self.min_tasks} candidate canary tasks")
         if baseline.tasks < self.min_baseline_tasks:
             return CanaryDecision(False, f"need at least {self.min_baseline_tasks} baseline canary tasks")
-        if candidate.task_families and candidate.task_families < self.min_task_families:
+        if candidate.task_families < self.min_task_families:
             return CanaryDecision(False, f"need at least {self.min_task_families} candidate task families")
         if baseline.tasks and candidate.success_rate + self.max_success_regression < baseline.success_rate:
             return CanaryDecision(False, "candidate canary regressed verified success")
@@ -1272,6 +1284,8 @@ class PolicyRegistry:
     def __init__(self, path: str | os.PathLike):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        self._lock = threading.RLock()
 
     @staticmethod
     def _empty():
@@ -1293,6 +1307,10 @@ class PolicyRegistry:
             raise ValueError(f"Policy registry {label} digest mismatch")
 
     def load(self) -> dict:
+        with self._lock, _file_lock(self.lock_path):
+            return self._load_unlocked()
+
+    def _load_unlocked(self) -> dict:
         if not self.path.exists():
             return self._empty()
         payload = json.loads(self.path.read_text(encoding="utf-8"))
@@ -1327,7 +1345,11 @@ class PolicyRegistry:
     def stage(self, report: DreamReport) -> dict:
         if not report.promotion.approved or report.selected.digest == report.baseline.digest:
             raise ValueError("Only a replay-approved changed policy can be staged")
-        payload = self.load()
+        with self._lock, _file_lock(self.lock_path):
+            return self._stage_unlocked(report)
+
+    def _stage_unlocked(self, report: DreamReport) -> dict:
+        payload = self._load_unlocked()
         parent_digest = self._current_baseline_digest(payload)
         if report.baseline.digest != parent_digest:
             raise ValueError("Replay report baseline is stale relative to the active policy")
@@ -1346,42 +1368,47 @@ class PolicyRegistry:
         return payload["staged"]
 
     def _promote_bound(self, evidence: CanaryEvidence, gate: CanaryGate | None = None) -> dict:
-        payload = self.load()
-        staged = payload.get("staged")
-        if not staged:
-            raise ValueError("No staged policy")
-        current_parent = self._current_baseline_digest(payload)
-        if current_parent != staged.get("parent_digest"):
-            raise ValueError("Staged policy parent no longer matches the active policy")
-        decision = (gate or CanaryGate()).assess(evidence.baseline, evidence.candidate, evidence=evidence)
-        if not decision.approved:
-            raise ValueError(f"Canary promotion rejected: {decision.reason}")
-        previous = payload.get("active")
-        if previous:
-            payload["history"].append({
-                **previous,
-                "deactivated_at_ms": int(time.time() * 1000),
-                "deactivation_reason": "superseded",
-            })
-        payload["active"] = {
-            **staged,
-            "promoted_at_ms": int(time.time() * 1000),
-            "suspended": False,
-            "canary": {
-                "baseline": asdict(evidence.baseline),
-                "candidate": asdict(evidence.candidate),
-                "paired_task_families": evidence.paired_task_families,
-                "candidate_wins": evidence.candidate_wins,
-                "baseline_wins": evidence.baseline_wins,
-                "ties": evidence.ties,
-                "event_head_hash": evidence.event_head_hash,
-                "evidence_digest": evidence.evidence_digest,
-                "reason": decision.reason,
-            },
-        }
-        payload["staged"] = None
-        self._write(payload)
-        return payload["active"]
+        with self._lock, _file_lock(self.lock_path):
+            payload = self._load_unlocked()
+            staged = payload.get("staged")
+            if not staged:
+                raise ValueError("No staged policy")
+            current_parent = self._current_baseline_digest(payload)
+            if current_parent != staged.get("parent_digest"):
+                raise ValueError("Staged policy parent no longer matches the active policy")
+            if evidence.candidate_digest and evidence.candidate_digest != staged["digest"]:
+                raise ValueError("Canary evidence is not bound to the staged policy digest")
+            if evidence.baseline_digest and evidence.baseline_digest != staged.get("parent_digest"):
+                raise ValueError("Canary evidence baseline does not match the staged policy parent digest")
+            decision = (gate or CanaryGate()).assess(evidence.baseline, evidence.candidate, evidence=evidence)
+            if not decision.approved:
+                raise ValueError(f"Canary promotion rejected: {decision.reason}")
+            previous = payload.get("active")
+            if previous:
+                payload["history"].append({
+                    **previous,
+                    "deactivated_at_ms": int(time.time() * 1000),
+                    "deactivation_reason": "superseded",
+                })
+            payload["active"] = {
+                **staged,
+                "promoted_at_ms": int(time.time() * 1000),
+                "suspended": False,
+                "canary": {
+                    "baseline": asdict(evidence.baseline),
+                    "candidate": asdict(evidence.candidate),
+                    "paired_task_families": evidence.paired_task_families,
+                    "candidate_wins": evidence.candidate_wins,
+                    "baseline_wins": evidence.baseline_wins,
+                    "ties": evidence.ties,
+                    "event_head_hash": evidence.event_head_hash,
+                    "evidence_digest": evidence.evidence_digest,
+                    "reason": decision.reason,
+                },
+            }
+            payload["staged"] = None
+            self._write(payload)
+            return payload["active"]
 
     def promote(
         self,
@@ -1416,6 +1443,8 @@ class PolicyRegistry:
             ties=0,
             event_head_hash=head,
             evidence_digest=_stable_hash(json.dumps(material, sort_keys=True, separators=(",", ":"))),
+            baseline_digest=staged.get("parent_digest", ""),
+            candidate_digest=staged["digest"],
         )
         # Explicit compatibility escape hatch; bypass paired-family requirement.
         permissive = CanaryGate(
@@ -1444,15 +1473,21 @@ class PolicyRegistry:
         staged = payload.get("staged")
         if not staged:
             raise ValueError("No staged policy")
+        parent_digest = staged.get("parent_digest")
         if baseline_policy_digest is None:
-            active = payload.get("active")
-            baseline_policy_digest = (
-                active["digest"] if active and not active.get("suspended") else staged.get("parent_digest")
-            )
+            baseline_policy_digest = parent_digest
         if not baseline_policy_digest:
             raise ValueError("Cannot resolve baseline policy digest")
+        # Bound promotion: evidence must pair the candidate against its staged parent.
+        if baseline_policy_digest != parent_digest:
+            raise ValueError("Baseline digest must match the staged policy parent digest")
         events = store.load()
-        evidence = CanaryEvidence.from_events(events, baseline_policy_digest, staged["digest"])
+        evidence = CanaryEvidence.from_events(
+            events,
+            baseline_policy_digest,
+            staged["digest"],
+            candidate_since_ms=staged.get("staged_at_ms"),
+        )
         return self._promote_bound(evidence, gate=gate)
 
     def staged_policy(self) -> ExplorationPolicy:
@@ -1468,59 +1503,62 @@ class PolicyRegistry:
         return ExplorationPolicy.from_dict(active["policy"])
 
     def suspend(self, reason: str) -> dict:
-        payload = self.load()
-        active = payload.get("active")
-        if not active:
-            raise ValueError("No active policy to suspend")
-        active["suspended"] = True
-        active["suspended_at_ms"] = int(time.time() * 1000)
-        active["suspension_reason"] = str(reason)[:512]
-        self._write(payload)
-        return active
+        with self._lock, _file_lock(self.lock_path):
+            payload = self._load_unlocked()
+            active = payload.get("active")
+            if not active:
+                raise ValueError("No active policy to suspend")
+            active["suspended"] = True
+            active["suspended_at_ms"] = int(time.time() * 1000)
+            active["suspension_reason"] = str(reason)[:512]
+            self._write(payload)
+            return active
 
     def resume(self) -> dict:
-        payload = self.load()
-        active = payload.get("active")
-        if not active:
-            raise ValueError("No active policy to resume")
-        active["suspended"] = False
-        active.pop("suspended_at_ms", None)
-        active.pop("suspension_reason", None)
-        self._write(payload)
-        return active
+        with self._lock, _file_lock(self.lock_path):
+            payload = self._load_unlocked()
+            active = payload.get("active")
+            if not active:
+                raise ValueError("No active policy to resume")
+            active["suspended"] = False
+            active.pop("suspended_at_ms", None)
+            active.pop("suspension_reason", None)
+            self._write(payload)
+            return active
 
     def rollback(self, digest: str | None = None) -> dict:
-        payload = self.load()
-        history = payload.get("history", [])
-        if not history:
-            raise ValueError("No prior active policy is available for rollback")
-        index = None
-        if digest is None:
-            index = len(history) - 1
-        else:
-            for i in range(len(history) - 1, -1, -1):
-                if history[i].get("digest") == digest:
-                    index = i
-                    break
-        if index is None:
-            raise ValueError("Requested rollback digest is not in registry history")
-        target = history.pop(index)
-        current = payload.get("active")
-        if current:
-            history.append({
-                **current,
-                "deactivated_at_ms": int(time.time() * 1000),
-                "deactivation_reason": "rollback",
-            })
-        target = {k: v for k, v in target.items() if k not in {"deactivated_at_ms", "deactivation_reason"}}
-        target["suspended"] = False
-        target["rollback_at_ms"] = int(time.time() * 1000)
-        target["rollback_from_digest"] = current.get("digest") if current else None
-        payload["active"] = target
-        payload["history"] = history
-        payload["staged"] = None
-        self._write(payload)
-        return target
+        with self._lock, _file_lock(self.lock_path):
+            payload = self._load_unlocked()
+            history = payload.get("history", [])
+            if not history:
+                raise ValueError("No prior active policy is available for rollback")
+            index = None
+            if digest is None:
+                index = len(history) - 1
+            else:
+                for i in range(len(history) - 1, -1, -1):
+                    if history[i].get("digest") == digest:
+                        index = i
+                        break
+            if index is None:
+                raise ValueError("Requested rollback digest is not in registry history")
+            target = history.pop(index)
+            current = payload.get("active")
+            if current:
+                history.append({
+                    **current,
+                    "deactivated_at_ms": int(time.time() * 1000),
+                    "deactivation_reason": "rollback",
+                })
+            target = {k: v for k, v in target.items() if k not in {"deactivated_at_ms", "deactivation_reason"}}
+            target["suspended"] = False
+            target["rollback_at_ms"] = int(time.time() * 1000)
+            target["rollback_from_digest"] = current.get("digest") if current else None
+            payload["active"] = target
+            payload["history"] = history
+            payload["staged"] = None
+            self._write(payload)
+            return target
 
     def health_from_store(
         self,
@@ -1558,8 +1596,3 @@ def summarize_usage(usage: dict | None) -> int:
     if isinstance(prompt, (int, float)) and isinstance(completion, (int, float)):
         return max(0, int(prompt + completion))
     return 0
-
-
-def mean_metric(reports: Iterable[ReplayMetrics], field_name: str) -> float:
-    values = [float(getattr(report, field_name)) for report in reports]
-    return fmean(values) if values else 0.0

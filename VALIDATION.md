@@ -4,24 +4,23 @@ Validation date: 2026-09-29.
 
 ## Reproduced in this build environment
 
-- `pytest`: **68 passed** using a temporary external `browser_harness` import stub because Browser Harness is not installed in this offline environment. The stub is outside this repository; browser/CDP calls in unit tests remain mocked by the tests themselves.
+- `uv run pytest`: **105 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
+- `uv run ruff check .`: passed.
+- `uv build`: passed (`dist/jev_ultrafast-0.4.0.tar.gz`, `dist/jev_ultrafast-0.4.0-py3-none-any.whl`).
 - `python -m compileall -q jev_ultrafast tests examples scripts`: passed.
 - `node --check jev_ultrafast/snapshot.js`: passed.
 - `node --check jev_ultrafast/static/app.js`: passed.
+- `shasum -a 256 -c MANIFEST.sha256`: all 55 tracked files verify.
 - TOML parse for `pyproject.toml`: passed.
 - JSON parse for bundled JSON evidence files: passed.
 - DREAM CLI smoke: `verify` and `improve --stage` completed against synthetic hash-chained evidence; the staged record bound the parent policy, world-pool digest, split-manifest digest, evidence head, and TCB versions.
-- Cross-process experience-store test: four spawned processes appended 40 events to one JSONL store and the resulting chain verified.
+- Cross-process serialization tests: four spawned processes appended 40 events to one JSONL store and the resulting chain verified; three spawned processes ran 30 serialized suspend/resume registry writes without lost updates.
 
-## Offline environment limitations
+## Remaining environment limitation
 
-- `uv lock --check --offline`: could not resolve because `browser-harness==0.1.13` was not present in the local uv package cache. `uv.lock` itself has been updated to the local project version `0.4.0`; this is not a passing dependency-resolution result.
-- `uv sync --frozen --offline`: failed because `typing-extensions==4.16.0` was absent from the local cache and network access is disabled.
-- `uv build --offline`: failed because `hatchling` was absent from the local cache.
-- `uv run ruff check .`: not reproduced because Ruff is not installed in the environment and offline dependency resolution is unavailable.
-- The real Browser Harness / Chrome integration suite (`scripts/check_guards.py`) was not executed because Browser Harness is unavailable here.
+- The real Browser Harness / Chrome live integration suite (`scripts/check_guards.py`) was not executed here; the package is installed but no live Chrome target was exercised.
 
-These are environment limitations, not passing results. Run the full dependency, lint, and live-browser checks on the deployment machine before unattended use.
+Run the live-browser checks on the deployment machine before unattended use.
 
 ## New v0.4 regression coverage
 
@@ -42,17 +41,27 @@ The test suite now covers the v0.3 contracts plus:
 - post-promotion health drift detection and policy suspension;
 - suspension fallback to baseline policy;
 - policy-registry history and rollback;
-- end-to-end Agent → trace → replay verified-success integration with a fake browser boundary.
+- end-to-end Agent → trace → replay verified-success integration with a fake browser boundary;
+- shared Unicode tokenization across live candidate scoring, policy scoring, and recorded goal overlap;
+- expanded sensitive URL-query redaction (api/access/refresh/id tokens, client secrets, session ids, CSRF/JWT/OTP names);
+- zero task-family canary candidates rejected by the default gate;
+- canary candidate evidence bound to runs recorded after staging;
+- canary evidence baseline digest pinned to the staged parent digest;
+- reserved experience-store and trace event keys rejected;
+- provably pre-mutation select errors retried via re-observation while interrupted select evaluation remains non-retryable;
+- signature-based verifier dispatch so internal verifier TypeErrors are never masked;
+- explicit `aborted` run status excluded from canary outcome metrics;
+- trace candidate catalogues computed only when a DREAM recorder is active;
+- cross-process serialization of policy-registry stage/promote/suspend/resume/rollback writes.
 
 ## Deployment gate
 
 Before production activation:
 
 1. Run `uv sync --frozen` with network/package cache available.
-2. Run `uv run ruff check .`.
-3. Run `uv run pytest` without the temporary import stub.
-4. Run `uv run python scripts/check_guards.py` against the intended Chrome/Browser Harness installation.
-5. Re-run representative browser benchmarks; the bundled v0.1 speed evidence is historical, not a fresh v0.4 latency claim.
-6. Collect matched baseline/candidate canary runs across the intended site/task distribution. The built-in 12-run/four-family thresholds are minimum gates, not statistical proof.
-7. Activate only through `jev-dream promote` / `PolicyRegistry.promote_from_store(...)`.
-8. Run periodic `jev-dream health`; use suspension or rollback on meaningful post-promotion drift.
+2. Run `uv run ruff check .` and `uv run pytest` (both pass in this environment).
+3. Run `uv run python scripts/check_guards.py` against the intended Chrome/Browser Harness installation.
+4. Re-run representative browser benchmarks; the bundled v0.1 speed evidence is historical, not a fresh v0.4 latency claim.
+5. Collect matched baseline/candidate canary runs across the intended site/task distribution. The built-in 12-run/four-family thresholds are minimum gates, not statistical proof.
+6. Activate only through `jev-dream promote` / `PolicyRegistry.promote_from_store(...)`.
+7. Run periodic `jev-dream health`; use suspension or rollback on meaningful post-promotion drift.

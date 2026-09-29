@@ -267,12 +267,12 @@ def browser_operation(request):
                 })""" + json.dumps({"action": action, "expected": expected})
             )
             if not target or target.get("error"):
+                # The guarded script only mutates in its final statement, so every
+                # explicit {error: ...} return is provably pre-mutation and safe to
+                # retry after re-observing. A missing result or an interrupted
+                # evaluation (handled in evaluate()) remains non-retryable.
                 if kind == "select" and target is None:
                     raise RuntimeError("Dropdown execution returned no result; inspect before retrying.")
-                if kind == "select" and target and target.get("error") not in {"stale-page", "stale-target"}:
-                    raise RuntimeError(
-                        f"Dropdown execution was not confirmed ({target['error']}); inspect before retrying."
-                    )
                 raise StalePage("Target changed, became unavailable, or is covered. Observe again.")
             if kind != "select":
                 x, y = target["x"], target["y"]

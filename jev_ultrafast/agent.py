@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import time
 from pathlib import Path
 
@@ -122,10 +123,23 @@ class Agent:
         return round((time.perf_counter() - self.state["started_at"]) * 1000)
 
     def _verify(self, page):
+        # Dispatch on the declared signature so an internal TypeError raised by a
+        # two-argument verifier is never retried as a one-argument call.
         try:
-            result = self.verifier(page, self.snapshot())
-        except TypeError:
-            result = self.verifier(page)
+            params = list(inspect.signature(self.verifier).parameters.values())
+            inspectable = True
+        except (TypeError, ValueError):
+            params = []
+            inspectable = False
+        positional_slots = sum(
+            p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) for p in params
+        )
+        accepts_two = (
+            not inspectable
+            or positional_slots >= 2
+            or any(p.kind is p.VAR_POSITIONAL for p in params)
+        )
+        result = self.verifier(page, self.snapshot()) if accepts_two else self.verifier(page)
         if isinstance(result, bool):
             result = {"passed": result}
         if not isinstance(result, dict) or type(result.get("passed")) is not bool:
@@ -312,11 +326,13 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
 
-            trace_candidates, _trace_omitted = candidate_actions(
-                page["actions"],
-                state["goal"],
-                exploration_policy=getattr(self, "exploration_policy", None),
-            )
+            trace_candidates = None
+            if getattr(self, "dream_recorder", None):
+                trace_candidates, _trace_omitted = candidate_actions(
+                    page["actions"],
+                    state["goal"],
+                    exploration_policy=getattr(self, "exploration_policy", None),
+                )
             state["browser"].act(action, page, text=text)
             self.pending_text = None
             state["elapsed_ms"] = self._elapsed()
@@ -358,7 +374,7 @@ class Agent:
                     after=state["page"],
                     action=action,
                     decision=decision,
-                    candidates=trace_candidates,
+                    candidates=trace_candidates or [],
                     helper=helper,
                     risk_events=int(bool(body.get("approved"))),
                 )
@@ -383,8 +399,9 @@ class Agent:
 
     def close(self):
         if getattr(self, "dream_recorder", None) and not self.dream_recorder.finished:
+            status = self.state.get("status", "closed")
             self.dream_recorder.finish(
-                status=self.state.get("status", "closed"),
+                status=status if status in TERMINAL_STATUSES else "aborted",
                 verified=self.state.get("verified", False),
             )
         self.browser.close()

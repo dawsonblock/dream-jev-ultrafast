@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import time
 from dataclasses import dataclass
 from typing import Protocol
@@ -13,7 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .privacy import sanitize_action, sanitize_page
+from .privacy import sanitize_action, sanitize_page, tokenize
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
@@ -81,7 +80,7 @@ def validate_choice(answer, ids):
 
 
 def _goal_tokens(goal):
-    return set(re.findall(r"[a-z0-9]{2,}", goal.lower()))
+    return set(tokenize(goal))
 
 
 def _candidate_score(action, goal_tokens, order, exploration_policy=None):
@@ -90,7 +89,7 @@ def _candidate_score(action, goal_tokens, order, exploration_policy=None):
     searchable = " ".join(
         str(action.get(k, "")) for k in ("label", "value", "current_value", "option_label")
     ).lower()
-    tokens = set(re.findall(r"[a-z0-9]{2,}", searchable))
+    tokens = set(tokenize(searchable))
     overlap = len(goal_tokens & tokens)
     kind_bonus = {"fill": 1.5, "select": 1.0, "click": 0.5}.get(action.get("kind"), 0)
     return overlap * 10 + kind_bonus - order / 100000
@@ -122,12 +121,15 @@ def candidate_actions(actions, goal, limit=None, exploration_policy=None):
         kind = action["kind"]
         if counts[kind] >= quotas[kind] or len(selected) >= regular_budget:
             continue
-        selected.append((index, action)); used.add(index); counts[kind] += 1
+        selected.append((index, action))
+        used.add(index)
+        counts[kind] += 1
     if len(selected) < regular_budget:
         for index, action in ranked:
             if index in used:
                 continue
-            selected.append((index, action)); used.add(index)
+            selected.append((index, action))
+            used.add(index)
             if len(selected) >= regular_budget:
                 break
     # Preserve document order after relevance selection. This keeps element indices

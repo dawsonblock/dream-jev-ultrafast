@@ -324,3 +324,54 @@ def test_navigation_during_prediction_reobserves_without_action(runner):
     assert runner.state["status"] == "ready"
     assert runner.state["decision"] is None
     runner.state["browser"].act.assert_not_called()
+
+
+def test_trace_candidates_only_computed_when_recording(runner, monkeypatch, tmp_path):
+    from jev_ultrafast.dream import ExperienceStore
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    spy = Mock(wraps=model.candidate_actions)
+    monkeypatch.setattr(loop, "candidate_actions", spy)
+    runner.state["decision"] = decision("e3")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    # Only the snapshot() bookkeeping call; no trace-catalogue work without a recorder.
+    assert spy.call_count == 1
+
+    runner.dream_recorder = DreamTraceRecorder(
+        ExperienceStore(tmp_path / "trace.jsonl"), goal="Find a book",
+    )
+    runner.state["decision"] = decision("e3")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    assert spy.call_count == 3  # trace catalogue + snapshot for each of the two acts
+
+
+def test_close_records_unfinished_run_as_aborted(tmp_path):
+    from jev_ultrafast.dream import CanaryMetrics, ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "abort.jsonl")
+    a = loop.Agent.__new__(loop.Agent)
+    a.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    a.dream_recorder.start({"fingerprint": "A", "url": "https://example.test"}, ExplorationPolicy())
+    a.state = {"status": "ready", "verified": False}
+    a.browser = Mock()
+    a.close()
+    events = store.load()
+    assert [event["event"] for event in events] == ["run_started", "run_finished"]
+    assert events[-1]["status"] == "aborted"
+    # Abandoned runs are not task outcomes and must not count as canary failures.
+    assert CanaryMetrics.from_events(events, ExplorationPolicy().digest).tasks == 0
+
+
+def test_close_preserves_terminal_status(tmp_path):
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "done.jsonl")
+    a = loop.Agent.__new__(loop.Agent)
+    a.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    a.dream_recorder.start({"fingerprint": "A", "url": "https://example.test"}, ExplorationPolicy())
+    a.state = {"status": "done", "verified": True}
+    a.browser = Mock()
+    a.close()
+    assert store.load()[-1]["status"] == "done"
