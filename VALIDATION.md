@@ -4,7 +4,7 @@ Validation date: 2026-09-29.
 
 ## Reproduced in this build environment
 
-- `uv run pytest`: **105 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
+- `uv run pytest`: **107 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
 - `uv run ruff check .`: passed.
 - `uv build`: passed (`dist/jev_ultrafast-0.4.0.tar.gz`, `dist/jev_ultrafast-0.4.0-py3-none-any.whl`).
 - `python -m compileall -q jev_ultrafast tests examples scripts`: passed.
@@ -52,7 +52,9 @@ The test suite now covers the v0.3 contracts plus:
 - signature-based verifier dispatch so internal verifier TypeErrors are never masked;
 - explicit `aborted` run status excluded from canary outcome metrics;
 - trace candidate catalogues computed only when a DREAM recorder is active;
-- cross-process serialization of policy-registry stage/promote/suspend/resume/rollback writes.
+- cross-process serialization of policy-registry stage/promote/suspend/resume/rollback writes;
+- canary risk comparison per task (rate) as well as absolute count;
+- optional `strict` experience stores that verify the full hash chain before every append.
 
 ## Deployment gate
 

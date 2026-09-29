@@ -456,6 +456,43 @@ def test_canary_gate_rejects_zero_task_families():
     assert "task families" in decision.reason
 
 
+def test_experience_store_strict_mode_refuses_mid_chain_corruption(tmp_path):
+    path = tmp_path / "strict.jsonl"
+    store = ExperienceStore(path)
+    store.append({"run_id": "1", "event": "a"})
+    store.append({"run_id": "1", "event": "b"})
+    store.append({"run_id": "1", "event": "c"})
+    lines = path.read_text().splitlines()
+    payload = json.loads(lines[1])
+    payload["event"] = "tampered"
+    lines[1] = json.dumps(payload)
+    path.write_text("\n".join(lines) + "\n")
+    # Tail-only appends remain O(1) and tolerate a stale mid-chain corruption;
+    # strict mode refuses to grow a store that load() would reject.
+    ExperienceStore(path).append({"run_id": "1", "event": "d"})
+    with pytest.raises(ValueError, match="integrity failure"):
+        ExperienceStore(path, strict=True).append({"run_id": "1", "event": "e"})
+
+
+def test_canary_gate_compares_risk_rate_as_well_as_count():
+    gate = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=0,
+        min_paired_task_families=0, max_extra_risk_events=5,
+    )
+    baseline = CanaryMetrics(tasks=12, verified_successes=12)
+    # Fewer raw events than the allowance, but a worse rate per task.
+    candidate = CanaryMetrics(tasks=20, verified_successes=20, risk_events=4)
+    decision = gate.assess(baseline, candidate)
+    assert not decision.approved
+    assert "risk rate" in decision.reason
+    strict = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=0, min_paired_task_families=0,
+    )
+    assert not strict.assess(
+        baseline, CanaryMetrics(tasks=12, verified_successes=12, risk_events=1)
+    ).approved
+
+
 def test_experience_store_rejects_reserved_event_keys(tmp_path):
     store = ExperienceStore(tmp_path / "reserved.jsonl")
     for key in ("schema", "tcb_version", "recorded_at_ms", "prev_hash", "event_hash"):

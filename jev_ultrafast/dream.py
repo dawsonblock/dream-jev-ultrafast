@@ -218,11 +218,15 @@ class ExperienceStore:
     operating-system lock, keeping append cost effectively constant.
     """
 
-    def __init__(self, path: str | os.PathLike):
+    def __init__(self, path: str | os.PathLike, *, strict: bool = False):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         self._lock = threading.Lock()
+        # Default appends verify only the tail so they stay O(1). ``strict``
+        # verifies the whole chain first so a mid-chain corruption cannot keep
+        # accumulating events into a store that load() would reject.
+        self.strict = strict
 
     @staticmethod
     def _event_hash(payload: dict) -> str:
@@ -259,6 +263,8 @@ class ExperienceStore:
                 f"DREAM event cannot set reserved chain keys: {sorted(self._RESERVED_EVENT_KEYS & event.keys())}"
             )
         with self._lock, _file_lock(self.lock_path):
+            if self.strict:
+                self._load_unlocked()
             tail = self._tail_event_unlocked()
             if tail:
                 if tail.get("schema") not in SUPPORTED_SCHEMAS or tail.get("tcb_version") not in SUPPORTED_TCB_VERSIONS:
@@ -1183,6 +1189,7 @@ class CanaryGate:
         min_pair_coverage: float = 0.80,
         max_success_regression: float = 0.0,
         max_extra_risk_events: int = 0,
+        max_extra_risk_rate: float = 0.0,
         max_failure_rate_regression: float = 0.0,
         max_latency_regression_ratio: float = 0.25,
         max_action_regression_ratio: float = 0.25,
@@ -1195,6 +1202,7 @@ class CanaryGate:
         self.min_pair_coverage = min_pair_coverage
         self.max_success_regression = max_success_regression
         self.max_extra_risk_events = max_extra_risk_events
+        self.max_extra_risk_rate = max_extra_risk_rate
         self.max_failure_rate_regression = max_failure_rate_regression
         self.max_latency_regression_ratio = max_latency_regression_ratio
         self.max_action_regression_ratio = max_action_regression_ratio
@@ -1219,6 +1227,10 @@ class CanaryGate:
             return CanaryDecision(False, "candidate canary increased failure rate")
         if candidate.risk_events > baseline.risk_events + self.max_extra_risk_events:
             return CanaryDecision(False, "candidate canary increased risk events")
+        # Rates as well as counts: unequal task counts must not let a busier
+        # candidate accumulate more risk per task than the baseline.
+        if baseline.tasks and candidate.risk_rate > baseline.risk_rate + self.max_extra_risk_rate:
+            return CanaryDecision(False, "candidate canary increased risk rate")
         if candidate.verified_successes == 0:
             return CanaryDecision(False, "candidate canary has no verified successes")
         if (
@@ -1455,6 +1467,7 @@ class PolicyRegistry:
             min_pair_coverage=0.0,
             max_success_regression=(gate.max_success_regression if gate else 0.0),
             max_extra_risk_events=(gate.max_extra_risk_events if gate else 0),
+            max_extra_risk_rate=(gate.max_extra_risk_rate if gate else 0.0),
             max_failure_rate_regression=(gate.max_failure_rate_regression if gate else 0.0),
             max_latency_regression_ratio=(gate.max_latency_regression_ratio if gate else 0.25),
             max_action_regression_ratio=(gate.max_action_regression_ratio if gate else 0.25),
