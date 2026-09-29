@@ -1,0 +1,895 @@
+{
+  "task": "Find one-way flights from Zurich to London on September 20, 2026, for one adult in economy. Stop when matching flight options are visible. Do not select or book a flight.",
+  "baseline_commit": "68c077bf79caca4e817b8e8a5854b2efa0c81ff6",
+  "summary": {
+    "baseline": {
+      "runs": 3,
+      "passed": 3,
+      "median_ms": 9450,
+      "median_cdp_calls": 1092
+    },
+    "candidate": {
+      "runs": 3,
+      "passed": 3,
+      "median_ms": 7092,
+      "median_cdp_calls": 101
+    }
+  },
+  "runs": [
+    {
+      "elapsed_ms": 11214,
+      "decision_requests": 26,
+      "decision_median_ms": 195.5,
+      "decision_total_ms": 5913,
+      "browser_actions": 13,
+      "wait_actions": 3,
+      "models": {
+        "decision": [
+          "jev-1.13.0"
+        ],
+        "text": [
+          "inception/mercury-2.5"
+        ]
+      },
+      "text_calls": [
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 490,
+          "usage": {
+            "prompt_tokens": 447,
+            "completion_tokens": 51,
+            "total_tokens": 498,
+            "cost": 2.553e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.553e-05,
+              "upstream_inference_prompt_cost": 1.788e-05,
+              "upstream_inference_completions_cost": 7.65e-06
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where from?",
+          "value": "Zurich"
+        },
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 792,
+          "usage": {
+            "prompt_tokens": 482,
+            "completion_tokens": 60,
+            "total_tokens": 542,
+            "cost": 2.828e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.828e-05,
+              "upstream_inference_prompt_cost": 1.928e-05,
+              "upstream_inference_completions_cost": 9e-06
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where to? ",
+          "value": "London"
+        }
+      ],
+      "verification": {
+        "passed": true,
+        "checks": {
+          "search_page": true,
+          "one_way": true,
+          "origin": true,
+          "destination": true,
+          "date": true,
+          "year": true,
+          "results": true
+        },
+        "visible_flights": [
+          "From 216 US dollars.This price does not include overhead bin access. Nonstop flight with easyJet. Leaves Zurich Airport at 4:45 PM on Sunday, September 20 and arrives at London Gatwick Airport at 5:35 PM on Sunday, September 20. Total duration 1 hr 50 min. Select flight",
+          "From 265 US dollars. Nonstop flight with British Airways. Operated by BA Cityflyer. Leaves Zurich Airport at 8:25 PM on Sunday, September 20 and arrives at London City Airport at 9:00 PM on Sunday, September 20. Total duration 1 hr 35 min. Select flight",
+          "From 271 US dollars. Nonstop flight with British Airways. Leaves Zurich Airport at 1:20 PM on Sunday, September 20 and arrives at Heathrow Airport at 2:20 PM on Sunday, September 20. Total duration 2 hr. Select flight"
+        ]
+      },
+      "source_hashes": {
+        "questions.py": "66a7054b85040b949e1757311257ea0c5a843c635f9a40c99f6d15ad660fb422",
+        "__init__.py": "60f025b8d24465e2c0f7a3547d43b8020fd8843de7b6cb3f892ef63f5548cf63",
+        "model.py": "a85ada8458d23642c5c8a4095acf0565e6268f81dcda26f6308942b653e9c9f3",
+        "browser.py": "d2b0e468c2dac3f4d3cbba51f3619fe26fe44fb1554446363d8d1aff5efe22f2",
+        "agent.py": "be5434b79de0410352485e734ff4bb7a5d9556ce22ae47f231b5be3aa67161a4",
+        "demo.py": "a0cfb10909b370efb284cbbe16bdb4b7e7e06ba6385827404169027645a1d8a4"
+      },
+      "tokens": {
+        "input_tokens": 133633,
+        "output_tokens": 9468
+      },
+      "arm": "baseline",
+      "pair": 1,
+      "configuration": {
+        "TYPESAFE_MODEL": null,
+        "TEXT_MODEL": "inception/mercury-2.5",
+        "TEXT_MODEL_BASE_URL": "https://openrouter.ai/api/v1",
+        "TEXT_MODEL_REASONING": "none"
+      },
+      "browser_version": "Chrome/152.0.7977.83",
+      "task_hash": "bce327f45dc380ca9cd76fac5b70bfddd7ce36f8e083c1f900522af2a3499ff9",
+      "cdp": {
+        "Runtime.evaluate": {
+          "count": 158,
+          "ms": 1487.242
+        },
+        "Accessibility.getFullAXTree": {
+          "count": 30,
+          "ms": 1238.199
+        },
+        "Runtime.callFunctionOn": {
+          "count": 40,
+          "ms": 223.157
+        },
+        "DOM.resolveNode": {
+          "count": 828,
+          "ms": 1215.957
+        },
+        "DOM.getBoxModel": {
+          "count": 10,
+          "ms": 8.559
+        },
+        "DOM.getNodeForLocation": {
+          "count": 10,
+          "ms": 10.932
+        },
+        "Input.dispatchMouseEvent": {
+          "count": 20,
+          "ms": 351.816
+        },
+        "Input.dispatchKeyEvent": {
+          "count": 4,
+          "ms": 35.583
+        },
+        "Input.insertText": {
+          "count": 2,
+          "ms": 11.208
+        }
+      },
+      "error": null,
+      "browser_closed": true
+    },
+    {
+      "elapsed_ms": 6964,
+      "decision_requests": 17,
+      "decision_median_ms": 169,
+      "decision_total_ms": 3284,
+      "browser_actions": 13,
+      "wait_actions": 3,
+      "models": {
+        "decision": [
+          "jev-1.13.0"
+        ],
+        "text": [
+          "inception/mercury-2.5"
+        ]
+      },
+      "text_calls": [
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 448,
+          "usage": {
+            "prompt_tokens": 456,
+            "completion_tokens": 59,
+            "total_tokens": 515,
+            "cost": 2.709e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.709e-05,
+              "upstream_inference_prompt_cost": 1.824e-05,
+              "upstream_inference_completions_cost": 8.85e-06
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where from?",
+          "value": "Zurich"
+        },
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 310,
+          "usage": {
+            "prompt_tokens": 471,
+            "completion_tokens": 62,
+            "total_tokens": 533,
+            "cost": 2.814e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.814e-05,
+              "upstream_inference_prompt_cost": 1.884e-05,
+              "upstream_inference_completions_cost": 9.3e-06
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where to? ",
+          "value": "London"
+        }
+      ],
+      "verification": {
+        "passed": true,
+        "checks": {
+          "search_page": true,
+          "one_way": true,
+          "origin": true,
+          "destination": true,
+          "date": true,
+          "year": true,
+          "results": true
+        },
+        "visible_flights": [
+          "From 216 US dollars.This price does not include overhead bin access. Nonstop flight with easyJet. Leaves Zurich Airport at 4:45 PM on Sunday, September 20 and arrives at London Gatwick Airport at 5:35 PM on Sunday, September 20. Total duration 1 hr 50 min.   Select flight",
+          "From 265 US dollars. Nonstop flight with British Airways. Operated by BA Cityflyer. Leaves Zurich Airport at 8:25 PM on Sunday, September 20 and arrives at London City Airport at 9:00 PM on Sunday, September 20. Total duration 1 hr 35 min.   Select flight",
+          "From 271 US dollars. Nonstop flight with British Airways. Leaves Zurich Airport at 1:20 PM on Sunday, September 20 and arrives at Heathrow Airport at 2:20 PM on Sunday, September 20. Total duration 2 hr.   Select flight"
+        ]
+      },
+      "source_hashes": {
+        "questions.py": "66a7054b85040b949e1757311257ea0c5a843c635f9a40c99f6d15ad660fb422",
+        "__init__.py": "60f025b8d24465e2c0f7a3547d43b8020fd8843de7b6cb3f892ef63f5548cf63",
+        "model.py": "a85ada8458d23642c5c8a4095acf0565e6268f81dcda26f6308942b653e9c9f3",
+        "browser.py": "6ef6c0cf9041f648c49bb09adf6b83d73ba301de5e87ffdeb03b0a4ce9e487ab",
+        "snapshot.js": "e50473501c8fb8e70f3b21866d987393e3f2315c639d638bd477d170e81ed78d",
+        "agent.py": "aaf8b271cb0ee6643fe7beb525328ab80de8568c7ac044d02b9c6721161e7c8b",
+        "demo.py": "a0cfb10909b370efb284cbbe16bdb4b7e7e06ba6385827404169027645a1d8a4"
+      },
+      "tokens": {
+        "input_tokens": 84650,
+        "output_tokens": 5899
+      },
+      "arm": "candidate",
+      "pair": 1,
+      "configuration": {
+        "TYPESAFE_MODEL": null,
+        "TEXT_MODEL": "inception/mercury-2.5",
+        "TEXT_MODEL_BASE_URL": "https://openrouter.ai/api/v1",
+        "TEXT_MODEL_REASONING": "none"
+      },
+      "browser_version": "Chrome/152.0.7977.83",
+      "task_hash": "bce327f45dc380ca9cd76fac5b70bfddd7ce36f8e083c1f900522af2a3499ff9",
+      "cdp": {
+        "Runtime.evaluate": {
+          "count": 75,
+          "ms": 2251.328
+        },
+        "Input.dispatchMouseEvent": {
+          "count": 20,
+          "ms": 322.317
+        },
+        "Input.dispatchKeyEvent": {
+          "count": 4,
+          "ms": 22.038
+        },
+        "Input.insertText": {
+          "count": 2,
+          "ms": 8.988
+        }
+      },
+      "error": null,
+      "browser_closed": true
+    },
+    {
+      "elapsed_ms": 7913,
+      "decision_requests": 18,
+      "decision_median_ms": 182.5,
+      "decision_total_ms": 3595,
+      "browser_actions": 13,
+      "wait_actions": 3,
+      "models": {
+        "decision": [
+          "jev-1.13.0"
+        ],
+        "text": [
+          "inception/mercury-2.5"
+        ]
+      },
+      "text_calls": [
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 415,
+          "usage": {
+            "prompt_tokens": 440,
+            "completion_tokens": 47,
+            "total_tokens": 487,
+            "cost": 2.465e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.465e-05,
+              "upstream_inference_prompt_cost": 1.76e-05,
+              "upstream_inference_completions_cost": 7.05e-06
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where from?",
+          "value": "Zurich"
+        },
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 1137,
+          "usage": {
+            "prompt_tokens": 485,
+            "completion_tokens": 511,
+            "total_tokens": 996,
+            "cost": 9.605e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 9.605e-05,
+              "upstream_inference_prompt_cost": 1.94e-05,
+              "upstream_inference_completions_cost": 7.665e-05
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where to? ",
+          "value": "London"
+        }
+      ],
+      "verification": {
+        "passed": true,
+        "checks": {
+          "search_page": true,
+          "one_way": true,
+          "origin": true,
+          "destination": true,
+          "date": true,
+          "year": true,
+          "results": true
+        },
+        "visible_flights": [
+          "From 216 US dollars.This price does not include overhead bin access. Nonstop flight with easyJet. Leaves Zurich Airport at 4:45 PM on Sunday, September 20 and arrives at London Gatwick Airport at 5:35 PM on Sunday, September 20. Total duration 1 hr 50 min.   Select flight",
+          "From 265 US dollars. Nonstop flight with British Airways. Operated by BA Cityflyer. Leaves Zurich Airport at 8:25 PM on Sunday, September 20 and arrives at London City Airport at 9:00 PM on Sunday, September 20. Total duration 1 hr 35 min.   Select flight",
+          "From 271 US dollars. Nonstop flight with British Airways. Leaves Zurich Airport at 1:20 PM on Sunday, September 20 and arrives at Heathrow Airport at 2:20 PM on Sunday, September 20. Total duration 2 hr.   Select flight"
+        ]
+      },
+      "source_hashes": {
+        "questions.py": "66a7054b85040b949e1757311257ea0c5a843c635f9a40c99f6d15ad660fb422",
+        "__init__.py": "60f025b8d24465e2c0f7a3547d43b8020fd8843de7b6cb3f892ef63f5548cf63",
+        "model.py": "a85ada8458d23642c5c8a4095acf0565e6268f81dcda26f6308942b653e9c9f3",
+        "browser.py": "6ef6c0cf9041f648c49bb09adf6b83d73ba301de5e87ffdeb03b0a4ce9e487ab",
+        "snapshot.js": "e50473501c8fb8e70f3b21866d987393e3f2315c639d638bd477d170e81ed78d",
+        "agent.py": "aaf8b271cb0ee6643fe7beb525328ab80de8568c7ac044d02b9c6721161e7c8b",
+        "demo.py": "a0cfb10909b370efb284cbbe16bdb4b7e7e06ba6385827404169027645a1d8a4"
+      },
+      "tokens": {
+        "input_tokens": 88844,
+        "output_tokens": 6242
+      },
+      "arm": "candidate",
+      "pair": 2,
+      "configuration": {
+        "TYPESAFE_MODEL": null,
+        "TEXT_MODEL": "inception/mercury-2.5",
+        "TEXT_MODEL_BASE_URL": "https://openrouter.ai/api/v1",
+        "TEXT_MODEL_REASONING": "none"
+      },
+      "browser_version": "Chrome/152.0.7977.83",
+      "task_hash": "bce327f45dc380ca9cd76fac5b70bfddd7ce36f8e083c1f900522af2a3499ff9",
+      "cdp": {
+        "Runtime.evaluate": {
+          "count": 77,
+          "ms": 2076.599
+        },
+        "Input.dispatchMouseEvent": {
+          "count": 20,
+          "ms": 334.491
+        },
+        "Input.dispatchKeyEvent": {
+          "count": 4,
+          "ms": 23.523
+        },
+        "Input.insertText": {
+          "count": 2,
+          "ms": 10.362
+        }
+      },
+      "error": null,
+      "browser_closed": true
+    },
+    {
+      "elapsed_ms": 8984,
+      "decision_requests": 21,
+      "decision_median_ms": 167,
+      "decision_total_ms": 4004,
+      "browser_actions": 12,
+      "wait_actions": 2,
+      "models": {
+        "decision": [
+          "jev-1.13.0"
+        ],
+        "text": [
+          "inception/mercury-2.5"
+        ]
+      },
+      "text_calls": [
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 395,
+          "usage": {
+            "prompt_tokens": 460,
+            "completion_tokens": 74,
+            "total_tokens": 534,
+            "cost": 2.95e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.95e-05,
+              "upstream_inference_prompt_cost": 1.84e-05,
+              "upstream_inference_completions_cost": 1.11e-05
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where from?",
+          "value": "Zurich"
+        },
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 338,
+          "usage": {
+            "prompt_tokens": 492,
+            "completion_tokens": 43,
+            "total_tokens": 535,
+            "cost": 2.613e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.613e-05,
+              "upstream_inference_prompt_cost": 1.968e-05,
+              "upstream_inference_completions_cost": 6.45e-06
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where to? ",
+          "value": "London"
+        }
+      ],
+      "verification": {
+        "passed": true,
+        "checks": {
+          "search_page": true,
+          "one_way": true,
+          "origin": true,
+          "destination": true,
+          "date": true,
+          "year": true,
+          "results": true
+        },
+        "visible_flights": [
+          "From 216 US dollars.This price does not include overhead bin access. Nonstop flight with easyJet. Leaves Zurich Airport at 4:45 PM on Sunday, September 20 and arrives at London Gatwick Airport at 5:35 PM on Sunday, September 20. Total duration 1 hr 50 min. Select flight",
+          "From 265 US dollars. Nonstop flight with British Airways. Operated by BA Cityflyer. Leaves Zurich Airport at 8:25 PM on Sunday, September 20 and arrives at London City Airport at 9:00 PM on Sunday, September 20. Total duration 1 hr 35 min. Select flight",
+          "From 271 US dollars. Nonstop flight with British Airways. Leaves Zurich Airport at 1:20 PM on Sunday, September 20 and arrives at Heathrow Airport at 2:20 PM on Sunday, September 20. Total duration 2 hr. Select flight"
+        ]
+      },
+      "source_hashes": {
+        "questions.py": "66a7054b85040b949e1757311257ea0c5a843c635f9a40c99f6d15ad660fb422",
+        "__init__.py": "60f025b8d24465e2c0f7a3547d43b8020fd8843de7b6cb3f892ef63f5548cf63",
+        "model.py": "a85ada8458d23642c5c8a4095acf0565e6268f81dcda26f6308942b653e9c9f3",
+        "browser.py": "d2b0e468c2dac3f4d3cbba51f3619fe26fe44fb1554446363d8d1aff5efe22f2",
+        "agent.py": "be5434b79de0410352485e734ff4bb7a5d9556ce22ae47f231b5be3aa67161a4",
+        "demo.py": "a0cfb10909b370efb284cbbe16bdb4b7e7e06ba6385827404169027645a1d8a4"
+      },
+      "tokens": {
+        "input_tokens": 106691,
+        "output_tokens": 7531
+      },
+      "arm": "baseline",
+      "pair": 2,
+      "configuration": {
+        "TYPESAFE_MODEL": null,
+        "TEXT_MODEL": "inception/mercury-2.5",
+        "TEXT_MODEL_BASE_URL": "https://openrouter.ai/api/v1",
+        "TEXT_MODEL_REASONING": "none"
+      },
+      "browser_version": "Chrome/152.0.7977.83",
+      "task_hash": "bce327f45dc380ca9cd76fac5b70bfddd7ce36f8e083c1f900522af2a3499ff9",
+      "cdp": {
+        "Runtime.evaluate": {
+          "count": 146,
+          "ms": 1595.322
+        },
+        "Accessibility.getFullAXTree": {
+          "count": 30,
+          "ms": 1311.762
+        },
+        "Runtime.callFunctionOn": {
+          "count": 40,
+          "ms": 315.525
+        },
+        "DOM.resolveNode": {
+          "count": 828,
+          "ms": 846.738
+        },
+        "DOM.getBoxModel": {
+          "count": 10,
+          "ms": 8.759
+        },
+        "DOM.getNodeForLocation": {
+          "count": 10,
+          "ms": 12.157
+        },
+        "Input.dispatchMouseEvent": {
+          "count": 20,
+          "ms": 337.511
+        },
+        "Input.dispatchKeyEvent": {
+          "count": 4,
+          "ms": 38.385
+        },
+        "Input.insertText": {
+          "count": 2,
+          "ms": 11.307
+        }
+      },
+      "error": null,
+      "browser_closed": true
+    },
+    {
+      "elapsed_ms": 9450,
+      "decision_requests": 22,
+      "decision_median_ms": 187.0,
+      "decision_total_ms": 4261,
+      "browser_actions": 12,
+      "wait_actions": 2,
+      "models": {
+        "decision": [
+          "jev-1.13.0"
+        ],
+        "text": [
+          "inception/mercury-2.5"
+        ]
+      },
+      "text_calls": [
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 460,
+          "usage": {
+            "prompt_tokens": 460,
+            "completion_tokens": 55,
+            "total_tokens": 515,
+            "cost": 2.665e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.665e-05,
+              "upstream_inference_prompt_cost": 1.84e-05,
+              "upstream_inference_completions_cost": 8.25e-06
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where from?",
+          "value": "Zurich"
+        },
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 513,
+          "usage": {
+            "prompt_tokens": 491,
+            "completion_tokens": 63,
+            "total_tokens": 554,
+            "cost": 2.909e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.909e-05,
+              "upstream_inference_prompt_cost": 1.964e-05,
+              "upstream_inference_completions_cost": 9.45e-06
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where to? ",
+          "value": "London"
+        }
+      ],
+      "verification": {
+        "passed": true,
+        "checks": {
+          "search_page": true,
+          "one_way": true,
+          "origin": true,
+          "destination": true,
+          "date": true,
+          "year": true,
+          "results": true
+        },
+        "visible_flights": [
+          "From 216 US dollars.This price does not include overhead bin access. Nonstop flight with easyJet. Leaves Zurich Airport at 4:45 PM on Sunday, September 20 and arrives at London Gatwick Airport at 5:35 PM on Sunday, September 20. Total duration 1 hr 50 min. Select flight",
+          "From 265 US dollars. Nonstop flight with British Airways. Operated by BA Cityflyer. Leaves Zurich Airport at 8:25 PM on Sunday, September 20 and arrives at London City Airport at 9:00 PM on Sunday, September 20. Total duration 1 hr 35 min. Select flight",
+          "From 271 US dollars. Nonstop flight with British Airways. Leaves Zurich Airport at 1:20 PM on Sunday, September 20 and arrives at Heathrow Airport at 2:20 PM on Sunday, September 20. Total duration 2 hr. Select flight"
+        ]
+      },
+      "source_hashes": {
+        "questions.py": "66a7054b85040b949e1757311257ea0c5a843c635f9a40c99f6d15ad660fb422",
+        "__init__.py": "60f025b8d24465e2c0f7a3547d43b8020fd8843de7b6cb3f892ef63f5548cf63",
+        "model.py": "a85ada8458d23642c5c8a4095acf0565e6268f81dcda26f6308942b653e9c9f3",
+        "browser.py": "d2b0e468c2dac3f4d3cbba51f3619fe26fe44fb1554446363d8d1aff5efe22f2",
+        "agent.py": "be5434b79de0410352485e734ff4bb7a5d9556ce22ae47f231b5be3aa67161a4",
+        "demo.py": "a0cfb10909b370efb284cbbe16bdb4b7e7e06ba6385827404169027645a1d8a4"
+      },
+      "tokens": {
+        "input_tokens": 115547,
+        "output_tokens": 8131
+      },
+      "arm": "baseline",
+      "pair": 3,
+      "configuration": {
+        "TYPESAFE_MODEL": null,
+        "TEXT_MODEL": "inception/mercury-2.5",
+        "TEXT_MODEL_BASE_URL": "https://openrouter.ai/api/v1",
+        "TEXT_MODEL_REASONING": "none"
+      },
+      "browser_version": "Chrome/152.0.7977.83",
+      "task_hash": "bce327f45dc380ca9cd76fac5b70bfddd7ce36f8e083c1f900522af2a3499ff9",
+      "cdp": {
+        "Runtime.evaluate": {
+          "count": 148,
+          "ms": 1452.987
+        },
+        "Accessibility.getFullAXTree": {
+          "count": 30,
+          "ms": 1382.719
+        },
+        "Runtime.callFunctionOn": {
+          "count": 40,
+          "ms": 254.649
+        },
+        "DOM.resolveNode": {
+          "count": 828,
+          "ms": 1792.588
+        },
+        "DOM.getBoxModel": {
+          "count": 10,
+          "ms": 9.862
+        },
+        "DOM.getNodeForLocation": {
+          "count": 10,
+          "ms": 11.54
+        },
+        "Input.dispatchMouseEvent": {
+          "count": 20,
+          "ms": 356.041
+        },
+        "Input.dispatchKeyEvent": {
+          "count": 4,
+          "ms": 41.423
+        },
+        "Input.insertText": {
+          "count": 2,
+          "ms": 12.43
+        }
+      },
+      "error": null,
+      "browser_closed": true
+    },
+    {
+      "elapsed_ms": 7092,
+      "decision_requests": 16,
+      "decision_median_ms": 182.5,
+      "decision_total_ms": 2996,
+      "browser_actions": 12,
+      "wait_actions": 2,
+      "models": {
+        "decision": [
+          "jev-1.13.0"
+        ],
+        "text": [
+          "inception/mercury-2.5"
+        ]
+      },
+      "text_calls": [
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 540,
+          "usage": {
+            "prompt_tokens": 453,
+            "completion_tokens": 74,
+            "total_tokens": 527,
+            "cost": 2.922e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.922e-05,
+              "upstream_inference_prompt_cost": 1.812e-05,
+              "upstream_inference_completions_cost": 1.11e-05
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where from?",
+          "value": "Zurich"
+        },
+        {
+          "model": "inception/mercury-2.5",
+          "latency_ms": 499,
+          "usage": {
+            "prompt_tokens": 483,
+            "completion_tokens": 59,
+            "total_tokens": 542,
+            "cost": 2.817e-05,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 2.817e-05,
+              "upstream_inference_prompt_cost": 1.932e-05,
+              "upstream_inference_completions_cost": 8.85e-06
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            }
+          },
+          "field": "Where to? ",
+          "value": "London"
+        }
+      ],
+      "verification": {
+        "passed": true,
+        "checks": {
+          "search_page": true,
+          "one_way": true,
+          "origin": true,
+          "destination": true,
+          "date": true,
+          "year": true,
+          "results": true
+        },
+        "visible_flights": [
+          "From 216 US dollars.This price does not include overhead bin access. Nonstop flight with easyJet. Leaves Zurich Airport at 4:45 PM on Sunday, September 20 and arrives at London Gatwick Airport at 5:35 PM on Sunday, September 20. Total duration 1 hr 50 min.   Select flight",
+          "From 265 US dollars. Nonstop flight with British Airways. Operated by BA Cityflyer. Leaves Zurich Airport at 8:25 PM on Sunday, September 20 and arrives at London City Airport at 9:00 PM on Sunday, September 20. Total duration 1 hr 35 min.   Select flight",
+          "From 271 US dollars. Nonstop flight with British Airways. Leaves Zurich Airport at 1:20 PM on Sunday, September 20 and arrives at Heathrow Airport at 2:20 PM on Sunday, September 20. Total duration 2 hr.   Select flight"
+        ]
+      },
+      "source_hashes": {
+        "questions.py": "66a7054b85040b949e1757311257ea0c5a843c635f9a40c99f6d15ad660fb422",
+        "__init__.py": "60f025b8d24465e2c0f7a3547d43b8020fd8843de7b6cb3f892ef63f5548cf63",
+        "model.py": "a85ada8458d23642c5c8a4095acf0565e6268f81dcda26f6308942b653e9c9f3",
+        "browser.py": "6ef6c0cf9041f648c49bb09adf6b83d73ba301de5e87ffdeb03b0a4ce9e487ab",
+        "snapshot.js": "e50473501c8fb8e70f3b21866d987393e3f2315c639d638bd477d170e81ed78d",
+        "agent.py": "aaf8b271cb0ee6643fe7beb525328ab80de8568c7ac044d02b9c6721161e7c8b",
+        "demo.py": "a0cfb10909b370efb284cbbe16bdb4b7e7e06ba6385827404169027645a1d8a4"
+      },
+      "tokens": {
+        "input_tokens": 82661,
+        "output_tokens": 5783
+      },
+      "arm": "candidate",
+      "pair": 3,
+      "configuration": {
+        "TYPESAFE_MODEL": null,
+        "TEXT_MODEL": "inception/mercury-2.5",
+        "TEXT_MODEL_BASE_URL": "https://openrouter.ai/api/v1",
+        "TEXT_MODEL_REASONING": "none"
+      },
+      "browser_version": "Chrome/152.0.7977.83",
+      "task_hash": "bce327f45dc380ca9cd76fac5b70bfddd7ce36f8e083c1f900522af2a3499ff9",
+      "cdp": {
+        "Runtime.evaluate": {
+          "count": 71,
+          "ms": 2483.491
+        },
+        "Input.dispatchMouseEvent": {
+          "count": 20,
+          "ms": 328.154
+        },
+        "Input.dispatchKeyEvent": {
+          "count": 4,
+          "ms": 20.116
+        },
+        "Input.insertText": {
+          "count": 2,
+          "ms": 8.988
+        }
+      },
+      "error": null,
+      "browser_closed": true
+    }
+  ],
+  "scope": "Three alternating pairs of one task in one existing Chrome profile, 1120x780 viewport. All attempts included. Same goal, independent checker, models, and budgets. Live site/network/caches not controlled.",
+  "final_source_note": "After timing and recording, added stop-on-interruption handling for native SELECT. It changes a failure path not exercised by Flights. Covered by offline fault-injection and local browser checks."
+}

@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: uv sync --frozen --group dev
+      - run: uv run ruff check .
+      - run: uv run pytest -q
+      - run: node --check jev_ultrafast/snapshot.js
+      - run: node --check jev_ultrafast/static/app.js
+      - run: uv build

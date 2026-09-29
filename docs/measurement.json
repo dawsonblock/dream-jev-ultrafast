@@ -1,0 +1,92 @@
+{
+  "date": "2026-09-16",
+  "scope": "Three runs of one authored local fixture; not a general web evaluation.",
+  "timing": "First decision request through final DONE, including execution, observations, screenshots. Excludes Chrome startup and initial page load.",
+  "model": "jev-1.13.0",
+  "goals": [
+    "Enter \"Lisbon\" into the Destination field.",
+    "Click Find stays to search for Lisbon.",
+    "Set Stay category to Design.",
+    "Enable Free cancellation.",
+    "Open Casa Flora."
+  ],
+  "browser_viewport": [
+    1120,
+    780
+  ],
+  "platform": "macOS / Chrome / browser-harness 0.1.13",
+  "runs": [
+    {
+      "run": 1,
+      "elapsed_ms": 1242,
+      "actions": 5,
+      "requests": 6,
+      "request_latencies_ms": [
+        335,
+        125,
+        134,
+        105,
+        123,
+        123
+      ],
+      "final_url": "http://127.0.0.1:8766/fixture.html?scenario=travel#casa-flora",
+      "verified_final_text": "Your filters: Design \u00b7 Free cancellation enabled \u00b7 Destination Lisbon",
+      "text_helper": "literal from task (no LLM)"
+    },
+    {
+      "run": 2,
+      "elapsed_ms": 1086,
+      "actions": 5,
+      "requests": 6,
+      "request_latencies_ms": [
+        127,
+        111,
+        102,
+        120,
+        167,
+        140
+      ],
+      "final_url": "http://127.0.0.1:8766/fixture.html?scenario=travel#casa-flora",
+      "verified_final_text": "Your filters: Design \u00b7 Free cancellation enabled \u00b7 Destination Lisbon",
+      "text_helper": "literal from task (no LLM)"
+    },
+    {
+      "run": 3,
+      "elapsed_ms": 1311,
+      "actions": 5,
+      "requests": 6,
+      "request_latencies_ms": [
+        146,
+        143,
+        117,
+        202,
+        211,
+        198
+      ],
+      "final_url": "http://127.0.0.1:8766/fixture.html?scenario=travel#casa-flora",
+      "verified_final_text": "Your filters: Design \u00b7 Free cancellation enabled \u00b7 Destination Lisbon",
+      "text_helper": "literal from task (no LLM)"
+    }
+  ],
+  "median_ms": 1242,
+  "text_generation_run": {
+    "elapsed_ms": 4650,
+    "helper": "z-ai/glm-5.3-flash",
+    "typed": "Lisbon",
+    "verified": true
+  },
+  "source_sha256": {
+    "jev_ultrafast/questions.py": "5167c4b84206f6b038370edbb863d566dd313bd77855d3f4d91f9435b215edaf",
+    "jev_ultrafast/__init__.py": "60f025b8d24465e2c0f7a3547d43b8020fd8843de7b6cb3f892ef63f5548cf63",
+    "jev_ultrafast/model.py": "014c3f349420b0e84a3cba1b0849b38172e7ddca1558f190437058938ac9b059",
+    "jev_ultrafast/browser.py": "b4b73f9470e2cf2bf499d6bdc9295f9411f7ef1426bb87ff3089530260a5d1b5",
+    "jev_ultrafast/agent.py": "519289e4fd65b1d318f4b8b7e3951908eb31ab7a4455648abbe82442fde5855d",
+    "jev_ultrafast/demo.py": "f9ea4a5809062b95b017c3f7a09d744d408e57b05738855e5e41257b5d7817a2"
+  },
+  "media": {
+    "source": "First recorded travel run; six original screenshot observations",
+    "speed": 1,
+    "lead_in_ms": 750,
+    "endpoint_hold_ms": 1250
+  }
+}

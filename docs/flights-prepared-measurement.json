@@ -1,0 +1,176 @@
+{
+  "task": "Google Flights: Z\u00fcrich to London, one way, 20 September 2026, 1 adult, economy",
+  "initial_url": "https://www.google.com/travel/flights?hl=en",
+  "final_url": "https://www.google.com/travel/flights/search?tfs=CBwQAhooEgoyMDI2LTA5LTIwagwIAxIIL20vMDg5NjZyDAgDEggvbS8wNGpwbEABSAFwAYIBCwj___________8BmAEC&hl=en",
+  "elapsed_ms": 12884,
+  "timing": "First prediction after initial page observation through final DONE; includes decisions, actions, fresh observations, screenshots, loading waits, and discarded stale decisions. Excludes initial navigation and setup.",
+  "model": "jev-1.13.0",
+  "model_requests": 17,
+  "model_ms": 3050,
+  "model_median_ms": 179,
+  "model_min_ms": 132,
+  "model_max_ms": 264,
+  "browser_actions": 11,
+  "wait_actions": 1,
+  "text_model_calls": 0,
+  "text_values": "Copied Zurich and London from the explicit goal steps.",
+  "verification": {
+    "passed": true,
+    "checks": {
+      "search_page": true,
+      "one_way": true,
+      "origin": true,
+      "destination": true,
+      "date": true,
+      "year": true,
+      "results": true
+    },
+    "visible_flights": [
+      "From 216 US dollars.This price does not include overhead bin access. Nonstop flight with easyJet. Leaves Zurich Airport at 4:45 PM on Sunday, September 20 and arrives at London Gatwick Airport at 5:35 PM on Sunday, September 20. Total duration 1 hr 50 min. Select flight",
+      "From 265 US dollars. Nonstop flight with British Airways. Operated by BA Cityflyer. Leaves Zurich Airport at 8:25 PM on Sunday, September 20 and arrives at London City Airport at 9:00 PM on Sunday, September 20. Total duration 1 hr 35 min. Select flight",
+      "From 370 US dollars.This price does not include overhead bin access. Nonstop flight with SWISS. Leaves Zurich Airport at 5:10 PM on Sunday, September 20 and arrives at London Gatwick Airport at 5:50 PM on Sunday, September 20. Total duration 1 hr 40 min. Select flight"
+    ]
+  },
+  "goals": [
+    "Set ticket type to One way.",
+    "Set the departure city to \"Zurich\" and select Z\u00fcrich Switzerland from the autocomplete suggestions.",
+    "Set the destination city to \"London\" and select London United Kingdom from the autocomplete suggestions.",
+    "Set departure to Sunday September 20, 2026. Confirm the date picker.",
+    "Search flights and wait until flight results are visible for Z\u00fcrich to London, one way, September 20, 2026."
+  ],
+  "actions": [
+    {
+      "step": 1,
+      "kind": "click",
+      "action": "Change ticket type. Round trip",
+      "text": null,
+      "executed_ms": 423,
+      "elapsed_ms": 603,
+      "latency_ms": 241
+    },
+    {
+      "step": 2,
+      "kind": "click",
+      "action": "One way",
+      "text": null,
+      "executed_ms": 1261,
+      "elapsed_ms": 1644,
+      "latency_ms": 185
+    },
+    {
+      "step": 3,
+      "kind": "fill",
+      "action": "Where from?",
+      "text": "Zurich",
+      "executed_ms": 2338,
+      "elapsed_ms": 2670,
+      "latency_ms": 149
+    },
+    {
+      "step": 4,
+      "kind": "click",
+      "action": "Z\u00fcrich, Switzerland",
+      "text": null,
+      "executed_ms": 3027,
+      "elapsed_ms": 3387,
+      "latency_ms": 179
+    },
+    {
+      "step": 5,
+      "kind": "fill",
+      "action": "Where to? ",
+      "text": "London",
+      "executed_ms": 4527,
+      "elapsed_ms": 4695,
+      "latency_ms": 139
+    },
+    {
+      "step": 6,
+      "kind": "click",
+      "action": "London, United Kingdom",
+      "text": null,
+      "executed_ms": 5139,
+      "elapsed_ms": 5714,
+      "latency_ms": 184
+    },
+    {
+      "step": 7,
+      "kind": "click",
+      "action": "Open Departure",
+      "text": null,
+      "executed_ms": 6169,
+      "elapsed_ms": 6522,
+      "latency_ms": 180
+    },
+    {
+      "step": 8,
+      "kind": "click",
+      "action": "Sunday, September 20, 2026",
+      "text": null,
+      "executed_ms": 7053,
+      "elapsed_ms": 7349,
+      "latency_ms": 222
+    },
+    {
+      "step": 9,
+      "kind": "click",
+      "action": "Done. Search for one-way flights, departing on September 20, 2026",
+      "text": null,
+      "executed_ms": 9124,
+      "elapsed_ms": 9511,
+      "latency_ms": 227
+    },
+    {
+      "step": 10,
+      "kind": "click",
+      "action": "Search",
+      "text": null,
+      "executed_ms": 9861,
+      "elapsed_ms": 10234,
+      "latency_ms": 132
+    },
+    {
+      "step": 11,
+      "kind": "wait",
+      "action": "Wait for the page to update",
+      "text": null,
+      "executed_ms": 10677,
+      "elapsed_ms": 12030,
+      "latency_ms": 202
+    }
+  ],
+  "video": {
+    "source_frames": 81,
+    "speed": 1,
+    "intro_hold_ms": 750,
+    "end_hold_ms": 2000,
+    "privacy": "The Google navigation/account strip is cropped out of every frame."
+  },
+  "development_attempts": [
+    {
+      "attempt": 1,
+      "elapsed_ms": 14118,
+      "verified": true,
+      "notes": "Initial per-node CDP extraction."
+    },
+    {
+      "attempt": 2,
+      "elapsed_ms": 14162,
+      "verified": true,
+      "notes": "Batched layout extraction."
+    },
+    {
+      "attempt": 3,
+      "elapsed_ms": 1585,
+      "verified": false,
+      "notes": "Relaxed mutation freshness; stopped during menu animation. Change reverted."
+    },
+    {
+      "attempt": 4,
+      "elapsed_ms": 12884,
+      "verified": true,
+      "notes": "Strict freshness restored; recorded screencast."
+    }
+  ],
+  "scope": "Single public workflow with explicit ordered goals. Iterative development attempts, not a controlled benchmark. Existing Chrome profile and caches. Fares can change."
+}
