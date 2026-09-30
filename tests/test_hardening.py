@@ -295,3 +295,12 @@ def test_fresh_treats_unreachable_guard_as_stale():
     page = {"marker": "m", "page_key": "k", "guards": {"0": "g"}}
     assert b.fresh(page) is False
     assert b.fresh(page, {"kind": "click", "node": 0}) is False
+
+
+def test_select_guard_normalizes_option_value_like_snapshot():
+    """snapshot.js records clip(o.value): whitespace-normalized. The guarded
+    select must apply identical normalization or a value with irregular
+    spacing can never match and retries forever."""
+    src = Path(browser.__file__).read_text()
+    assert "String(o.value).replace(" in src
+    assert "String(o.label).replace(" in src

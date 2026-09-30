@@ -65,7 +65,9 @@ class Browser:
         if response.get("exceptionDetails"):
             if context_id is not None:
                 self.world_context = None
-            raise StalePage("Document changed during evaluation")
+            details = response["exceptionDetails"]
+            reason = (details.get("exception") or {}).get("description") or details.get("text") or "unknown"
+            raise StalePage(f"Document changed during evaluation: {reason.splitlines()[0][:200]}")
         return response.get("result", {}).get("value")
 
     def evaluate(self, expression):
@@ -223,7 +225,9 @@ def browser_operation(request):
         if result.get("exceptionDetails"):
             if operation == "act" and request["action"]["kind"] == "select":
                 raise RuntimeError("Dropdown execution was interrupted; inspect before retrying.")
-            raise StalePage("Document changed during evaluation")
+            details = result["exceptionDetails"]
+            reason = (details.get("exception") or {}).get("description") or details.get("text") or "unknown"
+            raise StalePage(f"Document changed during evaluation: {reason.splitlines()[0][:200]}")
         return result.get("result", {}).get("value")
 
     if operation == "act":
@@ -258,7 +262,7 @@ def browser_operation(request):
                       return {error:'unsupported-select'};
                     const o=e.options[action.option_index];
                     if (!o || o.disabled || o.closest('optgroup[disabled]') ||
-                        String(o.value).slice(0,512)!==String(action.value) ||
+                        String(o.value).replace(/\s+/g,' ').trim().slice(0,512)!==String(action.value) ||
                         String(o.label).replace(/\\s+/g,' ').trim().slice(0,256)!==String(action.option_label))
                       return {error:'stale-option'};
                     e.selectedIndex=action.option_index;

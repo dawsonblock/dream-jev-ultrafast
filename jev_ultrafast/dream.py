@@ -1357,7 +1357,10 @@ class PolicyRegistry:
         payload["tcb_version"] = TCB_VERSION
         payload["revision"] = int(payload.get("revision", 0)) + 1
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, self.path)
 
     def _current_baseline_digest(self, payload: dict) -> str:

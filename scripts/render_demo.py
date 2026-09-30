@@ -94,7 +94,7 @@ for i in range(round((end + 500) * 30 / 1000)):
         font=font(14),
         fill=muted,
     )
-    d.text((1194, 973), "github.com/browser-use/jev-ultrafast", font=font(12), fill=muted)
+    d.text((1194, 973), "github.com/dawsonblock/dream-jev-ultrafast", font=font(12), fill=muted)
     canvas.save(folder / f"{i:04d}.png")
 canvas.save(ROOT / "docs/flights-result.png")
 subprocess.run(

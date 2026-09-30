@@ -105,7 +105,7 @@ class Agent:
             node = action.get("node")
             if action.get("kind") in {"click", "fill", "select"} and node not in ordered_nodes:
                 ordered_nodes.append(node)
-        for element, node in zip(elements, ordered_nodes, strict=False):
+        for element, node in zip(elements, ordered_nodes, strict=True):
             element["node"] = node  # local inspector metadata; never sent to a decision backend
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
