@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
-from .dream import ExperienceStore, ExplorationPolicy, PolicyRegistry
+from .dream import ExperienceStore, ExplorationPolicy, PolicyRegistry, candidate_catalog_digest
 from .model import action_space, candidate_actions, choose, field_context, field_text
 from .policy import DefaultActionPolicy, assess_payload
 from .privacy import action_goal_overlap, tokenize
@@ -56,12 +56,14 @@ class Agent:
             )
             exploration_policy = registry.active_policy()
         self.exploration_policy = exploration_policy or ExplorationPolicy()
-        # Optional on-policy experiment config: {"model": ChoiceModel,
-        # "rate": ε, "rng": random.Random(...)}. When set, eligible steps
-        # execute the prior's divergent proposal — or the model's own choice
-        # as the control arm — with a recorded assignment probability. At most
-        # one trial per run so outcomes stay attributable. Validated here so a
-        # malformed config fails before the browser starts, not mid-run.
+        # Optional on-policy experiment config: {"model": ChoiceModel, "rate": ε,
+        # "rng": random.Random(...)} — or {"proposals": [...], "rate": ε} to run
+        # the stamped DreamReport.experiment_proposals plans themselves (matched
+        # to a live state by fingerprint). When set, eligible steps execute the
+        # prior's divergent proposal — or the model's own choice as the control
+        # arm — with a recorded assignment probability. At most one trial per
+        # run so outcomes stay attributable. Validated here so a malformed
+        # config fails before the browser starts, not mid-run.
         if experiment is not None:
             if not isinstance(experiment, dict):
                 raise ValueError("experiment must be a config dict")
@@ -71,8 +73,11 @@ class Agent:
                 raise ValueError("experiment rate must be a number") from None
             if not 0.0 < rate <= 1.0:
                 raise ValueError("experiment rate must be in (0, 1]")
-            if experiment.get("model") is None:
-                raise ValueError("experiment requires a fitted model")
+            proposals = experiment.get("proposals")
+            if proposals is not None and not isinstance(proposals, (list, tuple)):
+                raise ValueError("experiment proposals must be a list of stamped plans")
+            if experiment.get("model") is None and not proposals:
+                raise ValueError("experiment requires a fitted model or stamped proposals")
         self.experiment = experiment
         if isinstance(dream_store, (str, Path)):
             dream_store = ExperienceStore(dream_store)
@@ -352,7 +357,7 @@ class Agent:
                 # bypass policy assessment, approval, or payload review.
                 trial_model = experiment.get("model")
                 rate = float(experiment.get("rate", 0.0) or 0.0)
-                if trial_model is not None and 0.0 < rate <= 1.0:
+                if 0.0 < rate <= 1.0:
                     offered_now, _ = candidate_actions(
                         page["actions"], state["goal"],
                         exploration_policy=getattr(self, "exploration_policy", None),
@@ -366,14 +371,77 @@ class Agent:
                         {**c, "goal_overlap": action_goal_overlap(c, goal_tokens)}
                         for c in offered_now
                     ]
-                    proposal = trial_model.choose(offered_now)
-                    if proposal is not None and proposal["id"] != selected and any(
-                        a["id"] == proposal["id"] for a in page["actions"]
+                    # A stamped DreamReport experiment proposal is matched to
+                    # this state by fingerprint; otherwise the live model
+                    # chooses from the same bounded catalogue.
+                    stamped = next(
+                        (
+                            p for p in experiment.get("proposals") or ()
+                            if isinstance(p, dict)
+                            and p.get("state") == page.get("fingerprint")
+                        ),
+                        None,
+                    )
+                    proposal = (
+                        dict(stamped.get("proposal") or {})
+                        if stamped is not None
+                        else (trial_model.choose(offered_now) if trial_model is not None else None)
+                    )
+                    # Hard boundary: a proposal is eligible only if it is one of
+                    # the actions the exploration policy actually offered the
+                    # model — page["actions"] is the pre-policy catalogue and
+                    # must never widen the experimental surface.
+                    offered_ids = {a["id"] for a in offered_now}
+                    if (
+                        proposal is not None
+                        and proposal.get("id") is not None
+                        and proposal["id"] != selected
+                        and proposal["id"] in offered_ids
                     ):
                         state["experiment_spent"] = True
                         rng = experiment.get("rng")
                         roll = (rng.random() if rng is not None else random.random())
                         arm = "candidate" if roll < rate else "control"
+                        selected_rank = next(
+                            (i for i, a in enumerate(offered_now) if a["id"] == selected),
+                            None,
+                        )
+                        expected_delta = None
+                        if stamped is not None:
+                            expected_delta = stamped.get("expected_delta")
+                        elif selected_rank is not None and callable(getattr(trial_model, "predict", None)):
+                            baseline_pred = trial_model.predict(
+                                kind=action.get("kind"),
+                                goal_overlap=offered_now[selected_rank].get("goal_overlap", 0),
+                                rank=selected_rank,
+                            )
+                            if (
+                                isinstance(baseline_pred, dict)
+                                and isinstance(baseline_pred.get("p_progress"), (int, float))
+                                and isinstance(proposal.get("p_progress"), (int, float))
+                            ):
+                                expected_delta = float(proposal["p_progress"]) - float(
+                                    baseline_pred["p_progress"]
+                                )
+                        policy = getattr(self, "exploration_policy", None)
+                        policy_digest = getattr(policy, "behavior_digest", None)
+                        model_digest = getattr(trial_model, "digest", None)
+                        proposal_digest = hashlib.sha256(
+                            json.dumps(
+                                {
+                                    "state": page.get("fingerprint"),
+                                    "model_choice_id": selected,
+                                    "proposal_id": proposal["id"],
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        # Immutable assignment: everything a later audit needs
+                        # to re-derive what was proposed and why is frozen here
+                        # — the offered catalogue, the policy behavior digest,
+                        # the model's identity, and the prior's own predicted
+                        # delta and uncertainty.
                         experiment_meta = {
                             "arm": arm,
                             "assignment_probability": (
@@ -383,22 +451,38 @@ class Agent:
                             "proposal_kind": proposal.get("kind"),
                             "model_choice_id": selected,
                             "model_choice_kind": action.get("kind"),
-                            "proposal_digest": hashlib.sha256(
-                                json.dumps(
-                                    {
-                                        "state": page.get("fingerprint"),
-                                        "model_choice_id": selected,
-                                        "proposal_id": proposal["id"],
-                                    },
-                                    sort_keys=True,
-                                    separators=(",", ":"),
-                                ).encode("utf-8")
-                            ).hexdigest(),
+                            "proposal_digest": proposal_digest,
+                            "stamped_digest": stamped.get("digest") if stamped else None,
+                            "choice_model_digest": (
+                                model_digest if isinstance(model_digest, str) else None
+                            ),
+                            "policy_behavior_digest": (
+                                policy_digest if isinstance(policy_digest, str) else None
+                            ),
+                            "offered_catalogue_digest": candidate_catalog_digest(offered_now),
+                            "proposal_p_progress": proposal.get("p_progress"),
+                            "proposal_uncertainty": proposal.get("uncertainty"),
+                            "expected_delta": expected_delta,
+                            "experiment_id": (
+                                stamped["digest"][:16]
+                                if stamped and stamped.get("digest")
+                                else proposal_digest[:16]
+                            ),
                         }
+                        # Randomization is evidence in its own right: record it
+                        # BEFORE the authority plane so a denied, rejected,
+                        # stale, or aborted trial still marks this run as
+                        # experimental and can never qualify as a canary.
+                        if getattr(self, "dream_recorder", None):
+                            self.dream_recorder.event(
+                                "experiment_assigned",
+                                state=page.get("fingerprint"),
+                                experiment=experiment_meta,
+                            )
                         if arm == "candidate":
                             selected = proposal["id"]
                             action = next(
-                                a for a in page["actions"] if a["id"] == selected
+                                a for a in offered_now if a["id"] == selected
                             )
 
             browser_actions = [h for h in state["history"] if h.get("kind") not in {"verification", "approval"}]
@@ -491,6 +575,10 @@ class Agent:
                         "action": action,
                         "fingerprint": page["fingerprint"],
                         "payload_digest": payload_digest,
+                        # The exact generated value under review, so the
+                        # approval screen can show precisely what the grant
+                        # covers — the digest alone is opaque to a human.
+                        "payload_preview": text,
                         # A trial assigned this step keeps its provenance across
                         # the approval pause; reject still drops the assignment.
                         "experiment": experiment_meta,

@@ -103,13 +103,27 @@ class DreamTraceRecorder:
             if compact_offered is not None
             else None
         )
-        # Behavior-policy propensities: without them a later counterfactual
-        # estimate has no denominator for inverse-propensity weighting and
-        # observational correlation is indistinguishable from evidence.
+        # The executor selects by deterministic argmax over the model's heads,
+        # so head probabilities are model *scores*, not sampling propensities —
+        # treating one as a propensity would let an off-policy estimator
+        # weight by a denominator that never existed. The only real behavior
+        # propensity is an experiment's recorded ``assignment_probability``;
+        # deterministic selection records ``behavior_propensity = None``.
         probabilities = decision.get("probabilities") or {}
         operation_probabilities = decision.get("operation_probabilities") or {}
         target_probabilities = decision.get("target_probabilities") or {}
         target = decision.get("target")
+        operation_p = operation_probabilities.get(decision.get("operation"))
+        target_p = target_probabilities.get(target) if target is not None else None
+        if operation_p is not None and target_p is not None:
+            joint_model_score = operation_p * target_p
+        elif operation_p is not None:
+            joint_model_score = operation_p
+        else:
+            joint_model_score = target_p
+        assignment_propensity = None
+        if isinstance(experiment, dict) and experiment.get("assignment_probability") is not None:
+            assignment_propensity = float(experiment["assignment_probability"])
         self._append({
             "event": "transition",
             "state": before.get("fingerprint", ""),
@@ -131,11 +145,16 @@ class DreamTraceRecorder:
             "offered_count": len(compact_offered) if compact_offered is not None else None,
             "selected_observed_rank": selected_observed_rank,
             "selected_offered_rank": selected_offered_rank,
-            "selected_propensity": probabilities.get(action.get("id")),
-            "operation_probability": operation_probabilities.get(decision.get("operation")),
-            "target_probability": (
-                target_probabilities.get(target) if target is not None else None
-            ),
+            # selection_mode is "argmax": deterministic execution has no
+            # behavior propensity, so behavior_propensity stays None. The
+            # model's own scores are kept under honest names — a score is
+            # evidence of model preference, not of assignment probability.
+            "selection_mode": "argmax",
+            "behavior_propensity": assignment_propensity,
+            "selected_model_score": probabilities.get(action.get("id")),
+            "joint_model_score": joint_model_score,
+            "operation_probability": operation_p,
+            "target_probability": target_p,
             "decision_confidence": decision.get("confidence"),
             "action_probabilities": {
                 str(k): round(float(v), 6) for k, v in probabilities.items()

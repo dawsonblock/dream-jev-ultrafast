@@ -740,3 +740,132 @@ def test_experiment_only_assigns_one_trial_per_run(runner):
     runner.state["status"] = "predicted"
     runner.command("act", {"fingerprint": p["fingerprint"]})
     proposal_model.choose.assert_not_called()
+
+
+def test_experiment_proposal_must_be_an_offered_action(runner, tmp_path):
+    """A proposal outside the policy-filtered offered catalogue is rejected —
+    existing in page["actions"] is not enough. The run just executes the
+    model's own choice with no trial recorded."""
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    p = runner.state["page"]
+    # "good" overlaps the goal ("book") so it survives min_goal_overlap=1;
+    # "filtered" does not, so the policy never offers it to the model.
+    p["actions"].append(
+        {"id": "good", "kind": "click", "label": "book order", "role": "button", "node": 40}
+    )
+    p["actions"].append(
+        {"id": "filtered", "kind": "click", "label": "unrelated", "role": "button", "node": 50}
+    )
+    p["fingerprint"] = fingerprint(p)
+    runner.exploration_policy = ExplorationPolicy(min_goal_overlap=1)
+    proposal_model = Mock()
+    proposal_model.choose = Mock(return_value={"id": "filtered", "kind": "click"})
+    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.state["decision"] = decision("e3")
+    runner.state["status"] = "predicted"
+    state = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "ready"
+    # The filtered proposal never executed and no trial was assigned.
+    runner.state["browser"].act.assert_called_once()
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e3"
+    assert all(e.get("experiment") is None for e in store.load())
+
+
+def test_experiment_assignment_is_recorded_before_authority(runner, tmp_path):
+    """The experiment_assigned event lands at randomization — before policy,
+    approval, or execution — so an operator-rejected trial still marks the
+    whole run experimental and unfit for canary."""
+    from jev_ultrafast.dream import (
+        CanaryMetrics,
+        ExperienceStore,
+        ExplorationPolicy,
+    )
+    from jev_ultrafast.policy import DefaultActionPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    runner.policy = DefaultActionPolicy()
+    runner.exploration_policy = ExplorationPolicy()
+    p = runner.state["page"]
+    p["actions"].append(
+        {"id": "buy", "kind": "click", "label": "Buy now", "role": "button", "node": 30}
+    )
+    p["fingerprint"] = fingerprint(p)
+    proposal_model = Mock()
+    proposal_model.choose = Mock(return_value={"id": "buy", "kind": "click"})
+    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+
+    state = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "approval_required"
+    assigned = next(e for e in store.load() if e["event"] == "experiment_assigned")
+    assert assigned["experiment"]["arm"] == "candidate"
+    assert assigned["experiment"]["proposal_id"] == "buy"
+    # The frozen plan carries the full provenance binding.
+    meta = assigned["experiment"]
+    for field in (
+        "proposal_digest", "policy_behavior_digest", "offered_catalogue_digest",
+        "experiment_id",
+    ):
+        assert meta[field], field
+    runner.command("reject")
+    # The operator vetoed the trial: no transition exists, yet the run is
+    # still unmistakably experimental and excluded from canary.
+    runner.dream_recorder.finish(status="blocked", verified=False)
+    events = store.load()
+    assert not any(e["event"] == "transition" for e in events)
+    assert CanaryMetrics.from_events(events, ExplorationPolicy().digest).tasks == 0
+
+
+def test_experiment_stamped_proposal_executes_the_plan(runner, tmp_path):
+    """experiment={"proposals": [...]} consumes the stamped DreamReport plan
+    itself — matched to the live state by fingerprint — rather than re-asking
+    a live model."""
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    p = runner.state["page"]
+    stamped = {
+        "state": p["fingerprint"],
+        "step": 0,
+        "proposal": {"id": "e3", "kind": "click", "p_progress": 0.9, "uncertainty": 0.1},
+        "historical": {"id": "e1"},
+        "expected_delta": 0.4,
+        "digest": "ab" * 32,
+    }
+    runner.experiment = {"proposals": [stamped], "rate": 1.0}
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e3"
+    events = store.load()
+    assigned = next(e for e in events if e["event"] == "experiment_assigned")
+    trial = next(e for e in events if e["event"] == "transition")
+    assert assigned["experiment"]["stamped_digest"] == stamped["digest"]
+    assert assigned["experiment"]["experiment_id"] == stamped["digest"][:16]
+    assert assigned["experiment"]["expected_delta"] == 0.4
+    assert trial["experiment"]["stamped_digest"] == stamped["digest"]
+
+
+def test_experiment_proposals_config_validated_in_init(monkeypatch):
+    browser_cls = Mock()
+    monkeypatch.setattr(loop, "Browser", browser_cls)
+    # Stamped proposals alone are a valid experiment config — no model needed.
+    loop.Agent("https://example.test", "goal", experiment={
+        "proposals": [{"state": "s", "proposal": {"id": "x"}}], "rate": 1.0,
+    })
+    with pytest.raises(ValueError, match="proposals"):
+        loop.Agent("https://example.test", "goal", experiment={
+            "proposals": "notalist", "rate": 0.5,
+        })

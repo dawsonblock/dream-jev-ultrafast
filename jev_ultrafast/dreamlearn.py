@@ -12,8 +12,9 @@ These are Level-1/Level-2 learners in the DREAM stack:
   transition effects (did the page change?). It annotates candidates with prior
   expectations for experiment design; it is never consulted by a gate.
 - Level 3 (``ChoiceModel``): an uncertainty-aware counterfactual choice prior
-  trained on verified progress (page change for intermediate steps, verified
-  completion for terminal ones) over the action's *offered* rank. It predicts
+  trained on trajectory success — the run's final independently verified
+  outcome labels every step of that run — over the action's *offered* rank.
+  It predicts
   under the candidate policy's *own* recomputed offered rank and proposes
   which offered action it would prefer (posterior mean plus an exploration
   bonus on posterior stddev), abstaining via an explicit ``confident`` flag on
@@ -186,12 +187,13 @@ def rank_bucket(rank: int | None) -> str:
 
 
 def _transitions(events: Iterable[dict]):
-    """Yield ``(transition_event, run_policy, terminal, verified_done)``.
+    """Yield ``(transition_event, run_policy, terminal, verified_done, run_verified)``.
 
     Run context supplies the policy needed to re-derive the offered catalogue
-    (the rank coordinate the models train on) and the terminal verified outcome
-    (the signal that separates progress from mere page activity). Transitions
-    without a run_id are still usable, just without run context.
+    (the rank coordinate the models train on), the terminal verified outcome,
+    and the run-level verified outcome that applies to *every* step of the
+    trajectory. Transitions without a run_id are still usable, just without
+    run context (both verified signals are False for them).
     """
     events = list(events)
     runs: dict[str, list[dict]] = defaultdict(list)
@@ -211,16 +213,20 @@ def _transitions(events: Iterable[dict]):
                 policy = ExplorationPolicy.from_dict(start["policy"])
             except (ValueError, TypeError):
                 policy = None
+        # The run's final independently verified outcome — one label for the
+        # whole trajectory. Every transition in a verified run shares it, so
+        # intermediate page movement can never launder a failed trajectory.
+        run_verified = bool(
+            final is not None and final.get("status") == "done" and final.get("verified")
+        )
         transitions = [e for e in run_events if e.get("event") == "transition"]
         for index, event in enumerate(transitions):
             terminal = index == len(transitions) - 1 and final is not None
-            verified_done = bool(
-                terminal and final.get("status") == "done" and final.get("verified")
-            )
-            yield event, policy, terminal, verified_done
+            verified_done = bool(terminal and run_verified)
+            yield event, policy, terminal, verified_done, run_verified
     for event in loose:
         if event.get("event") == "transition":
-            yield event, None, False, False
+            yield event, None, False, False, False
 
 
 def _selected_offered_rank(event: dict, policy: ExplorationPolicy | None) -> int | None:
@@ -252,15 +258,16 @@ def _selected_offered_rank(event: dict, policy: ExplorationPolicy | None) -> int
 def _fit_cells(events: Iterable[dict], label) -> tuple[dict, dict, int, int]:
     """Count outcomes per ``(kind, overlap_bucket, offered_rank_bucket)`` cell.
 
-    ``label(event, terminal, verified_done)`` decides what counts as a positive
-    observation; the rank coordinate is always the offered-catalogue rank so
-    training and counterfactual replay share one basis.
+    ``label(event, terminal, verified_done, run_verified)`` decides what counts
+    as a positive observation; the rank coordinate is always the
+    offered-catalogue rank so training and counterfactual replay share one
+    basis.
     """
     cell_counts: dict[tuple[str, str, str], list[int]] = {}
     kind_counts: dict[str, list[int]] = {}
     positive_total = 0
     samples = 0
-    for event, policy, terminal, verified_done in _transitions(events):
+    for event, policy, terminal, verified_done, run_verified in _transitions(events):
         selected = event.get("selected") or {}
         kind = str(selected.get("kind") or "unknown")
         selected_id = selected.get("id")
@@ -270,7 +277,7 @@ def _fit_cells(events: Iterable[dict], label) -> tuple[dict, dict, int, int]:
             0,
         )
         rank = _selected_offered_rank(event, policy)
-        positive = int(bool(label(event, terminal, verified_done)))
+        positive = int(bool(label(event, terminal, verified_done, run_verified)))
         cell = (kind, overlap_bucket(overlap), rank_bucket(rank))
         cell_counts.setdefault(cell, [0, 0])
         cell_counts[cell][0] += 1
@@ -302,7 +309,8 @@ class OutcomeModel:
     @classmethod
     def fit(cls, events: Iterable[dict]) -> "OutcomeModel":
         cell_counts, kind_counts, changed_total, samples = _fit_cells(
-            events, lambda event, terminal, verified_done: bool(event.get("page_changed"))
+            events,
+            lambda event, terminal, verified_done, run_verified: bool(event.get("page_changed")),
         )
         return cls(
             samples=samples,
@@ -372,11 +380,14 @@ class ChoiceModel:
       recorded policy actually *offered* — replay queries the model under the
       candidate policy's recomputed offered rank, so both sides share the
       offered-rank basis instead of mixing in the pre-policy observed rank.
-    - The learned target is verified progress rather than raw page activity:
-      intermediate transitions count their ``page_changed`` observation, but
-      a run's terminal transition counts only when the run ended ``done`` and
-      verifier-passed. A page change that ended in failure or an unverified
-      self-report does not teach the prior that the action was good.
+    - The learned target is the run's final independently verified outcome:
+      every action on a trajectory that ended verifier-confirmed ``done`` is
+      a positive association, and every action on a failed or unverified run
+      is a negative. This is deliberate *trajectory* credit — correlational,
+      not per-action causality — and it restores the hardened v0.6.2 labeling:
+      intermediate ``page_changed`` movement must never let a run the verifier
+      rejected teach the prior that its actions were good. Per-action causal
+      credit is the job of ``CounterfactualTrials``, which randomizes.
     - Every prediction carries the posterior standard deviation and an
       explicit ``confident`` flag; on sparse cells the model abstains rather
       than returning a smoothed guess.
@@ -397,18 +408,19 @@ class ChoiceModel:
     cells: tuple[tuple[str, str, str, int, int], ...] = ()
     kind_totals: tuple[tuple[str, int, int], ...] = ()
     global_positive: int = 0
-    version: str = "jev-choice/2"
+    version: str = "jev-choice/3"
 
     MIN_CONFIDENT = 4
     EXPLORE_BONUS = 0.5
 
     @classmethod
     def fit(cls, events: Iterable[dict]) -> "ChoiceModel":
+        # Trajectory-success association (v0.6.2 semantics): the label is the
+        # run's verified final outcome for *every* step, not the step's page
+        # change. Transitions without run context carry run_verified=False.
         cell_counts, kind_counts, positive_total, samples = _fit_cells(
             events,
-            lambda event, terminal, verified_done: (
-                verified_done if terminal else bool(event.get("page_changed"))
-            ),
+            lambda event, terminal, verified_done, run_verified: run_verified,
         )
         return cls(
             samples=samples,
@@ -525,24 +537,29 @@ class CounterfactualTrials:
     Each cell is keyed by the *context* the tension arose in — the model
     choice's ``(kind, overlap_bucket)`` — and holds one estimate per arm:
     ``candidate`` (the prior's proposal was executed) versus ``control``
-    (the model's own choice was executed). Outcomes use the same
-    verified-progress label as ``ChoiceModel``: intermediate steps count
-    their page change, terminal steps require verifier-confirmed ``done``.
+    (the model's own choice was executed).
+
+    The primary endpoint is the run's final independently verified outcome:
+    since at most one trial is assigned per run, ``p_success`` answers the
+    actual experimental question — did assigning the proposal help the run
+    the verifier judged? A mid-run page change is secondary telemetry only
+    (``p_page_changed``); crediting it as progress let a trial whose run
+    ultimately failed report the exact opposite of reality.
 
     Estimates annotate reports only; a promising candidate arm still has to
     qualify through the replay + bound-canary path like everything else.
     """
 
-    # (context_key, arm, trials, weighted_positive, weight_sum, weight_sq_sum)
-    cells: tuple[tuple[str, str, int, float, float, float], ...] = ()
-    version: str = "jev-trials/1"
+    # (context_key, arm, trials, weighted_success, weighted_page, w_sum, w_sq)
+    cells: tuple[tuple[str, str, int, float, float, float, float], ...] = ()
+    version: str = "jev-trials/2"
 
     MIN_ESS = 4.0
 
     @classmethod
     def fit(cls, events: Iterable[dict]) -> "CounterfactualTrials":
         acc: dict[tuple[str, str], list[float]] = {}
-        for event, _policy, terminal, verified_done in _transitions(events):
+        for event, _policy, _terminal, _verified_done, run_verified in _transitions(events):
             meta = event.get("experiment")
             if not isinstance(meta, dict):
                 continue
@@ -579,20 +596,20 @@ class CounterfactualTrials:
                 f"{str(meta.get('model_choice_kind') or selected.get('kind') or 'unknown')}"
                 f"|{overlap}"
             )
-            positive = float(
-                bool(verified_done if terminal else event.get("page_changed"))
-            )
             weight = 1.0 / propensity
-            cell = acc.setdefault((context, arm), [0, 0.0, 0.0, 0.0])
+            cell = acc.setdefault((context, arm), [0, 0.0, 0.0, 0.0, 0.0])
             cell[0] += 1
-            cell[1] += positive * weight
-            cell[2] += weight
-            cell[3] += weight * weight
+            # Primary endpoint: the run's final verified outcome. Secondary
+            # telemetry: whether the trial step itself moved the page.
+            cell[1] += float(run_verified) * weight
+            cell[2] += float(bool(event.get("page_changed"))) * weight
+            cell[3] += weight
+            cell[4] += weight * weight
         return cls(
             cells=tuple(
                 sorted(
-                    (context, arm, n, wpos, wsum, wsq)
-                    for (context, arm), (n, wpos, wsum, wsq) in acc.items()
+                    (context, arm, n, wsuccess, wpage, wsum, wsq)
+                    for (context, arm), (n, wsuccess, wpage, wsum, wsq) in acc.items()
                 )
             )
         )
@@ -605,13 +622,16 @@ class CounterfactualTrials:
         cannot masquerade as a confident estimate.
         """
         arms: dict[str, dict] = {}
-        for ctx, arm, n, wpos, wsum, wsq in self.cells:
+        for ctx, arm, n, wsuccess, wpage, wsum, wsq in self.cells:
             if context is not None and ctx != context:
                 continue
             entry = arms.setdefault(ctx, {})
             ess = (wsum * wsum / wsq) if wsq else 0.0
             entry[arm] = {
-                "p_progress": (wpos / wsum) if wsum else 0.0,
+                # Primary endpoint: verified run success. ``p_page_changed``
+                # is secondary telemetry — never a treatment effect.
+                "p_success": (wsuccess / wsum) if wsum else 0.0,
+                "p_page_changed": (wpage / wsum) if wsum else 0.0,
                 "trials": n,
                 "ess": ess,
                 "reliable": ess >= self.MIN_ESS,
@@ -619,7 +639,7 @@ class CounterfactualTrials:
         for entry in arms.values():
             if "candidate" in entry and "control" in entry:
                 entry["delta"] = (
-                    entry["candidate"]["p_progress"] - entry["control"]["p_progress"]
+                    entry["candidate"]["p_success"] - entry["control"]["p_success"]
                 )
                 # The contrast is only as trustworthy as its weaker arm.
                 entry["delta_reliable"] = (
@@ -640,7 +660,10 @@ class CounterfactualTrials:
         unknown = set(payload) - allowed
         if unknown:
             raise ValueError(f"Unknown counterfactual-trials keys: {sorted(unknown)}")
+        cells = tuple(tuple(c) for c in payload.get("cells", ()))
+        if any(len(c) != 7 for c in cells):
+            raise ValueError("Unsupported counterfactual-trials cell arity")
         return cls(
-            cells=tuple(tuple(c) for c in payload.get("cells", ())),
+            cells=cells,
             version=payload.get("version", "jev-trials/1"),
         )

@@ -16,6 +16,9 @@ jobs:
         with:
           node-version: 22
       - run: uv sync --frozen --group dev
+      # Release-tree integrity: the manifest must match the committed files —
+      # a stale MANIFEST.sha256 is itself a failure, so verify before building.
+      - run: sha256sum -c MANIFEST.sha256
       - run: uv run ruff check .
       - run: uv run pytest -q
       - run: node --check jev_ultrafast/snapshot.js

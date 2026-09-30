@@ -1123,8 +1123,9 @@ def test_trace_records_observed_and_offered_catalogues(tmp_path):
 
 
 def test_trace_records_behavior_propensities(tmp_path):
-    """Off-policy groundwork: the recorded behavior-policy probabilities are the
-    denominator any future counterfactual estimate is weighted by."""
+    """Model scores are recorded under honest names and the behavior
+    propensity is None: deterministic argmax selection has no sampling
+    propensity, so a score must never be weightable as one."""
     store = ExperienceStore(tmp_path / "propensity.jsonl")
     policy = ExplorationPolicy(min_goal_overlap=1)
     recorder = DreamTraceRecorder(store, goal="Open target")
@@ -1150,7 +1151,11 @@ def test_trace_records_behavior_propensities(tmp_path):
     event = next(e for e in store.load() if e["event"] == "transition")
     assert event["selected_observed_rank"] == 1
     assert event["selected_offered_rank"] == 0
-    assert event["selected_propensity"] == 0.8
+    assert event["selection_mode"] == "argmax"
+    assert event["behavior_propensity"] is None
+    assert "selected_propensity" not in event
+    assert event["selected_model_score"] == 0.8
+    assert event["joint_model_score"] == 0.7 * 0.8
     assert event["operation_probability"] == 0.7
     assert event["target_probability"] == 0.8
     assert event["decision_confidence"] == 0.9
@@ -1158,7 +1163,33 @@ def test_trace_records_behavior_propensities(tmp_path):
     transition = ReplayWorld.from_events(store.load())[0].trajectory[0]
     assert transition.selected_observed_rank == 1
     assert transition.selected_offered_rank == 0
-    assert transition.selected_propensity == 0.8
+    assert transition.selected_propensity is None
+
+
+def test_trace_trial_step_records_assignment_propensity(tmp_path):
+    """A randomized trial step DOES have an honest behavior propensity — the
+    scheduler's assignment probability — and it is the one an IPW estimator
+    may weight by."""
+    store = ExperienceStore(tmp_path / "trial-propensity.jsonl")
+    recorder = DreamTraceRecorder(store, goal="Open target")
+    page = {"fingerprint": "A", "url": "https://example.test"}
+    recorder.start(page, ExplorationPolicy())
+    actions = [{"id": "p", "kind": "click", "node": 1, "label": "Proposal"}]
+    recorder.transition(
+        before=page, after={"fingerprint": "B", "url": "https://example.test"},
+        action=actions[0], decision={"latency_ms": 1, "usage": {}},
+        candidates=actions, offered=actions,
+        experiment={
+            "arm": "candidate", "assignment_probability": 0.25,
+            "proposal_id": "p", "model_choice_id": "m",
+        },
+    )
+    recorder.finish(status="done", verified=True)
+    event = next(e for e in store.load() if e["event"] == "transition")
+    assert event["selection_mode"] == "argmax"
+    assert event["behavior_propensity"] == 0.25
+    transition = ReplayWorld.from_events(store.load())[0].trajectory[0]
+    assert transition.selected_propensity == 0.25
 
 
 def test_replay_world_rejects_inconsistent_offered_metadata(tmp_path):
@@ -1501,6 +1532,111 @@ def test_registry_signature_strip_fails_under_a_signer(tmp_path):
     # signer check can catch this.
     with pytest.raises(ValueError, match="Unsigned policy registry state"):
         PolicyRegistry(path, signer=signer).load()
+
+
+def test_registry_anchor_detects_snapshot_restore(tmp_path):
+    """The signed state head proves authenticity; the external anchor proves
+    freshness. Restoring an older *complete* signed file — every signature
+    intact — still fails closed because the anchor remembers the newer head."""
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"a" * 32)
+    anchor_path = tmp_path / "anchored.head.json"
+    registry = PolicyRegistry(
+        tmp_path / "anchored.json", signer=signer, verify_keys={signer.key_id},
+        anchor_path=anchor_path,
+    )
+    worlds = _efficiency_world(tmp_path)
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds, ExplorationPolicy())
+    registry.stage(report)
+    path = tmp_path / "anchored.json"
+    first_state = path.read_bytes()
+    permissive = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=0, min_paired_task_families=0)
+    registry.promote(
+        CanaryMetrics(1, 1), CanaryMetrics(1, 1),
+        gate=permissive, allow_unbound_metrics=True,
+    )
+    assert anchor_path.exists()
+
+    # Wholesale restore of the older signed snapshot: self-consistently
+    # signed, but it rewinds active/staged state the anchor knows is stale.
+    path.write_bytes(first_state)
+    reader = PolicyRegistry(
+        path, signer=signer, verify_keys={signer.key_id}, anchor_path=anchor_path)
+    with pytest.raises(ValueError, match="anchor disagrees"):
+        reader.load()
+    # Explicit operator repair — never silent — acknowledges the restore.
+    anchor = reader.reanchor()
+    assert anchor["kind"] == "registry_head_anchor"
+    assert reader.load()["staged"] is not None
+
+
+def test_registry_anchor_missing_and_unsigned_fail_closed(tmp_path):
+    """A configured anchor must exist and — under trust keys — be signed;
+    deletion or a forged unsigned anchor is tampering, not a clean start."""
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"b" * 32)
+    anchor_path = tmp_path / "a.head.json"
+    registry = PolicyRegistry(
+        tmp_path / "a.json", signer=signer, verify_keys={signer.key_id},
+        anchor_path=anchor_path,
+    )
+    worlds = _efficiency_world(tmp_path)
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds, ExplorationPolicy())
+    registry.stage(report)
+
+    anchor_path.unlink()
+    with pytest.raises(ValueError, match="anchor missing"):
+        PolicyRegistry(
+            tmp_path / "a.json", signer=signer, verify_keys={signer.key_id},
+            anchor_path=anchor_path).load()
+
+    # A forged unsigned anchor — attacker recomputes the content digest but
+    # cannot produce the signature — still fails under configured keys.
+    import hashlib
+    material = {
+        "kind": "registry_head_anchor", "head": "0" * 64,
+        "revision": 0, "signed_at_ms": 1,
+    }
+    forged = {**material, "digest": hashlib.sha256(
+        (PolicyRegistry._REGISTRY_ANCHOR_CONTENT_DOMAIN + "\n"
+         + json.dumps(material, sort_keys=True, separators=(",", ":"))).encode()
+    ).hexdigest()}
+    anchor_path.write_text(json.dumps(forged))
+    with pytest.raises(ValueError, match="Unsigned registry head anchor"):
+        PolicyRegistry(
+            tmp_path / "a.json", signer=signer, verify_keys={signer.key_id},
+            anchor_path=anchor_path).load()
+
+
+def test_registry_anchor_detects_deleted_registry(tmp_path):
+    """A registry file deleted under a live anchor is not an empty registry."""
+    anchor_path = tmp_path / "gone.head.json"
+    registry = PolicyRegistry(tmp_path / "gone.json", anchor_path=anchor_path)
+    worlds = _efficiency_world(tmp_path)
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds, ExplorationPolicy())
+    registry.stage(report)
+    (tmp_path / "gone.json").unlink()
+    with pytest.raises(ValueError, match="head anchor"):
+        PolicyRegistry(tmp_path / "gone.json", anchor_path=anchor_path).load()
+
+
+def test_registry_without_anchor_is_unchanged(tmp_path):
+    """Anchor behavior is strictly opt-in: an unanchored registry behaves
+    exactly as before."""
+    registry = PolicyRegistry(tmp_path / "plain.json")
+    worlds = _efficiency_world(tmp_path)
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds, ExplorationPolicy())
+    registry.stage(report)
+    assert registry.load()["staged"]["digest"] == report.selected.digest
+    with pytest.raises(ValueError, match="anchor_path"):
+        registry.reanchor()
 
 
 def test_registry_legacy_schema_without_state_head_still_loads(tmp_path):

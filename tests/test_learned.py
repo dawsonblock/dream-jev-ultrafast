@@ -72,6 +72,24 @@ def _transition(selected="sel", offered=40, tokens=400, latency_ms=120, page_cha
     }
 
 
+def _run_events(run_id, transitions, *, status="done", verified=True, task_key="t", policy=None):
+    """Wrap bare transition dicts as one run with a terminal outcome.
+
+    Trajectory-success labeling keys positives off the run's verified finish,
+    so tests expressing outcome semantics must write real run boundaries —
+    loose transitions carry no outcome and fit as negatives.
+    """
+    policy = policy or ExplorationPolicy()
+    events = [
+        {"event": "run_started", "run_id": run_id, "task_key": task_key, "goal": "g",
+         "policy": policy.to_dict(), "policy_digest": policy.digest},
+        *[{**t, "run_id": run_id, "task_key": task_key} for t in transitions],
+        {"event": "run_finished", "run_id": run_id, "task_key": task_key,
+         "status": status, "verified": verified},
+    ]
+    return events
+
+
 # ---------------------------------------------------------------- CostModel
 
 
@@ -285,28 +303,28 @@ def test_choice_model_empty_fit_abstains():
 
 
 def test_choice_model_choose_proposes_only_offered_candidates():
-    # Mixed cells within one kind: goal-relevant clicks changed pages,
-    # irrelevant ones did not, so the cell prior beats the kind fallback.
-    events = [
-        *[
+    # Mixed cells within one kind: goal-relevant clicks ran on verified
+    # trajectories, irrelevant ones on failed runs, so the cell prior beats
+    # the kind fallback.
+    events = []
+    for i in range(5):
+        events += _run_events(f"g{i}", [
             {
-                **_transition(selected=f"g{i}", page_changed=True, candidates=[
+                **_transition(selected=f"g{i}", candidates=[
                     {"id": f"g{i}", "kind": "click", "label": "Search", "goal_overlap": 2},
                 ]),
                 "selected_offered_rank": 0,
             }
-            for i in range(5)
-        ],
-        *[
+        ], status="done", verified=True)
+    for i in range(5):
+        events += _run_events(f"k{i}", [
             {
                 **_transition(selected=f"k{i}", page_changed=False, candidates=[
                     {"id": f"k{i}", "kind": "click", "label": "Ctl", "goal_overlap": 0},
                 ]),
                 "selected_offered_rank": 0,
             }
-            for i in range(5)
-        ],
-    ]
+        ], status="blocked", verified=False)
     model = ChoiceModel.fit(events)
     offered = [
         {"id": "a", "kind": "click", "label": "A", "goal_overlap": 0},
@@ -324,27 +342,26 @@ def test_choice_model_ucb_can_prefer_uncertain_candidate():
     # still proposes the unexplored action, but the proposal is flagged
     # not-confident (global fallback is an abstention) so consumers know it
     # is a hypothesis, not knowledge.
-    events = [
-        *[
+    events = []
+    for i in range(8):
+        events += _run_events(f"k{i}", [
             {
                 **_transition(selected=f"k{i}", page_changed=False, candidates=[
                     {"id": f"k{i}", "kind": "click", "label": "Known", "goal_overlap": 0},
                 ]),
                 "selected_offered_rank": 0,
             }
-            for i in range(8)
-        ],
-        *[
+        ], status="blocked", verified=False)
+    for i in range(4):
+        events += _run_events(f"s{i}", [
             {
-                **_transition(selected=f"s{i}", page_changed=True, candidates=[
+                **_transition(selected=f"s{i}", candidates=[
                     {"id": f"s{i}", "kind": "select", "label": "Pick", "goal_overlap": 0},
                 ]),
                 "selected": {"id": f"s{i}", "kind": "select"},
                 "selected_offered_rank": 0,
             }
-            for i in range(4)
-        ],
-    ]
+        ], status="done", verified=True)
     model = ChoiceModel.fit(events)
     offered = [
         {"id": "known", "kind": "click", "label": "Known", "goal_overlap": 0},
@@ -390,21 +407,23 @@ def test_choice_model_replay_uses_candidate_policy_rank():
     worlds = _rank_sensitive_worlds()
     # Separate priors per rank bucket: recorded at bucket "5-19" under baseline
     # (offered rank 6) but "0-4" under the filtering policy (offered rank 0).
-    front_events = [
-        {**_transition(selected=f"s{i}", page_changed=True, candidates=[
-            {"id": f"s{i}", "kind": "click", "label": "Search", "goal_overlap": 2},
-        ]), "selected_offered_rank": 0}
-        for i in range(6)
-    ]
-    back_events = [
+    front_events = []
+    for i in range(6):
+        front_events += _run_events(f"f{i}", [
+            {**_transition(selected=f"s{i}", candidates=[
+                {"id": f"s{i}", "kind": "click", "label": "Search", "goal_overlap": 2},
+            ]), "selected_offered_rank": 0}
+        ])
+    back_events = []
+    for i in range(6):
         # The selected action honestly sits at offered rank 9.
-        {**_transition(selected=f"b{i}", page_changed=False, offered=10, candidates=[
-            *[{"id": f"x{i}-{j}", "kind": "click", "label": f"X{j}", "goal_overlap": 0}
-              for j in range(9)],
-            {"id": f"b{i}", "kind": "click", "label": "Back", "goal_overlap": 0},
-        ]), "selected_offered_rank": 9}
-        for i in range(6)
-    ]
+        back_events += _run_events(f"b{i}", [
+            {**_transition(selected=f"b{i}", page_changed=False, offered=10, candidates=[
+                *[{"id": f"x{i}-{j}", "kind": "click", "label": f"X{j}", "goal_overlap": 0}
+                  for j in range(9)],
+                {"id": f"b{i}", "kind": "click", "label": "Back", "goal_overlap": 0},
+            ]), "selected_offered_rank": 9}
+        ], status="blocked", verified=False)
     model = ChoiceModel.fit(front_events + back_events)
     sim = ReplaySimulator(worlds)
     baseline = ReplaySimulator(worlds).evaluate(ExplorationPolicy(), choice_model=model)
@@ -726,9 +745,10 @@ def test_choice_model_terminal_progress_requires_verified_done():
     assert good["n"] == 6 and good["p_progress"] > 0.8
 
 
-def test_choice_model_nonterminal_steps_still_count_page_changes():
-    """Intermediate transitions keep the page-change signal — only the run's
-    terminal transition is gated on verified completion."""
+def test_choice_model_failed_runs_teach_negative_trajectory():
+    """Trajectory-success labeling: intermediate page movement inside a run
+    the verifier rejected is a *negative* association, not progress — the
+    screen moving is telemetry, not outcome."""
     events = [
         {"event": "run_started", "run_id": "mid", "task_key": "t", "goal": "g",
          "policy": ExplorationPolicy().to_dict(),
@@ -741,31 +761,59 @@ def test_choice_model_nonterminal_steps_still_count_page_changes():
          "state": "M", "next_state": "D", "selected": {"id": "e", "kind": "click"},
          "candidates": [{"id": "e", "kind": "click", "label": "End", "goal_overlap": 1}],
          "page_changed": True, "latency_ms": 5, "model_calls": 1, "tokens": 1},
-        # The run failed: the terminal transition is not progress, but the
-        # intermediate page change still counts.
+        # The run failed: neither transition is a positive.
         {"event": "run_finished", "run_id": "mid", "task_key": "t",
          "status": "blocked", "verified": False},
     ]
     model = ChoiceModel.fit(events)
     pred = model.predict(kind="click", goal_overlap=1, rank=0)
-    # 1 positive of 2 + Beta(1,1) → 2/4 = 0.5
+    # 0 positives of 2 + Beta(1,1) → 1/4 = 0.25
     assert pred["n"] == 2
-    assert abs(pred["p_progress"] - 0.5) < 1e-9
+    assert abs(pred["p_progress"] - 0.25) < 1e-9
 
 
-def _trial(run_id, arm, *, positive=True, propensity=0.5, kind="click", model_kind="click",
-           overlap=1, model_overlap=0):
-    """One experiment-tagged transition: an executed arm with a recorded
-    assignment propensity — the denominator honest off-policy weights need.
-    The model choice stays in the candidate catalogue (it was an offered
-    action), so both arms of a divergence share its context cell."""
+def test_choice_model_page_churn_on_failed_runs_is_not_progress():
+    """The v0.6.2 regression guard: dozens of page-changing actions across
+    failed runs must not teach the prior progress — verified success is 0,
+    so the learned P(success) sits near the Beta prior floor."""
+    events = []
+    for run_index in range(10):
+        transitions = [
+            {
+                **_transition(
+                    selected=f"r{run_index}s{step}",
+                    page_changed=True,
+                    candidates=[
+                        {"id": f"r{run_index}s{step}", "kind": "click",
+                         "label": "Churn", "goal_overlap": 1},
+                    ],
+                ),
+                "selected_offered_rank": 0,
+            }
+            for step in range(5)
+        ]
+        events += _run_events(
+            f"fail{run_index}", transitions, status="blocked", verified=False
+        )
+    model = ChoiceModel.fit(events)
+    pred = model.predict(kind="click", goal_overlap=1, rank=0)
+    assert pred["n"] == 50
+    assert pred["confident"] is True  # dense evidence — all of it negative
+    assert pred["p_progress"] < 0.05
+
+
+def _trial_run(run_id, arm, *, success=True, page=True, propensity=0.5, kind="click",
+               model_kind="click", overlap=1, model_overlap=0, status=None, verified=None):
+    """One randomized trial as a complete run: the executed arm's transition
+    plus the run_finished outcome the trial endpoint is drawn from. The model
+    choice stays in the candidate catalogue (it was an offered action), so
+    both arms of a divergence share its context cell."""
     proposal_id = f"p{run_id}"
     model_id = f"m{run_id}"
-    return {
-        "run_id": run_id,
+    transition = {
         **_transition(
             selected=proposal_id if arm == "candidate" else model_id,
-            page_changed=positive,
+            page_changed=page,
             candidates=[
                 {"id": proposal_id, "kind": kind, "label": "Go", "goal_overlap": overlap},
                 {"id": model_id, "kind": model_kind, "label": "M", "goal_overlap": model_overlap},
@@ -780,6 +828,12 @@ def _trial(run_id, arm, *, positive=True, propensity=0.5, kind="click", model_ki
             "model_choice_kind": model_kind,
         },
     }
+    return _run_events(
+        run_id,
+        [transition],
+        status=status or ("done" if success else "blocked"),
+        verified=success if verified is None else verified,
+    )
 
 
 def test_counterfactual_trials_ipw_estimates():
@@ -789,8 +843,8 @@ def test_counterfactual_trials_ipw_estimates():
 
     events = []
     for i in range(4):
-        events.append(_trial(f"c{i}", "candidate", positive=i < 3, propensity=0.25))
-        events.append(_trial(f"k{i}", "control", positive=i == 0, propensity=0.75))
+        events += _trial_run(f"c{i}", "candidate", success=i < 3, propensity=0.25)
+        events += _trial_run(f"k{i}", "control", success=i == 0, propensity=0.75)
     trials = CounterfactualTrials.fit(events)
     estimates = trials.estimate()
     # Context keys on the model choice's features (overlap 0), not the
@@ -798,9 +852,9 @@ def test_counterfactual_trials_ipw_estimates():
     assert set(estimates) == {"click|0"}
     arms = estimates["click|0"]
     assert arms["candidate"]["trials"] == 4
-    assert abs(arms["candidate"]["p_progress"] - 0.75) < 1e-9
+    assert abs(arms["candidate"]["p_success"] - 0.75) < 1e-9
     assert arms["control"]["trials"] == 4
-    assert abs(arms["control"]["p_progress"] - 0.25) < 1e-9
+    assert abs(arms["control"]["p_success"] - 0.25) < 1e-9
     assert abs(arms["delta"] - 0.5) < 1e-9
     assert arms["delta_reliable"] is True
     assert arms["candidate"]["reliable"] and arms["control"]["reliable"]
@@ -813,39 +867,50 @@ def test_counterfactual_trials_require_recorded_propensity():
 
     bad = []
     for prop in (None, 0.0, 1.5, "nan"):
-        t = _trial("x", "candidate")
-        t["experiment"]["assignment_probability"] = prop
-        bad.append(t)
+        run = _trial_run("x", "candidate")
+        run[1]["experiment"]["assignment_probability"] = prop
+        bad += run
     # Non-experiment transitions never enter trial estimates either.
     bad.append(_transition(selected="plain", page_changed=True, candidates=[
         {"id": "plain", "kind": "click", "goal_overlap": 1}]))
     assert CounterfactualTrials.fit(bad).cells == ()
 
 
-def test_counterfactual_trials_terminal_requires_verified_done():
-    """Experiment outcomes use the same verified-progress label as the prior:
-    a terminal trial counts only when the run ended verifier-confirmed done."""
+def test_counterfactual_trials_endpoint_is_run_outcome_not_page_change():
+    """The primary endpoint is the run's final verified outcome: a trial that
+    moved the page inside a failed run is a *failure*, and ``p_page_changed``
+    remains as secondary telemetry showing the page did move."""
     from jev_ultrafast.dreamlearn import CounterfactualTrials
 
-    events = [
-        {"event": "run_started", "run_id": "r1", "task_key": "t",
-         "policy": ExplorationPolicy().to_dict(),
-         "policy_digest": ExplorationPolicy().digest},
-        _trial("r1", "candidate", positive=True, propensity=0.5),
-        # Failed run: the terminal trial is not progress even though the page moved.
-        {"event": "run_finished", "run_id": "r1", "task_key": "t",
-         "status": "blocked", "verified": False},
-        {"event": "run_started", "run_id": "r2", "task_key": "t",
-         "policy": ExplorationPolicy().to_dict(),
-         "policy_digest": ExplorationPolicy().digest},
-        _trial("r2", "candidate", positive=True, propensity=0.5),
-        {"event": "run_finished", "run_id": "r2", "task_key": "t",
-         "status": "done", "verified": True},
-    ]
+    # The audit's adversarial construction: candidate-armed trials all moved
+    # the page yet every run failed; control-armed trials didn't move the
+    # page yet every run verified. The estimate must report candidate worse.
+    events = []
+    for i in range(4):
+        events += _trial_run(f"c{i}", "candidate", success=False, page=True)
+        events += _trial_run(f"k{i}", "control", success=True, page=False)
+    arms = CounterfactualTrials.fit(events).estimate()["click|0"]
+    assert arms["candidate"]["p_success"] < 0.01
+    assert arms["control"]["p_success"] > 0.99
+    assert arms["candidate"]["p_page_changed"] > 0.99
+    assert arms["control"]["p_page_changed"] < 0.01
+    assert arms["delta"] < -0.9
+
+
+def test_counterfactual_trials_partial_success_counts_verified_share():
+    """Two trials, one in a verified run and one in a failed run, give a
+    half-weighted success estimate."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    events = (
+        _trial_run("r1", "candidate", success=False, page=True)
+        + _trial_run("r2", "candidate", success=True, page=True)
+    )
     estimates = CounterfactualTrials.fit(events).estimate()
     arm = estimates["click|0"]["candidate"]
     assert arm["trials"] == 2
-    assert abs(arm["p_progress"] - 0.5) < 1e-9  # one verified success of two
+    assert abs(arm["p_success"] - 0.5) < 1e-9  # one verified success of two
+    assert arm["p_page_changed"] > 0.99  # both steps moved the page
 
 
 def test_counterfactual_trials_context_is_arm_independent():
@@ -855,7 +920,7 @@ def test_counterfactual_trials_context_is_arm_independent():
 
     # Same divergence point: the prior proposed a high-overlap action over the
     # model's overlap-0 choice. Both arms must land in the model choice's cell.
-    events = [_trial("x", "candidate"), _trial("x", "control")]
+    events = _trial_run("x", "candidate") + _trial_run("y", "control")
     estimates = CounterfactualTrials.fit(events).estimate()
     assert set(estimates) == {"click|0"}
     entry = estimates["click|0"]

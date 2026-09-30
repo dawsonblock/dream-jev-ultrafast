@@ -14,7 +14,19 @@ from pathlib import Path
 from .dream import DreamImprover, ExperienceStore, ExplorationPolicy, PolicyRegistry, ReplayWorld
 from .dreamlearn import ChoiceModel, CostModel, OutcomeModel
 
-COMMANDS = {"improve", "verify", "promote", "status", "rollback", "health", "suspend", "resume"}
+COMMANDS = {
+    "improve", "verify", "promote", "status", "rollback", "health",
+    "suspend", "resume", "registry-reanchor",
+}
+
+
+def _add_registry_anchor_arg(cmd):
+    cmd.add_argument(
+        "--registry-anchor",
+        help="Registry head anchor file. Registry writes checkpoint the signed "
+        "state head here; reads fail when the file no longer reaches the "
+        "anchored head (wholesale snapshot restore).",
+    )
 
 
 def _add_verify_args(cmd):
@@ -46,6 +58,13 @@ def _store(args):
     )
 
 
+def _registry(args):
+    return PolicyRegistry(
+        args.registry,
+        anchor_path=getattr(args, "registry_anchor", None),
+    )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="DREAM-Jev replay improvement and policy qualification controls.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -54,6 +73,7 @@ def build_parser():
     improve.add_argument("experience", help="Path to Jev DREAM JSONL experience store")
     improve.add_argument("--report", default="dream-report.json", help="Write replay report to this JSON path")
     improve.add_argument("--registry", help="Optional policy registry. Its active policy is used as the baseline.")
+    _add_registry_anchor_arg(improve)
     improve.add_argument("--stage", action="store_true", help="Stage a replay-approved changed policy in --registry")
     improve.add_argument(
         "--cost-model",
@@ -80,6 +100,7 @@ def build_parser():
     promote = sub.add_parser("promote", help="Promote the staged policy from bound live-canary evidence")
     promote.add_argument("experience")
     promote.add_argument("--registry", required=True)
+    _add_registry_anchor_arg(promote)
     promote.add_argument(
         "--baseline-digest",
         help="Explicit baseline policy digest; must match the staged policy parent digest",
@@ -93,14 +114,17 @@ def build_parser():
 
     status = sub.add_parser("status", help="Show registry state")
     status.add_argument("--registry", required=True)
+    _add_registry_anchor_arg(status)
 
     rollback = sub.add_parser("rollback", help="Roll back to a prior active policy")
     rollback.add_argument("--registry", required=True)
     rollback.add_argument("--digest", help="Specific prior digest; defaults to most recent")
+    _add_registry_anchor_arg(rollback)
 
     health = sub.add_parser("health", help="Evaluate recent active-policy traces for post-promotion drift")
     health.add_argument("experience")
     health.add_argument("--registry", required=True)
+    _add_registry_anchor_arg(health)
     health.add_argument("--recent-tasks", type=int, default=20)
     health.add_argument("--suspend-on-fail", action="store_true")
     _add_verify_args(health)
@@ -108,9 +132,18 @@ def build_parser():
     suspend = sub.add_parser("suspend", help="Suspend the active learned policy and fall back to baseline")
     suspend.add_argument("--registry", required=True)
     suspend.add_argument("--reason", required=True)
+    _add_registry_anchor_arg(suspend)
 
     resume = sub.add_parser("resume", help="Resume a suspended active policy")
     resume.add_argument("--registry", required=True)
+    _add_registry_anchor_arg(resume)
+
+    reanchor = sub.add_parser(
+        "registry-reanchor",
+        help="Re-anchor the registry state head after a confirmed anchor gap",
+    )
+    reanchor.add_argument("--registry", required=True)
+    reanchor.add_argument("--registry-anchor", required=True, help="Anchor file to re-write")
     return parser
 
 
@@ -130,27 +163,31 @@ def main(argv=None):
         return 0
 
     if args.command == "status":
-        _json(PolicyRegistry(args.registry).load())
+        _json(_registry(args).load())
         return 0
 
     if args.command == "rollback":
-        active = PolicyRegistry(args.registry).rollback(args.digest)
+        active = _registry(args).rollback(args.digest)
         _json({"rolled_back": True, "active_digest": active["digest"], "active": active})
         return 0
 
     if args.command == "suspend":
-        active = PolicyRegistry(args.registry).suspend(args.reason)
+        active = _registry(args).suspend(args.reason)
         _json({"suspended": True, "active_digest": active["digest"], "reason": active.get("suspension_reason")})
         return 0
 
     if args.command == "resume":
-        active = PolicyRegistry(args.registry).resume()
+        active = _registry(args).resume()
         _json({"resumed": True, "active_digest": active["digest"]})
+        return 0
+
+    if args.command == "registry-reanchor":
+        _json({"reanchored": True, "anchor": _registry(args).reanchor()})
         return 0
 
     if args.command == "promote":
         store = _store(args)
-        active = PolicyRegistry(args.registry).promote_from_store(
+        active = _registry(args).promote_from_store(
             store,
             baseline_policy_digest=args.baseline_digest,
             baseline_since_ms=args.baseline_since_ms,
@@ -164,7 +201,7 @@ def main(argv=None):
         return 0
 
     if args.command == "health":
-        decision = PolicyRegistry(args.registry).health_from_store(
+        decision = _registry(args).health_from_store(
             _store(args),
             recent_tasks=args.recent_tasks,
             suspend_on_fail=args.suspend_on_fail,
@@ -182,7 +219,7 @@ def main(argv=None):
     store = _store(args)
     events = store.load()
     worlds = ReplayWorld.from_events(events)
-    registry = PolicyRegistry(args.registry) if args.registry else None
+    registry = _registry(args) if args.registry else None
     baseline = registry.active_policy() if registry else ExplorationPolicy()
     cost_model = CostModel.fit(events) if args.cost_model else None
     outcome_model = OutcomeModel.fit(events) if args.outcome_model else None

@@ -94,8 +94,13 @@ function render() {
     blocked: "Stopped · no supported next action",
   };
   $("status").textContent = labels[state.status] || state.status;
-  if (state.status === "approval_required" && state.pending_approval?.reason) {
-    $("status").textContent += ` · ${state.pending_approval.reason}`;
+  if (state.status === "approval_required") {
+    const pending = state.pending_approval;
+    if (pending?.reason) $("status").textContent += ` · ${pending.reason}`;
+    // The grant is digest-bound to this exact generated value — show it so the
+    // operator approves the payload itself, not just the action label.
+    if (pending?.payload_preview != null)
+      $("status").textContent += ` · payload: ${JSON.stringify(pending.payload_preview)}`;
   }
   if (!page) {
     controls();

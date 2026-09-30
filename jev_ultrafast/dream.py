@@ -26,6 +26,7 @@ from .signing import (
     ANCHOR_DOMAIN,
     PROMOTION_SIGNING_KEY_ENV,
     PROMOTION_VERIFY_KEYS_ENV,
+    REGISTRY_ANCHOR_DOMAIN,
     REGISTRY_STATE_DOMAIN,
     EvidenceSigner,
     verify_keys_from_env,
@@ -40,7 +41,12 @@ SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", "jev-dream/3", SCHEMA_VERSION
 # 0.10 adds experiment-tagged transitions: trial runs carry an ``experiment``
 # block and are excluded from canary metrics, so pools that predate the
 # distinction must not silently co-mingle with it.
-TCB_VERSION = "jev-ultrafast-tcb/0.10"
+# 0.11 relabels propensity semantics (deterministic argmax selection records
+# behavior_propensity=None; only a randomized assignment is a propensity) and
+# adds experiment_assigned events recorded at randomization time, before the
+# authority plane — pools that predate it lack the boundary between a trial
+# that executed and a trial that was assigned but vetoed.
+TCB_VERSION = "jev-ultrafast-tcb/0.11"
 SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.3",
     "jev-ultrafast-tcb/0.4",
@@ -49,6 +55,7 @@ SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.7",
     "jev-ultrafast-tcb/0.8",
     "jev-ultrafast-tcb/0.9",
+    "jev-ultrafast-tcb/0.10",
     TCB_VERSION,
 }
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
@@ -815,7 +822,13 @@ class ReplayWorld:
                     if recorded_offered_rank is not None and recorded_offered_rank != observed_rank:
                         raise ValueError(f"Run {run_id} has a selected offered-rank mismatch")
                     selected_offered_rank = observed_rank
+                # ``selected_propensity`` (v0.7.x traces) recorded a model score
+                # mislabeled as a propensity; ``behavior_propensity`` records
+                # the honest value — None for deterministic argmax selection,
+                # the assignment probability for a randomized trial step.
                 propensity = event.get("selected_propensity")
+                if propensity is None:
+                    propensity = event.get("behavior_propensity")
                 tr = RecordedTransition(
                     run_id=run_id,
                     task_key=key,
@@ -2109,10 +2122,11 @@ class PolicyRegistry:
     the authority itself.
     """
 
-    def __init__(self, path: str | os.PathLike, *, signer=None, verify_keys=None):
+    def __init__(self, path: str | os.PathLike, *, signer=None, verify_keys=None, anchor_path=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        self.anchor_path = Path(anchor_path) if anchor_path else None
         self._lock = threading.RLock()
         self.signer = signer if signer is not None else (
             EvidenceSigner.from_env(PROMOTION_SIGNING_KEY_ENV) or EvidenceSigner.from_env()
@@ -2122,6 +2136,111 @@ class PolicyRegistry:
         # Evidence verification keys are a valid promotion authority too.
         keys.update(verify_keys_from_env())
         self.verify_keys = keys
+
+    # Content hash domain for the registry head anchor — distinct from both
+    # the registry state domain (which signs the payload) and the evidence
+    # chain-head anchor domain (which checkpoints the event log).
+    _REGISTRY_ANCHOR_CONTENT_DOMAIN = "jev-dream/registry-head-anchor/v1"
+
+    def _read_anchor(self) -> dict | None:
+        if self.anchor_path is None or not self.anchor_path.exists():
+            return None
+        try:
+            anchor = json.loads(self.anchor_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError("Invalid registry head anchor file") from exc
+        if not isinstance(anchor, dict) or anchor.get("kind") != "registry_head_anchor":
+            raise ValueError("Invalid registry head anchor file")
+        return anchor
+
+    def _write_anchor_unlocked(self, head: str | None, revision: int) -> dict | None:
+        if self.anchor_path is None:
+            return None
+        material = {
+            "kind": "registry_head_anchor",
+            "head": head,
+            "revision": revision,
+            "signed_at_ms": int(time.time() * 1000),
+        }
+        digest = _stable_hash(
+            f"{self._REGISTRY_ANCHOR_CONTENT_DOMAIN}\n"
+            + json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        anchor = {**material, "digest": digest}
+        if self.signer is not None:
+            anchor["key_id"] = self.signer.key_id
+            anchor["signature"] = self.signer.sign_hex(digest, domain=REGISTRY_ANCHOR_DOMAIN)
+        self.anchor_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.anchor_path.with_suffix(self.anchor_path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(anchor, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, self.anchor_path)
+        _fsync_dir(self.anchor_path.parent)
+        return anchor
+
+    def _check_anchor_unlocked(self, state_digest: str, revision: int) -> dict | None:
+        """Anchor consistency when ``anchor_path`` is configured.
+
+        The chained signed state head proves authenticity of what was written,
+        but a wholesale restore of an older complete signed file replays
+        cleanly — the external anchor is the freshness check that detects it.
+        Fails closed on a missing anchor, a bad digest, signature problems, or
+        a head/revision that disagrees with the verified payload.
+        """
+        if self.anchor_path is None:
+            return None
+        anchor = self._read_anchor()
+        if anchor is None:
+            raise ValueError("Registry head anchor missing while the registry holds state")
+        material = {k: v for k, v in anchor.items() if k not in {"digest", "signature", "key_id"}}
+        digest = _stable_hash(
+            f"{self._REGISTRY_ANCHOR_CONTENT_DOMAIN}\n"
+            + json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        if anchor.get("digest") != digest:
+            raise ValueError("Registry head anchor digest mismatch")
+        signature = anchor.get("signature")
+        if signature is not None:
+            trusted = set(self.verify_keys)
+            if self.signer is not None:
+                trusted.add(self.signer.key_id)
+            if not trusted:
+                raise ValueError("Signed registry anchor but no verification key is configured")
+            if anchor.get("key_id") not in trusted:
+                raise ValueError("Registry anchor signed by an unexpected key")
+            if not verify_signature(
+                str(anchor["key_id"]), digest, str(signature), domain=REGISTRY_ANCHOR_DOMAIN
+            ):
+                raise ValueError("Registry anchor signature verification failure")
+        elif self.verify_keys or self.signer is not None:
+            raise ValueError("Unsigned registry head anchor while trust keys are configured")
+        if anchor.get("head") != state_digest or int(anchor.get("revision", -1)) != revision:
+            raise ValueError(
+                "Registry head anchor disagrees with the registry: an older "
+                "snapshot was restored or the anchor is stale — resolve with "
+                "an explicit reanchor()"
+            )
+        return anchor
+
+    def reanchor(self) -> dict:
+        """Write a fresh anchor for the current verified registry head.
+
+        Operator-level resolution after a confirmed anchor gap — a restore, a
+        lost anchor file, or a deliberate reset. The registry's own chained
+        state is still verified by the load; only the anchor check is skipped,
+        because the anchor is the thing being repaired. Never implicit: normal
+        reads and writes checkpoint the anchor but never re-anchor a gap.
+        """
+        with self._lock, _file_lock(self.lock_path):
+            payload = self._load_unlocked(check_anchor=False)
+            anchor = self._write_anchor_unlocked(
+                payload.get("state_digest"), int(payload.get("revision", 0))
+            )
+            if anchor is None:
+                raise ValueError("No anchor_path configured for this registry")
+            return anchor
 
     @staticmethod
     def _empty():
@@ -2265,8 +2384,17 @@ class PolicyRegistry:
         with self._lock, _file_lock(self.lock_path):
             return self._load_unlocked()
 
-    def _load_unlocked(self) -> dict:
+    def _load_unlocked(self, *, check_anchor: bool = True) -> dict:
         if not self.path.exists():
+            # A deleted registry under a live anchor is not an empty registry —
+            # the anchor still points at a head the file must reach. Only an
+            # explicitly anchored *empty* state (head=None) may read as empty.
+            if check_anchor:
+                anchor = self._read_anchor()
+                if anchor is not None and anchor.get("head") is not None:
+                    raise ValueError(
+                        "Policy registry file missing while a head anchor exists"
+                    )
             return self._empty()
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         if payload.get("schema") not in SUPPORTED_SCHEMAS or payload.get("tcb_version") not in SUPPORTED_TCB_VERSIONS:
@@ -2322,6 +2450,12 @@ class PolicyRegistry:
                 raise ValueError(
                     "Unsigned policy registry state while a signing/verification key is configured"
                 )
+        if check_anchor and state_digest is not None:
+            # Freshness, not authenticity: the signed head above proves this
+            # payload was written by the key holder, but a wholesale restore
+            # of an older complete signed file replays cleanly. The external
+            # anchor is the checkpoint that detects it.
+            self._check_anchor_unlocked(state_digest, int(payload.get("revision", 0)))
         payload.setdefault("revision", 0)
         payload.setdefault("active", None)
         payload.setdefault("staged", None)
@@ -2380,6 +2514,13 @@ class PolicyRegistry:
         # fsync the directory so the rename itself survives a crash; the file
         # fsync alone does not make the new directory entry durable.
         _fsync_dir(self.path.parent)
+        # Checkpoint the new head into the external anchor *after* the payload
+        # is durable. If this step fails, the anchor stays behind and every
+        # subsequent read fails closed until an explicit reanchor().
+        if self.anchor_path is not None:
+            self._write_anchor_unlocked(
+                payload.get("state_digest"), int(payload.get("revision", 0))
+            )
 
     def _current_baseline_digest(self, payload: dict) -> str:
         active = payload.get("active")
