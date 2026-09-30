@@ -1009,7 +1009,10 @@ class CanaryMetrics:
     ) -> "CanaryMetrics":
         runs = _canary_run_summaries(events, policy_digest, since_ms=since_ms)
         if max_runs is not None:
-            runs = runs[-max(0, int(max_runs)) :]
+            # ``-0`` slices to the whole list, so a non-positive limit must not
+            # silently mean "all runs" — it must mean none.
+            limit = int(max_runs)
+            runs = runs[-limit:] if limit > 0 else []
         return _metrics_from_canary_runs(runs)
 
 

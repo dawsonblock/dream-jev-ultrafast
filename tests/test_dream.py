@@ -248,6 +248,23 @@ def test_canary_metrics_are_derived_from_hash_chained_run_evidence(tmp_path):
     assert metrics.latency_ms == 30
 
 
+def test_canary_metrics_max_runs_zero_means_none(tmp_path):
+    store = ExperienceStore(tmp_path / "canary.jsonl")
+    policy = ExplorationPolicy()
+    transition = [{
+        "state": "S", "next_state": "D", "selected": {"id": "go", "kind": "click"},
+        "candidates": [{"id": "go", "kind": "click", "label": "Go", "goal_overlap": 1}],
+        "page_changed": True, "latency_ms": 5, "model_calls": 1, "tokens": 10,
+        "stale_or_failure": 0, "risk_events": 0,
+    }]
+    _append_run(store, "r1", "goal", transition, status="done", verified=True, policy=policy)
+    _append_run(store, "r2", "goal", transition, status="done", verified=True, policy=policy)
+    events = store.load()
+    assert CanaryMetrics.from_events(events, policy.digest, max_runs=0).tasks == 0
+    assert CanaryMetrics.from_events(events, policy.digest, max_runs=-3).tasks == 0
+    assert CanaryMetrics.from_events(events, policy.digest, max_runs=1).tasks == 1
+
+
 def test_agent_emits_replayable_trace_without_changing_executor_contract(tmp_path, monkeypatch):
     from jev_ultrafast import agent as loop
 

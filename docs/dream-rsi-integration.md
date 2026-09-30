@@ -251,7 +251,7 @@ uv run jev-dream health .jev/experience.jsonl \
   --suspend-on-fail
 ```
 
-`HealthGate` compares recent active-policy traces with the promotion reference. By default it waits for 20 recent tasks, allows at most a 10-percentage-point verified-success regression, and permits no increase in risk-event rate.
+`HealthGate` compares recent active-policy traces with the promotion reference. By default it waits for 20 recent tasks (`sufficient=false` distinguishes "not enough evidence yet" from a clean pass), allows at most a 10-percentage-point verified-success regression, and permits no increase in risk-event rate.
 
 If `--suspend-on-fail` is used, the active learned policy is marked suspended. `Agent(policy_registry=...)` then falls back to the baseline `ExplorationPolicy` without changing the browser executor or deleting the learned policy record.
 
