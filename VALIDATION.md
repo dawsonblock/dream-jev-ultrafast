@@ -1,4 +1,4 @@
-# Validation — Jev Ultrafast v0.4.0 DREAM-Jev
+# Validation — Jev Ultrafast v0.4.1 DREAM-Jev
 
 Validation date: 2026-09-29.
 
@@ -7,7 +7,7 @@ Validation date: 2026-09-29.
 - `uv run pytest`: **112 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
 - `uv run python scripts/check_guards.py` against a dedicated Chrome 152 instance (`BU_CDP_URL=http://127.0.0.1:9222`): **all 23 live browser guard checks passed**. The first live run exposed a latent defect: the guarded act/select/fill and post-input wait expressions concatenated their JSON argument without call parentheses, so every mutation path raised a `SyntaxError` that surfaced as `StalePage`. Unit mocks could not see this. The expressions were corrected to invoke their argument, `fresh()` now treats an unreachable/destroyed guard context as stale, and the live suite was re-run to green.
 - `uv run ruff check .`: passed.
-- `uv build`: passed (`dist/jev_ultrafast-0.4.0.tar.gz`, `dist/jev_ultrafast-0.4.0-py3-none-any.whl`).
+- `uv build`: passed (`dist/jev_ultrafast-0.4.1.tar.gz`, `dist/jev_ultrafast-0.4.1-py3-none-any.whl`).
 - `python -m compileall -q jev_ultrafast tests examples scripts`: passed.
 - `node --check jev_ultrafast/snapshot.js`: passed.
 - `node --check jev_ultrafast/static/app.js`: passed.

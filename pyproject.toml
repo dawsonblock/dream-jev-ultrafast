@@ -1,6 +1,6 @@
 [project]
 name = "jev-ultrafast"
-version = "0.4.0"
+version = "0.4.1"
 description = "A browser agent that chooses instead of generating."
 readme = "README.md"
 license = "MIT"

@@ -19,7 +19,7 @@ from .dream import (
 from .model import DecisionBackend, SystemOneBackend
 from .policy import DefaultActionPolicy, PolicyDecision
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "Agent",

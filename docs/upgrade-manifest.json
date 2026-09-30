@@ -1,6 +1,6 @@
 {
   "project": "jev-ultrafast",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "release_name": "DREAM-Jev Qualification Control Plane",
   "based_on": "jev-ultrafast v0.3.0 DREAM-Jev",
   "design_source": {

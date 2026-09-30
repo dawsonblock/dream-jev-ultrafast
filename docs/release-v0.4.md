@@ -1,4 +1,6 @@
-# Jev Ultrafast v0.4.0 — DREAM-Jev Qualification Control Plane
+# Jev Ultrafast v0.4.1 — DREAM-Jev Qualification Control Plane
+
+v0.4.1 is a patch on v0.4.0: the first live Chrome guard run exposed that the guarded mutation expressions concatenated their argument without call parentheses, so `act`/`select`/`fill` could not execute against a real page. All three expressions now invoke their argument, `fresh()` fails closed when the guard context is destroyed, contenteditable coverage includes `""`/`plaintext-only`, and the 23-check live suite is recorded in `VALIDATION.md`.
 
 v0.4 does not widen browser authority. It hardens the evidence and deployment path around the bounded DREAM-Jev exploration policy introduced in v0.3.
 
