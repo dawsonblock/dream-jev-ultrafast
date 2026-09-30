@@ -21,3 +21,26 @@ jobs:
       - run: node --check jev_ultrafast/snapshot.js
       - run: node --check jev_ultrafast/static/app.js
       - run: uv build
+
+  live-guards:
+    # Real-browser execution-guard regressions. v0.4.0 shipped a mutation bug
+    # that passed mocked tests and broke only in Chrome; this job gates that
+    # class of regression with no model calls and no external websites.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: Launch headless Chrome with CDP
+        run: |
+          google-chrome --headless=new --remote-debugging-port=9222 \
+            --user-data-dir="$RUNNER_TEMP/jev-guard-chrome" --no-first-run \
+            --no-sandbox --disable-gpu about:blank &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9222/json/version >/dev/null && exit 0
+            sleep 1
+          done
+          exit 1
+      - run: BU_CDP_URL=http://127.0.0.1:9222 uv run python scripts/check_guards.py

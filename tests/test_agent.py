@@ -394,3 +394,113 @@ def test_close_releases_browser_when_finish_fails(tmp_path):
     with pytest.raises(RuntimeError, match="store full"):
         a.close()
     a.browser.close.assert_called_once()
+
+
+def _buy_runner(runner):
+    from jev_ultrafast.policy import DefaultActionPolicy
+
+    runner.policy = DefaultActionPolicy()
+    p = runner.state["page"]
+    p["actions"].append(
+        {"id": "buy", "kind": "click", "label": "Buy now", "role": "button", "node": 30}
+    )
+    p["fingerprint"] = fingerprint(p)
+    runner.state["decision"] = decision("buy")
+    runner.state["status"] = "predicted"
+    return p
+
+
+def test_caller_supplied_approval_flag_is_rejected(runner):
+    p = _buy_runner(runner)
+    for body in ({"approved": True}, {"approved": False}, {"approved": "yes"}):
+        with pytest.raises(ValueError, match="caller-supplied approval"):
+            runner.command("act", {"fingerprint": p["fingerprint"], **body})
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_consequential_action_executes_only_via_bound_approval(runner):
+    p = _buy_runner(runner)
+    state = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "approval_required"
+    assert state["pending_approval"]["reason"]
+    runner.state["browser"].act.assert_not_called()
+
+    runner.command("approve")
+    runner.state["browser"].act.assert_called_once()
+    assert runner.state["history"][-1]["action"] == "Buy now"
+    assert runner.state["status"] == "ready"
+    assert runner.state.get("granted_approval") is None
+
+    # The grant is consumed once: the next consequential decision needs a new approval.
+    runner.state["decision"] = decision("buy")
+    runner.state["status"] = "predicted"
+    again = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert again["status"] == "approval_required"
+    assert runner.state["browser"].act.call_count == 1
+
+
+def test_approval_grant_cannot_approve_a_different_action(runner):
+    p = _buy_runner(runner)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["status"] == "approval_required"
+    # Forge a grant aimed at an unrelated action; the pending action must still pause.
+    runner.state["granted_approval"] = {"action_id": "e3", "fingerprint": p["fingerprint"]}
+    runner.state["decision"] = decision("buy")
+    runner.state["status"] = "predicted"
+    state = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "approval_required"
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_reject_clears_pending_and_records_rejection(runner):
+    p = _buy_runner(runner)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    state = runner.command("reject")
+    assert state["status"] == "ready"
+    assert state["pending_approval"] is None
+    assert runner.state["history"][-1]["approval"] == "rejected"
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_approved_execution_marks_risk_events_in_trace(runner, tmp_path):
+    from jev_ultrafast.dream import ExperienceStore
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    p = _buy_runner(runner)
+    runner.dream_recorder = DreamTraceRecorder(
+        ExperienceStore(tmp_path / "approval.jsonl"), goal="Buy a book"
+    )
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    runner.command("approve")
+    events = ExperienceStore(tmp_path / "approval.jsonl").load()
+    kinds = [event["event"] for event in events]
+    assert kinds == ["approval_required", "transition"]
+    assert events[-1]["risk_events"] == 1
+
+
+def test_model_boundaries_redact_history_text(monkeypatch):
+    monkeypatch.setenv("JEV_MODEL_PRIVACY", "basic")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    captured = {}
+
+    def post(_url, _key, body):
+        captured.update(body)
+        return {
+            "model": "test",
+            "answers": {"operation": choice(body["questions"]["operation"]["criteria"], "DONE")},
+        }
+
+    monkeypatch.setattr(model, "post_json", post)
+    history = [
+        {"action": "Email", "kind": "fill", "text": "private@example.com", "page_changed": True},
+        {"action": "Search", "kind": "fill", "text": "flights", "page_changed": True},
+    ]
+    model.choose(page(), "Send the mail", history)
+    recent = captured["state"]["recent_actions"]
+    assert recent[0]["text"] == "[REDACTED_EMAIL]"
+    assert "private@example.com" not in json.dumps(recent)
+    assert recent[1]["text"] == "flights"
+
+    context = model.field_context("Send the mail", page()["actions"][0], page(), history)
+    assert context["recent_actions"][0]["text"] == "[REDACTED_EMAIL]"
+    assert "private@example.com" not in json.dumps(context["recent_actions"])

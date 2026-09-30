@@ -13,6 +13,9 @@ Give it one goal. A finite-choice decision backend picks an operation and an obs
 > [!NOTE]
 > **v0.4 hardens DREAM-Jev into a qualification control plane.** v0.2's isolated-world browser executor remains fixed and v0.3's bounded replay policy remains the only self-improvable surface. v0.4 adds cross-process hash-chain and policy-registry serialization, replay-evidence binding, train/validation/holdout candidate selection, matched live-canary evidence bound to post-staging runs and the staged parent digest, latency/action/token regression gates, policy lineage checks, suspension, health monitoring, and rollback. A replay winner still cannot activate itself.
 
+> [!NOTE]
+> **v0.5 adds authority integrity.** A deterministic effect classifier maps every candidate to a semantic class (`NAVIGATE`, `FORM_EDIT`, `SUBMISSION`, `PURCHASE`, `UNKNOWN_COMMIT`, …) from bounded DOM context — a bare "Continue" is an `UNKNOWN_COMMIT`, and no learned adviser can downgrade a deterministic high-risk classification. Click execution re-verifies page identity, node identity, geometry, and hit-test *between* `mousePressed` and `mouseReleased`; text insertion runs atomically inside the isolated world. Evidence signatures are domain-separated with verification-key rotation, and a crash-torn final JSONL line is recovered without weakening hash/signature checks.
+
 **Zürich → London on Google Flights in 7.1 seconds.** One natural-language goal, actual text generation, and loading waits included.
 
 <a href="docs/demo.mp4"><img src="docs/demo.gif" alt="A real Google Flights search at 1× speed, with generated city names and dynamic operation/target decisions" width="100%" /></a>
@@ -119,13 +122,22 @@ with Agent(
         ...
 ```
 
-The store is privacy-bounded and SHA-256 hash-chained. Offline, `jev-dream improve` turns completed histories into empirical replay worlds, evaluates bounded `ExplorationPolicy` variants across deterministic train/validation/holdout splits, binds the report to the replay-world pool and current hash-chain head, and can stage a replay-approved policy:
+The store is privacy-bounded and SHA-256 hash-chained. Each transition records the **pre-policy observed catalogue** plus a digest of the catalogue actually offered to the model, so replay can evaluate both contraction and expansion of the candidate space rather than only pruning an already-filtered set. Optional `task_family`/`instance_id` metadata keeps semantically equivalent goals in one train/validation/holdout partition and pairs canary evidence per task instance. Offline, `jev-dream improve` turns completed histories into empirical replay worlds, evaluates bounded `ExplorationPolicy` variants across deterministic splits, binds the report to the replay-world pool and current hash-chain head, and can stage a replay-approved policy:
 
 ```bash
 uv run jev-dream improve .jev/experience.jsonl \
   --report .jev/dream-report.json \
   --registry .jev/policy-registry.json \
+  --cost-model --outcome-model \
   --stage
+```
+
+`--cost-model` fits a linear `CostModel` of tokens/latency against offered-candidate count on the same store; candidates keep their empirical gate results, and the learned estimate only re-orders which *passing* candidate is selected for staging (reported as `estimated_*` metrics alongside the real measurements). `--outcome-model` fits a bucketed, Beta-smoothed prior of `P(page_changed)` per `(kind, overlap, rank)` cell and annotates candidates with predicted progress. Both are hypothesis-prioritization layers: their digests are recorded in the report, but they cannot open a replay gate or count as promotion evidence.
+
+For authenticity on top of the hash chain, the store accepts an Ed25519 signer (`JEV_EVIDENCE_SIGNING_KEY`, or any injected signer exposing `key_id`/`sign_hex` so private material can stay outside the agent process). Signatures are domain-separated over `jev-dream/evidence-event/v1:<event_hash>`. Readers pass trusted verification keys — `JEV_EVIDENCE_VERIFY_KEY`, `JEV_EVIDENCE_VERIFY_KEYS`, or `--verify-key`/`--verify-keys` — and every signed event carries its `key_id`, so key rotation keeps older signed segments verifiable under a trusted-key set. Signed events fail closed on unexpected keys or forged signatures, and `require_signatures`/`JEV_REQUIRE_SIGNED_EVIDENCE` rejects unsigned events outright. A crash-torn final line (a recognizable event prefix without its newline) is recovered on read and truncated on the next append; a parseable record with a bad hash or signature stays fail-closed:
+
+```bash
+uv run jev-dream verify .jev/experience.jsonl --verify-keys <hex-pubkey>,<hex-pubkey> --require-signatures
 ```
 
 The old v0.3 command form (`jev-dream EXPERIENCE ...`) still maps to `improve`. Staging is not activation. Run matched baseline/candidate canaries, then promote from the same hash-verified trace store. Only candidate runs recorded after staging count toward promotion, and the paired baseline digest must match the staged policy's parent digest:
@@ -136,7 +148,7 @@ uv run jev-dream promote .jev/experience.jsonl --registry .jev/policy-registry.j
 uv run jev-dream health .jev/experience.jsonl --registry .jev/policy-registry.json --recent-tasks 20
 ```
 
-Default activation gates require at least 12 baseline and 12 candidate canary tasks across at least four candidate task families, at least four paired task families, no verified-success/risk regression, and no more than 25% live regression in average latency, action count, or token use. Runs abandoned before a terminal decision (`aborted`) do not count as task outcomes. A failing active policy can be suspended so `Agent(policy_registry=...)` falls back to the baseline policy, and prior active policies can be restored with `jev-dream rollback`. Replay never fabricates a browser/model counterfactual: it follows the action actually recorded only if the proposed candidate-allocation policy would still have offered that action; otherwise the trajectory ends as a coverage miss. See [DREAM-Jev design](docs/dream-rsi-integration.md).
+Default activation gates require at least 12 baseline and 12 candidate canary tasks across at least four candidate task families, at least four paired task families, no verified-success/risk regression, and no more than 25% live regression in average latency, action count, or token use. Canary evidence is paired per task instance (`instance_id`, falling back to the goal-hash task key) and reports an exact two-sided sign-test p-value; `CanaryGate(max_pair_sign_p=...)` can enforce a confidence bound on top of the count gates, and `--baseline-since-ms` bounds baseline evidence to a matched time window. Runs abandoned before a terminal decision (`aborted`) do not count as task outcomes. A failing active policy can be suspended so `Agent(policy_registry=...)` falls back to the baseline policy, and prior active policies can be restored with `jev-dream rollback`. Replay never fabricates a browser/model counterfactual: it follows the action actually recorded only if the proposed candidate-allocation policy would still have offered that action; otherwise the trajectory ends as a coverage miss. See [DREAM-Jev design](docs/dream-rsi-integration.md).
 
 ## Why it moves
 
@@ -144,14 +156,14 @@ Default activation gates require at least 12 baseline and 12 candidate canary ta
 - **No screenshots in the default agent loop.** Jev consumes structured state. The inspector opts into screenshots; the video uses a separate continuous screencast.
 - **Isolated-world identity.** Node IDs, live node references, page keys, and target guards live in a named CDP isolated world. Main-world page JavaScript cannot replace Jev's registry or guard functions.
 - **One steady-state browser read per snapshot.** Read visible controls, their names, values, and text together. Isolated-world recreation adds a control-plane call only when the execution context changes.
-- **Validate the selected target twice.** A preflight freshness check happens before execution, then the same observed page/target guard is compared again inside the isolated-world execution evaluation. Geometry is resolved again and covered controls are rejected.
-- **Verify focus before text.** After the trusted mouse click, Jev checks that the observed field still owns focus before `Input.insertText`; focus redirection fails closed.
+- **Validate the selected target continuously.** A preflight freshness check happens before execution; the page/target guard, geometry, and hit-test are then re-verified inside the isolated world immediately before `mousePressed` *and again* before `mouseReleased`. A mid-press mutation (overlay, node swap, geometry drift, page change) aborts the operation — the release is still dispatched for pointer hygiene — and control returns to perception rather than retrying.
+- **Insert text atomically.** After the trusted click, focus verification and `execCommand('insertText')` run inside a single isolated-world evaluation, so focus can never be redirected between check and insertion. A landed value that differs from the authorized text is a non-retryable error.
 - **Wait for useful state.** After typing into a combobox, wait for visible suggestions, capped at 200 ms. Other interactions get at most two animation frames or 50 ms. These reads happen after execution is logged.
 - **Keep hidden tabs rendering.** Focus emulation prevents background animation throttling without switching Chrome's visible tab.
 - **Send visible text.** Offscreen article bodies and footers do not fill the model context.
 - **Reuse an interrupted text request.** A generated value survives a stale-page retry only if the entire text-helper input is unchanged.
 
-Every executed target is resolved from an observed node owned by the isolated-world registry. The executor rechecks semantic guards, current geometry, click occlusion, and—when typing—post-click focus. Model output never becomes selectors, coordinates, shell commands, or executable JavaScript. Text-helper output must parse as a small JSON object before typing. High-impact labels such as purchase, money-transfer, account-deletion, publication, and message-send commits pause in `approval_required` until the caller explicitly approves or rejects them. Applications should inject a stricter policy where their risk model demands it.
+Every executed target is resolved from an observed node owned by the isolated-world registry. The executor rechecks semantic guards, current geometry, click occlusion, and—when typing—post-click focus. Model output never becomes selectors, coordinates, shell commands, or executable JavaScript. Text-helper output must parse as a small JSON object before typing. Every mutation is classified into a deterministic semantic effect (`NAVIGATE`, `SEARCH`, `FORM_EDIT`, `AUTHENTICATE`, `SUBMISSION`, `EXTERNAL_MESSAGE`, `PURCHASE`, `FINANCIAL`, `DELETE`, `PERMISSION_CHANGE`, `UNKNOWN_COMMIT`) from the bounded structural context each snapshot attaches to a candidate — form membership and method, submit semantics, scoped field inventory, modal/dialog scope, outbound destination — plus label signals that can only escalate, never downgrade. High-authority effects pause in `approval_required`; a commit-shaped control whose effect cannot be determined is itself an `UNKNOWN_COMMIT` and also requires approval. `act()` accepts no caller-asserted approval: only `approve()` issues a one-shot grant bound to the pending action and page fingerprint, and `reject()` consumes the pending decision. Applications should inject a stricter policy where their risk model demands it.
 
 ## Small enough to read
 
@@ -161,9 +173,11 @@ Every executed target is resolved from an observed node owned by the isolated-wo
 | [snapshot.js](jev_ultrafast/snapshot.js) | Atomic DOM snapshot, indexed controls, freshness guards |
 | [browser.py](jev_ultrafast/browser.py) | Browser connection, current geometry, execution |
 | [model.py](jev_ultrafast/model.py) | Candidate budgeting, finite-choice backend interface, validation, text generation |
-| [policy.py](jev_ultrafast/policy.py) | Approval/deny boundary for consequential mutations |
+| [policy.py](jev_ultrafast/policy.py) | Deterministic effect classification + approval/deny boundary for consequential mutations |
 | [privacy.py](jev_ultrafast/privacy.py) | Bounded/redacted model observation layer |
 | [dream.py](jev_ultrafast/dream.py) | Replay worlds, evidence-bound policy improvement, canary/health gates, lineage and rollback |
+| [dreamlearn.py](jev_ultrafast/dreamlearn.py) | Learned cost/outcome priors for candidate prioritization — never qualification evidence |
+| [signing.py](jev_ultrafast/signing.py) | Domain-separated Ed25519 authenticity for evidence event hashes, injectable signer boundary, key rotation |
 | [trace.py](jev_ultrafast/trace.py) | Privacy-bounded, hash-chained live experience capture with candidate-catalogue evidence |
 | [questions.py](jev_ultrafast/questions.py) | Model instructions |
 | [demo.py](jev_ultrafast/demo.py) | Local inspector with approval controls |
@@ -176,7 +190,7 @@ In six alternating runs with identical models and settings, both versions passed
 
 The same policy opened the requested Wikipedia article in **2.798 s** and passed a local hotel search/filter task in **1.896 s**. Runs, failures, source hashes, and measurement boundaries are in [performance.md](docs/performance.md).
 
-A `DONE` choice is now represented as `claimed_done` unless a caller-supplied verifier passes; successful verification produces `done` with `verified=true`. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Shadow roots, frames, canvas, uploads, pop-up tabs, nested scrolling, multi-select widgets, and arbitrary keyboard widgets remain outside this release. Browser Harness still controls the profile/session boundary; v0.4 does not claim that the Chrome profile itself is isolated from the user's normal browser profile. DREAM-Jev is an empirical replay system, not a learned latent world model, and its usefulness depends on historical branch coverage and website freshness. The default canary thresholds are a deployment gate, not statistical proof of general reliability; production users should increase task count and diversity for their domain.
+A `DONE` choice is now represented as `claimed_done` unless a caller-supplied verifier passes; successful verification produces `done` with `verified=true`. The DOM reader handles common HTML and ARIA controls, not the full accessible-name specification. Shadow roots, frames, canvas, uploads, pop-up tabs, nested scrolling, multi-select widgets, and arbitrary keyboard widgets remain outside this release. Browser Harness still controls the profile/session boundary; v0.4 does not claim that the Chrome profile itself is isolated from the user's normal browser profile. DREAM-Jev is an empirical replay system, not a learned latent world model: the auxiliary `CostModel`/`OutcomeModel` only prioritize among empirically evaluated candidates and can never count as qualification evidence. Its usefulness depends on historical branch coverage and website freshness. The default canary thresholds are a deployment gate, not statistical proof of general reliability; production users should increase task count and diversity for their domain.
 
 ## Development
 
@@ -188,7 +202,7 @@ node --check jev_ultrafast/snapshot.js
 uv build
 ```
 
-Tests are offline. `uv run python scripts/check_guards.py` checks real controls in a local browser without model calls. Point it at a dedicated automation Chrome — the harness does not see Chrome running under a non-default profile or without remote debugging:
+Unit tests are offline; CI additionally runs `scripts/check_guards.py` in a `live-guards` job against headless Chrome over CDP, because a past release shipped a mutation-path defect that passed mocked tests and failed only in a real browser. Run the same suite locally against a dedicated automation Chrome — the harness does not see Chrome running under a non-default profile or without remote debugging:
 
 ```bash
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \

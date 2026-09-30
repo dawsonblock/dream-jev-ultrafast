@@ -21,12 +21,19 @@ from pathlib import Path
 from statistics import fmean
 from typing import Iterable
 
-from .privacy import tokenize
+from .privacy import action_goal_overlap
+from .signing import EvidenceSigner, verify_keys_from_env, verify_signature
 
-SCHEMA_VERSION = "jev-dream/2"
-SUPPORTED_SCHEMAS = {"jev-dream/1", SCHEMA_VERSION}
-TCB_VERSION = "jev-ultrafast-tcb/0.5"
-SUPPORTED_TCB_VERSIONS = {"jev-ultrafast-tcb/0.3", "jev-ultrafast-tcb/0.4", TCB_VERSION}
+SCHEMA_VERSION = "jev-dream/3"
+SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", SCHEMA_VERSION}
+TCB_VERSION = "jev-ultrafast-tcb/0.7"
+SUPPORTED_TCB_VERSIONS = {
+    "jev-ultrafast-tcb/0.3",
+    "jev-ultrafast-tcb/0.4",
+    "jev-ultrafast-tcb/0.5",
+    "jev-ultrafast-tcb/0.6",
+    TCB_VERSION,
+}
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
 
 
@@ -61,6 +68,20 @@ def _file_lock(lock_path: Path):
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _fsync_dir(path: Path):
+    """Durable-rename bookkeeping: fsync the directory after atomic file writes."""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def task_key(goal: str) -> str:
@@ -98,11 +119,14 @@ class ExplorationPolicy:
     name: str = "baseline"
     version: int = 1
     goal_overlap_weight: float = 10.0
+    overlap_exponent: float = 1.0
     order_penalty: float = 0.00001
     click_bonus: float = 0.5
     fill_bonus: float = 1.5
     select_bonus: float = 1.0
     model_action_limit: int = 250
+    duplicate_node_cap: int = 250
+    min_goal_overlap: int = 0
     click_quota: int = 150
     fill_quota: int = 45
     select_quota: int = 55
@@ -114,6 +138,7 @@ class ExplorationPolicy:
             raise ValueError("Exploration policy needs a name and positive version")
         for value in (
             self.goal_overlap_weight,
+            self.overlap_exponent,
             self.order_penalty,
             self.click_bonus,
             self.fill_bonus,
@@ -121,8 +146,14 @@ class ExplorationPolicy:
         ):
             if not math.isfinite(value):
                 raise ValueError("Exploration policy weights must be finite")
+        if not 0.25 <= self.overlap_exponent <= 2.0:
+            raise ValueError("overlap_exponent must be between 0.25 and 2.0")
         if not 16 <= self.model_action_limit <= 250:
             raise ValueError("model_action_limit must be between 16 and 250")
+        if not 1 <= self.duplicate_node_cap <= 250:
+            raise ValueError("duplicate_node_cap must be between 1 and 250")
+        if not 0 <= self.min_goal_overlap <= 5:
+            raise ValueError("min_goal_overlap must be between 0 and 5")
         for quota in (self.click_quota, self.fill_quota, self.select_quota):
             if not 1 <= quota <= 250:
                 raise ValueError("candidate quotas must be between 1 and 250")
@@ -132,17 +163,13 @@ class ExplorationPolicy:
             raise ValueError("no_progress_window must be between 2 and 10")
 
     def candidate_score(self, action: dict, goal_tokens: set[str], order: int) -> float:
-        searchable = " ".join(
-            str(action.get(k, "")) for k in ("label", "value", "current_value", "option_label")
-        ).lower()
-        tokens = set(tokenize(searchable))
-        overlap = len(goal_tokens & tokens)
+        overlap = action_goal_overlap(action, goal_tokens)
         bonus = {
             "fill": self.fill_bonus,
             "select": self.select_bonus,
             "click": self.click_bonus,
         }.get(action.get("kind"), 0.0)
-        return overlap * self.goal_overlap_weight + bonus - order * self.order_penalty
+        return (overlap ** self.overlap_exponent) * self.goal_overlap_weight + bonus - order * self.order_penalty
 
     def quota_for(self, kind: str) -> int:
         return {
@@ -162,10 +189,37 @@ class ExplorationPolicy:
             raise ValueError(f"Unknown exploration policy keys: {sorted(unknown)}")
         return cls(**payload)
 
+    _BEHAVIOR_FIELDS = (
+        "goal_overlap_weight",
+        "overlap_exponent",
+        "order_penalty",
+        "click_bonus",
+        "fill_bonus",
+        "select_bonus",
+        "model_action_limit",
+        "duplicate_node_cap",
+        "min_goal_overlap",
+        "click_quota",
+        "fill_quota",
+        "select_quota",
+        "max_actions",
+        "no_progress_window",
+    )
+
     @property
     def digest(self) -> str:
         encoded = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
         return _stable_hash(encoded)
+
+    @property
+    def behavior_digest(self) -> str:
+        """Identity-free digest of only the parameters that change runtime behavior.
+
+        ``digest`` binds name/version lineage; ``behavior_digest`` deduplicates
+        candidates that differ in identity but not in what the agent would do.
+        """
+        material = {field: getattr(self, field) for field in self._BEHAVIOR_FIELDS}
+        return _stable_hash(json.dumps(material, sort_keys=True, separators=(",", ":")))
 
 
 @dataclass(frozen=True)
@@ -199,6 +253,9 @@ class ReplayMetrics:
     risk_events: int
     coverage_misses: int
     coverage: float
+    estimated_tokens: int = 0
+    estimated_latency_ms: int = 0
+    estimated_score: float | None = None
 
     @property
     def success_rate(self) -> float:
@@ -218,7 +275,16 @@ class ExperienceStore:
     operating-system lock, keeping append cost effectively constant.
     """
 
-    def __init__(self, path: str | os.PathLike, *, strict: bool = False):
+    def __init__(
+        self,
+        path: str | os.PathLike,
+        *,
+        strict: bool = False,
+        signer=None,
+        verify_key: str | None = None,
+        verify_keys=None,
+        require_signatures: bool = False,
+    ):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
@@ -227,10 +293,26 @@ class ExperienceStore:
         # verifies the whole chain first so a mid-chain corruption cannot keep
         # accumulating events into a store that load() would reject.
         self.strict = strict
+        # Optional authenticity: a signer object exposing ``key_id`` and
+        # ``sign_hex`` (Ed25519 EvidenceSigner by default via env key). The
+        # signer interface is injectable so private material can live outside
+        # the agent process. ``verify_keys`` is the trusted set of hex Ed25519
+        # public keys — a set rather than one key so rotation keeps older
+        # signed events verifiable. ``require_signatures`` additionally
+        # rejects unsigned events.
+        self.signer = signer if signer is not None else EvidenceSigner.from_env()
+        keys = {k.strip() for k in (verify_keys or []) if k and k.strip()}
+        if verify_key and verify_key.strip():
+            keys.add(verify_key.strip())
+        keys.update(verify_keys_from_env())
+        self.verify_keys = keys
+        # Single-key form retained for callers inspecting configuration.
+        self.verify_key = next(iter(keys)) if len(keys) == 1 else None
+        self.require_signatures = bool(require_signatures or os.environ.get("JEV_REQUIRE_SIGNED_EVIDENCE"))
 
     @staticmethod
     def _event_hash(payload: dict) -> str:
-        material = {k: v for k, v in payload.items() if k != "event_hash"}
+        material = {k: v for k, v in payload.items() if k not in {"event_hash", "signature", "key_id"}}
         return _stable_hash(json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
 
     def _tail_event_unlocked(self) -> dict | None:
@@ -255,7 +337,15 @@ class ExperienceStore:
                         raise ValueError("Invalid DREAM event JSON at store tail") from exc
         return None
 
-    _RESERVED_EVENT_KEYS = {"schema", "tcb_version", "recorded_at_ms", "prev_hash", "event_hash"}
+    _RESERVED_EVENT_KEYS = {
+        "schema",
+        "tcb_version",
+        "recorded_at_ms",
+        "prev_hash",
+        "event_hash",
+        "signature",
+        "key_id",
+    }
 
     def append(self, event: dict) -> dict:
         if self._RESERVED_EVENT_KEYS & event.keys():
@@ -263,6 +353,7 @@ class ExperienceStore:
                 f"DREAM event cannot set reserved chain keys: {sorted(self._RESERVED_EVENT_KEYS & event.keys())}"
             )
         with self._lock, _file_lock(self.lock_path):
+            needs_separator = self._truncate_torn_tail_unlocked()
             if self.strict:
                 self._load_unlocked()
             tail = self._tail_event_unlocked()
@@ -280,49 +371,130 @@ class ExperienceStore:
                 **event,
             }
             payload["event_hash"] = self._event_hash(payload)
+            if self.signer is not None:
+                payload["key_id"] = self.signer.key_id
+                payload["signature"] = self.signer.sign_hex(payload["event_hash"])
             line = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+            created = not self.path.exists()
             with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+                # A complete record whose terminating newline was lost to a
+                # crash needs the separator restored before the next event.
+                handle.write(("\n" if needs_separator else "") + line + "\n")
                 handle.flush()
                 os.fsync(handle.fileno())
+            if created:
+                _fsync_dir(self.path.parent)
             return payload
 
-    def _load_unlocked(self) -> list[dict]:
+    def _truncate_torn_tail_unlocked(self) -> bool:
+        """Discard a crash-torn final fragment; return True when a separator is owed.
+
+        A write is ``line + "\\n"``, so a file not ending in a newline carries
+        an unfinished final record. Truncating is allowed only when the
+        fragment is a recognizable prefix of an event object (``{`` or
+        ``{"...``) or pure whitespace — anything else means corruption or
+        tampering and stays fail-closed. A complete record missing only its
+        newline is left in place; the caller must restore the separator.
+        """
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return False
+        data = self.path.read_bytes()
+        if data.endswith(b"\n"):
+            return False
+        frag = data.rsplit(b"\n", 1)[-1]
+        stripped = frag.strip()
+        try:
+            parsed = json.loads(frag) if stripped else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            # A complete record whose terminating newline was lost to a crash —
+            # keep it; the caller restores the separator before the next event.
+            return True
+        if parsed is not None or (stripped and stripped != b"{" and not stripped.startswith(b'{"')):
+            raise ValueError("Unrecoverable DREAM store tail: not a torn event prefix")
+        offset = len(data) - len(frag)
+        with self.path.open("r+b") as handle:
+            handle.truncate(offset)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return False
+
+    def _load_unlocked(self) -> tuple[list[dict], int | None]:
+        """Validate the chain; return ``(events, torn_tail_offset | None)``.
+
+        A clearly incomplete final fragment is reported, not fatal: the writer
+        crashed between or during writes. Every other decode failure, and any
+        parsed record with a bad hash, link, or signature, stays fail-closed.
+        """
         if not self.path.exists():
-            return []
+            return [], None
+        data = self.path.read_bytes()
+        lines = data.split(b"\n")
+        last_idx = len(lines) - 1
         events = []
+        torn_offset = None
         expected_prev = "0" * 64
-        with self.path.open("r", encoding="utf-8") as handle:
-            for line_no, line in enumerate(handle, 1):
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"Invalid DREAM event JSON on line {line_no}") from exc
-                if event.get("schema") not in SUPPORTED_SCHEMAS:
-                    raise ValueError(f"Unsupported DREAM schema on line {line_no}")
-                if event.get("tcb_version") not in SUPPORTED_TCB_VERSIONS:
-                    raise ValueError(f"Unsupported DREAM TCB version on line {line_no}")
-                if event.get("prev_hash") != expected_prev:
-                    raise ValueError(f"DREAM hash-chain predecessor mismatch on line {line_no}")
-                if event.get("event_hash") != self._event_hash(event):
-                    raise ValueError(f"DREAM hash-chain integrity failure on line {line_no}")
-                expected_prev = event["event_hash"]
-                events.append(event)
-        return events
+        offset = 0
+        for i, raw in enumerate(lines):
+            line_no = i + 1
+            line_start = offset
+            offset += len(raw) + 1
+            if not raw.strip():
+                continue
+            try:
+                event = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                if i == last_idx and (raw.strip() == b"{" or raw.strip().startswith(b'{"')):
+                    torn_offset = line_start
+                    break
+                raise ValueError(f"Invalid DREAM event JSON on line {line_no}") from exc
+            if not isinstance(event, dict):
+                raise ValueError(f"Invalid DREAM event JSON on line {line_no}")
+            if event.get("schema") not in SUPPORTED_SCHEMAS:
+                raise ValueError(f"Unsupported DREAM schema on line {line_no}")
+            if event.get("tcb_version") not in SUPPORTED_TCB_VERSIONS:
+                raise ValueError(f"Unsupported DREAM TCB version on line {line_no}")
+            if event.get("prev_hash") != expected_prev:
+                raise ValueError(f"DREAM hash-chain predecessor mismatch on line {line_no}")
+            if event.get("event_hash") != self._event_hash(event):
+                raise ValueError(f"DREAM hash-chain integrity failure on line {line_no}")
+            signature = event.get("signature")
+            if signature is not None:
+                if not self.verify_keys:
+                    raise ValueError(
+                        f"Signed DREAM event on line {line_no} but no verification key is configured"
+                    )
+                key_id = event.get("key_id")
+                if key_id not in self.verify_keys:
+                    raise ValueError(f"DREAM evidence signed by an unexpected key on line {line_no}")
+                if not verify_signature(key_id, event["event_hash"], signature):
+                    raise ValueError(f"DREAM evidence signature verification failure on line {line_no}")
+            elif self.require_signatures:
+                raise ValueError(f"Unsigned DREAM event on line {line_no} with signatures required")
+            expected_prev = event["event_hash"]
+            events.append(event)
+        return events, torn_offset
 
     def load(self) -> list[dict]:
         with self._lock, _file_lock(self.lock_path):
-            return self._load_unlocked()
+            events, _ = self._load_unlocked()
+            return events
 
     def verify(self) -> dict:
-        events = self.load()
+        with self._lock, _file_lock(self.lock_path):
+            events, torn_offset = self._load_unlocked()
+        signed = sum(1 for event in events if event.get("signature"))
         return {
             "events": len(events),
             "head_hash": events[-1]["event_hash"] if events else "0" * 64,
             "schemas": sorted({event["schema"] for event in events}),
             "tcb_versions": sorted({event["tcb_version"] for event in events}),
+            "signed_events": signed,
+            "unsigned_events": len(events) - signed,
+            "signature_key_ids": sorted({event["key_id"] for event in events if event.get("key_id")}),
+            "signatures_checked": bool(self.verify_keys) if signed else None,
+            "torn_tail_recovered": torn_offset is not None,
         }
 
     def head_hash(self) -> str:
@@ -348,6 +520,9 @@ class RecordedTransition:
     risk_events: int
     terminal: str | None = None
     verified: bool = False
+    catalog: str = "recorded"
+    offered_digest: str | None = None
+    offered_count: int | None = None
 
 
 @dataclass
@@ -366,12 +541,14 @@ class ReplayWorld:
     start_state: str
     tcb_version: str
     trajectory: tuple[RecordedTransition, ...]
+    family_key: str = ""
 
     @property
     def digest(self) -> str:
         payload = {
             "key": self.key,
             "task_key": self.task_key,
+            "family_key": self.family_key,
             "start_state": self.start_state,
             "tcb_version": self.tcb_version,
             "trajectory": [asdict(item) for item in self.trajectory],
@@ -393,6 +570,10 @@ class ReplayWorld:
             if not start:
                 continue
             key = start["task_key"]
+            family_key = str(start.get("task_family") or "").strip().lower() or key
+            run_policy = None
+            if start.get("policy") is not None:
+                run_policy = ExplorationPolicy.from_dict(start["policy"])
             run_tcbs = {e.get("tcb_version") for e in run_events}
             if len(run_tcbs) != 1:
                 raise ValueError(f"Run {run_id} crosses DREAM TCB versions")
@@ -414,6 +595,14 @@ class ReplayWorld:
                 stored_digest = event.get("candidate_digest")
                 if stored_digest and stored_digest != observed_digest:
                     raise ValueError(f"Run {run_id} has a candidate catalogue digest mismatch")
+                stored_offered = event.get("offered_digest")
+                if stored_offered and run_policy is not None:
+                    # The recorded policy must be able to re-derive the catalogue
+                    # the model was offered from the observed catalogue, or the
+                    # trace evidence is inconsistent.
+                    expected_offered = ReplaySimulator._retained_candidates(run_policy, event_candidates)
+                    if candidate_catalog_digest(expected_offered) != stored_offered:
+                        raise ValueError(f"Run {run_id} has an offered catalogue digest mismatch")
                 selected_id = event["selected"]["id"]
                 selected_rank = event.get("selected_rank")
                 if selected_rank is None:
@@ -439,6 +628,13 @@ class ReplayWorld:
                     risk_events=max(0, int(event.get("risk_events", 0))),
                     terminal=terminal,
                     verified=verified,
+                    catalog=str(event.get("catalog") or "recorded"),
+                    offered_digest=stored_offered,
+                    offered_count=(
+                        max(0, int(event["offered_count"]))
+                        if event.get("offered_count") is not None
+                        else len(event_candidates)
+                    ),
                 )
                 transitions.append(tr)
             worlds.append(cls(
@@ -448,6 +644,7 @@ class ReplayWorld:
                 start_state=start.get("state", "ROOT"),
                 tcb_version=run_tcb,
                 trajectory=tuple(transitions),
+                family_key=family_key,
             ))
         return worlds
 
@@ -485,11 +682,36 @@ class ReplaySimulator:
         self.worlds = tuple(worlds)
         self.weights = weights or ObjectiveWeights()
 
-    def evaluate(self, policy: ExplorationPolicy, *, max_steps: int | None = None) -> ReplayResult:
-        summaries = [self._evaluate_world(world, policy, max_steps=max_steps) for world in self.worlds]
-        return ReplayResult(metrics=self._aggregate(summaries), per_world=tuple(summaries))
+    def evaluate(
+        self,
+        policy: ExplorationPolicy,
+        *,
+        max_steps: int | None = None,
+        cost_model=None,
+        outcome_model=None,
+    ) -> ReplayResult:
+        estimated = bool(cost_model is not None and getattr(cost_model, "reliable", False))
+        summaries = [
+            self._evaluate_world(
+                world,
+                policy,
+                max_steps=max_steps,
+                cost_model=cost_model if estimated else None,
+                outcome_model=outcome_model,
+            )
+            for world in self.worlds
+        ]
+        return ReplayResult(metrics=self._aggregate(summaries, estimated=estimated), per_world=tuple(summaries))
 
-    def _evaluate_world(self, world: ReplayWorld, policy: ExplorationPolicy, *, max_steps: int | None):
+    def _evaluate_world(
+        self,
+        world: ReplayWorld,
+        policy: ExplorationPolicy,
+        *,
+        max_steps: int | None,
+        cost_model=None,
+        outcome_model=None,
+    ):
         summary = self._empty_world(world)
         step_limit = min(policy.max_actions, max_steps or policy.max_actions)
         no_progress = 0
@@ -506,6 +728,33 @@ class ReplaySimulator:
             summary["page_progress"] += int(transition.page_changed)
             summary["stale_or_failures"] += transition.stale_or_failure
             summary["risk_events"] += transition.risk_events
+            if cost_model is not None:
+                # Anchored efficiency estimate: keep the recorded measurement and
+                # adjust only by the learned marginal cost of the offered-count
+                # delta. This is hypothesis prioritization, not evidence.
+                recorded_offered = transition.offered_count or len(transition.candidate_actions)
+                predicted = cost_model.predict(len(offered))
+                recorded = cost_model.predict(recorded_offered)
+                summary["est_tokens"] += max(0.0, transition.tokens + predicted["tokens"] - recorded["tokens"])
+                summary["est_latency_ms"] += max(
+                    0.0, transition.latency_ms + predicted["latency_ms"] - recorded["latency_ms"]
+                )
+            if outcome_model is not None:
+                selected_overlap = next(
+                    (
+                        int(c.get("goal_overlap", 0))
+                        for c in transition.candidate_actions
+                        if c.get("id") == transition.selected_id
+                    ),
+                    0,
+                )
+                prediction = outcome_model.predict(
+                    kind=transition.selected_kind,
+                    goal_overlap=selected_overlap,
+                    rank=transition.selected_rank,
+                )
+                summary["predicted_change"] += prediction["p_page_changed"]
+                summary["prediction_samples"] += prediction["n"]
             if transition.selected_kind != "wait" and not transition.page_changed:
                 no_progress += 1
             else:
@@ -523,38 +772,68 @@ class ReplaySimulator:
 
     @staticmethod
     def _retained_candidates(policy: ExplorationPolicy, candidates: Iterable[dict]) -> list[dict]:
+        """Re-derive the offered catalogue; must match model.candidate_actions.
+
+        Stored ``goal_overlap`` is computed on sanitized labels, as is live
+        scoring, so the replayed catalogue is identical to what the model was
+        offered online. Candidates lacking ``node`` metadata (older schema)
+        are treated as unique nodes so ``duplicate_node_cap`` cannot merge them.
+        """
         candidates = [dict(c) for c in candidates if c.get("id")]
         controls = [c for c in candidates if c.get("kind") not in {"click", "fill", "select"}]
-        regular = [(index, c) for index, c in enumerate(candidates) if c.get("kind") in {"click", "fill", "select"}]
+        regular = []
+        for index, candidate in enumerate(candidates):
+            if candidate.get("kind") not in {"click", "fill", "select"}:
+                continue
+            overlap = max(0, int(candidate.get("goal_overlap", 0)))
+            if overlap < policy.min_goal_overlap:
+                continue
+            regular.append((index, candidate, overlap))
 
         def score(pair):
-            index, action = pair
-            overlap = max(0, int(action.get("goal_overlap", 0)))
+            index, action, overlap = pair
             bonus = {
                 "fill": policy.fill_bonus,
                 "select": policy.select_bonus,
                 "click": policy.click_bonus,
             }.get(action.get("kind"), 0.0)
-            return overlap * policy.goal_overlap_weight + bonus - index * policy.order_penalty
+            overlap_term = (overlap ** policy.overlap_exponent) * policy.goal_overlap_weight
+            return overlap_term + bonus - index * policy.order_penalty
+
+        def node_group(index, action):
+            node = action.get("node")
+            return ("n", node) if node is not None else ("~", index)
 
         ranked = sorted(regular, key=score, reverse=True)
         quotas = {"click": policy.click_quota, "fill": policy.fill_quota, "select": policy.select_quota}
         regular_budget = max(0, policy.model_action_limit - len(controls))
         counts = {kind: 0 for kind in quotas}
+        node_counts: dict = {}
         selected = []
         used = set()
-        for index, action in ranked:
+        for index, action, _overlap in ranked:
             kind = action["kind"]
-            if counts[kind] >= quotas[kind] or len(selected) >= regular_budget:
+            group = node_group(index, action)
+            if (
+                counts[kind] >= quotas[kind]
+                or len(selected) >= regular_budget
+                or node_counts.get(group, 0) >= policy.duplicate_node_cap
+            ):
                 continue
             selected.append((index, action))
             used.add(index)
             counts[kind] += 1
+            node_counts[group] = node_counts.get(group, 0) + 1
         if len(selected) < regular_budget:
-            for index, action in ranked:
+            for index, action, _overlap in ranked:
                 if index in used:
                     continue
+                group = node_group(index, action)
+                if node_counts.get(group, 0) >= policy.duplicate_node_cap:
+                    continue
                 selected.append((index, action))
+                used.add(index)
+                node_counts[group] = node_counts.get(group, 0) + 1
                 if len(selected) >= regular_budget:
                     break
         result = [action for _, action in sorted(selected, key=lambda pair: pair[0])]
@@ -579,9 +858,13 @@ class ReplaySimulator:
             "risk_events": 0,
             "coverage_misses": coverage_miss,
             "covered_steps": 0,
+            "est_tokens": 0.0,
+            "est_latency_ms": 0.0,
+            "predicted_change": 0.0,
+            "prediction_samples": 0,
         }
 
-    def _aggregate(self, summaries: list[dict]) -> ReplayMetrics:
+    def _aggregate(self, summaries: list[dict], *, estimated: bool = False) -> ReplayMetrics:
         w = self.weights
         worlds = len(summaries)
         successes = sum(int(s["success"]) for s in summaries)
@@ -597,21 +880,30 @@ class ReplaySimulator:
         misses = sum(s["coverage_misses"] for s in summaries)
         potential = actions + misses
         coverage = actions / potential if potential else (1.0 if worlds else 0.0)
-        score = (
-            w.success * successes
-            + w.verified * verified
-            + w.page_progress * progress
-            - w.latency_seconds * (latency / 1000)
-            - w.action * actions
-            - w.model_call * model_calls
-            - w.thousand_tokens * (tokens / 1000)
-            - w.offered_candidate * offered
-            - w.stale_or_failure * failures
-            - w.risk_event * risk
-            - w.coverage_miss * misses
-        )
+
+        def score(token_total, latency_total):
+            return (
+                w.success * successes
+                + w.verified * verified
+                + w.page_progress * progress
+                - w.latency_seconds * (latency_total / 1000)
+                - w.action * actions
+                - w.model_call * model_calls
+                - w.thousand_tokens * (token_total / 1000)
+                - w.offered_candidate * offered
+                - w.stale_or_failure * failures
+                - w.risk_event * risk
+                - w.coverage_miss * misses
+            )
+
+        estimated_score = None
+        est_tokens = est_latency = 0
+        if estimated:
+            est_tokens = sum(s["est_tokens"] for s in summaries)
+            est_latency = sum(s["est_latency_ms"] for s in summaries)
+            estimated_score = score(est_tokens, est_latency)
         return ReplayMetrics(
-            score=score,
+            score=score(tokens, latency),
             worlds=worlds,
             successes=successes,
             verified_successes=verified,
@@ -625,6 +917,9 @@ class ReplaySimulator:
             risk_events=risk,
             coverage_misses=misses,
             coverage=coverage,
+            estimated_tokens=int(round(est_tokens)),
+            estimated_latency_ms=int(round(est_latency)),
+            estimated_score=estimated_score,
         )
 
 
@@ -726,11 +1021,15 @@ class PromotionGate:
 
 
 def split_worlds(worlds: Iterable[ReplayWorld]):
-    """Deterministic, disjoint split that keeps each task family in one partition."""
+    """Deterministic, disjoint split that keeps each task family in one partition.
+
+    A family is the explicit ``task_family`` recorded at run start, falling back
+    to the goal-hash task key for traces without family metadata.
+    """
     groups: dict[str, list[ReplayWorld]] = defaultdict(list)
     for world in worlds:
-        groups[world.task_key].append(world)
-    ordered = sorted(groups.items(), key=lambda item: (int(item[0][:16], 16), item[0]))
+        groups[world.family_key or world.task_key].append(world)
+    ordered = sorted(groups.items(), key=lambda item: (int(_stable_hash(item[0])[:16], 16), item[0]))
     n = len(ordered)
     if n == 0:
         return {"train": [], "validation": [], "holdout": []}
@@ -760,33 +1059,64 @@ def split_worlds(worlds: Iterable[ReplayWorld]):
 
 
 def mutate_policies(base: ExplorationPolicy) -> list[ExplorationPolicy]:
-    """Deterministic, bounded candidate generator for offline dreaming.
+    """Deterministic, bidirectional, bounded candidate generator for offline dreaming.
 
-    The generator changes only whitelisted exploration knobs. It never emits code.
+    Every knob is perturbed in both directions within the ``ExplorationPolicy``
+    envelopes, so the search can expand as well as contract the candidate space.
+    The generator changes only whitelisted exploration knobs. It never emits
+    code, and candidates identical in behavior to the base are dropped by
+    ``behavior_digest`` rather than kept as distinct digests.
     """
-    candidates = [base]
     specs = [
-        {"goal_overlap_weight": base.goal_overlap_weight * 1.20},
-        {"goal_overlap_weight": max(1.0, base.goal_overlap_weight * 0.50)},
-        {"goal_overlap_weight": max(0.1, base.goal_overlap_weight * 0.25)},
-        {"goal_overlap_weight": max(0.1, base.goal_overlap_weight * 0.05)},
-        {"fill_bonus": base.fill_bonus + 0.5},
-        {"fill_bonus": base.fill_bonus + 3.0},
-        {"select_bonus": base.select_bonus + 0.5},
-        {"select_bonus": base.select_bonus + 3.0},
-        {"click_bonus": base.click_bonus + 0.5},
-        {"click_bonus": base.click_bonus + 3.0},
-        {"model_action_limit": max(64, min(250, base.model_action_limit - 32))},
-        {"model_action_limit": max(64, min(250, base.model_action_limit + 0))},
-        {"click_quota": max(40, min(250, base.click_quota - 20)), "fill_quota": min(80, base.fill_quota + 10)},
-        {"no_progress_window": min(6, base.no_progress_window + 1)},
-        {"max_actions": max(20, base.max_actions - 10)},
+        {"goal_overlap_weight": max(0.1, base.goal_overlap_weight * factor)}
+        for factor in (0.25, 0.5, 0.75, 1.25, 1.5, 2.0)
     ]
+    specs += [
+        {field: max(-2.0, min(10.0, getattr(base, field) + delta))}
+        for field in ("click_bonus", "fill_bonus", "select_bonus")
+        for delta in (-1.0, -0.5, -0.25, 0.25, 0.5, 1.0)
+    ]
+    specs += [
+        {field: max(1, min(250, getattr(base, field) + delta))}
+        for field in ("click_quota", "fill_quota", "select_quota")
+        for delta in (-25, -10, 10, 25)
+    ]
+    specs += [
+        {"model_action_limit": max(16, min(250, base.model_action_limit + delta))}
+        for delta in (-32, -16, 16, 32)
+    ]
+    specs += [
+        {"max_actions": max(4, min(120, base.max_actions + delta))}
+        for delta in (-16, -8, 8, 16)
+    ]
+    specs += [
+        {"no_progress_window": max(2, min(10, base.no_progress_window + delta))}
+        for delta in (-1, 1)
+    ]
+    specs += [
+        {"order_penalty": max(0.0, base.order_penalty * factor)}
+        for factor in (0.2, 5.0)
+    ]
+    specs += [
+        {"overlap_exponent": max(0.25, min(2.0, base.overlap_exponent * factor))}
+        for factor in (0.7, 1.4)
+    ]
+    specs += [
+        {"duplicate_node_cap": max(1, min(250, base.duplicate_node_cap + delta))}
+        for delta in (-100, -50, -25, 25, 100)
+    ]
+    specs += [
+        {"min_goal_overlap": max(0, min(5, base.min_goal_overlap + delta))}
+        for delta in (-1, 1)
+    ]
+    candidates = []
+    seen = {base.behavior_digest}
     for index, changes in enumerate(specs, 1):
-        # Avoid duplicate candidates such as action_limit=250 + 0.
         candidate = replace(base, name=f"{base.name}-dream-{index}", version=base.version + 1, **changes)
-        if candidate.digest not in {p.digest for p in candidates}:
-            candidates.append(candidate)
+        if candidate.behavior_digest in seen:
+            continue
+        seen.add(candidate.behavior_digest)
+        candidates.append(candidate)
     return candidates
 
 
@@ -802,14 +1132,18 @@ class DreamReport:
     evidence_head_hash: str | None = None
     tcb_versions: tuple[str, ...] = ()
     live_canary_required: bool = True
+    cost_model_digest: str | None = None
+    outcome_model_digest: str | None = None
 
     def to_dict(self):
         return {
             "schema": SCHEMA_VERSION,
             "selected": self.selected.to_dict(),
             "selected_digest": self.selected.digest,
+            "selected_behavior_digest": self.selected.behavior_digest,
             "baseline": self.baseline.to_dict(),
             "baseline_digest": self.baseline.digest,
+            "baseline_behavior_digest": self.baseline.behavior_digest,
             "promotion": {
                 "approved": self.promotion.approved,
                 "reason": self.promotion.reason,
@@ -825,6 +1159,8 @@ class DreamReport:
             "evidence_head_hash": self.evidence_head_hash,
             "tcb_versions": list(self.tcb_versions),
             "live_canary_required": self.live_canary_required,
+            "cost_model_digest": self.cost_model_digest,
+            "outcome_model_digest": self.outcome_model_digest,
             "tcb_version": TCB_VERSION,
         }
 
@@ -858,6 +1194,8 @@ class DreamImprover:
         base: ExplorationPolicy,
         *,
         evidence_head_hash: str | None = None,
+        cost_model=None,
+        outcome_model=None,
     ) -> DreamReport:
         worlds = list(worlds)
         splits = split_worlds(worlds)
@@ -874,7 +1212,15 @@ class DreamImprover:
             empty = ReplaySimulator([], self.weights).evaluate(base)
             decision = PromotionDecision(False, "no replay worlds", empty.metrics, empty.metrics)
             return DreamReport(
-                base, base, decision, (), split_sizes, pool_digest, split_digest, evidence_head_hash, tcb_versions
+                base,
+                base,
+                decision,
+                (),
+                split_sizes,
+                pool_digest,
+                split_digest,
+                evidence_head_hash,
+                tcb_versions,
             )
 
         simulators = {
@@ -882,21 +1228,39 @@ class DreamImprover:
             for name, items in splits.items()
         }
         base_results = {
-            name: (sim.evaluate(base) if sim else None)
+            name: (sim.evaluate(base, cost_model=cost_model, outcome_model=outcome_model) if sim else None)
             for name, sim in simulators.items()
         }
 
+        def robust_estimated_gain(candidate_results):
+            deltas = []
+            for name in ("train", "validation", "holdout"):
+                base_result, candidate_result = base_results.get(name), candidate_results.get(name)
+                if (
+                    base_result is None
+                    or candidate_result is None
+                    or not base_result.metrics.worlds
+                    or base_result.metrics.estimated_score is None
+                    or candidate_result.metrics.estimated_score is None
+                ):
+                    continue
+                deltas.append(
+                    candidate_result.metrics.estimated_score / candidate_result.metrics.worlds
+                    - base_result.metrics.estimated_score / base_result.metrics.worlds
+                )
+            return min(deltas) if deltas else None
+
         evaluated = []
-        passing: list[tuple[float, float, ExplorationPolicy, PromotionDecision]] = []
+        passing: list[tuple[float, float, float, ExplorationPolicy, PromotionDecision]] = []
         for policy in mutate_policies(base):
             candidate_results = {
-                name: (sim.evaluate(policy) if sim else None)
+                name: (sim.evaluate(policy, cost_model=cost_model, outcome_model=outcome_model) if sim else None)
                 for name, sim in simulators.items()
             }
-            if policy.digest == base.digest:
+            if policy.behavior_digest == base.behavior_digest:
                 decision = PromotionDecision(
                     False,
-                    "baseline candidate",
+                    "baseline behavior",
                     base_results["train"].metrics,
                     candidate_results["train"].metrics,
                 )
@@ -915,9 +1279,11 @@ class DreamImprover:
                 for name in ("train", "validation", "holdout")
                 if base_results[name] is not None and candidate_results[name] is not None
             ])
-            evaluated.append({
+            estimated_gain = robust_estimated_gain(candidate_results)
+            entry = {
                 "policy": policy.to_dict(),
                 "digest": policy.digest,
+                "behavior_digest": policy.behavior_digest,
                 "train": asdict(candidate_results["train"].metrics),
                 "validation": (
                     asdict(candidate_results["validation"].metrics) if candidate_results["validation"] else None
@@ -927,13 +1293,22 @@ class DreamImprover:
                 "reason": decision.reason,
                 "robust_gain_per_world": robust_gain,
                 "average_gain_per_world": average_gain,
-            })
+            }
+            if estimated_gain is not None:
+                entry["estimated_gain_per_world"] = estimated_gain
+            if outcome_model is not None and outcome_model.samples:
+                entry["predicted_page_changes_per_world"] = fmean(
+                    s["predicted_change"] for s in candidate_results["train"].per_world
+                )
+            evaluated.append(entry)
             if decision.approved:
-                passing.append((robust_gain, average_gain, policy, decision))
+                passing.append((robust_gain, average_gain, estimated_gain or float("-inf"), policy, decision))
 
         if passing:
-            passing.sort(key=lambda item: (item[0], item[1], item[2].digest), reverse=True)
-            _robust, _average, selected, promotion = passing[0]
+            passing.sort(
+                key=lambda item: (item[0], item[1], item[2], item[3].digest), reverse=True
+            )
+            _robust, _average, _estimated, selected, promotion = passing[0]
         else:
             selected = base
             base_train = base_results["train"]
@@ -956,6 +1331,10 @@ class DreamImprover:
             split_manifest_digest=split_digest,
             evidence_head_hash=evidence_head_hash,
             tcb_versions=tcb_versions,
+            cost_model_digest=(cost_model.digest if cost_model is not None and cost_model.samples else None),
+            outcome_model_digest=(
+                outcome_model.digest if outcome_model is not None and outcome_model.samples else None
+            ),
         )
 
 
@@ -973,6 +1352,8 @@ class CanaryMetrics:
     task_families: int = 0
     run_ids: tuple[str, ...] = ()
     task_keys: tuple[str, ...] = ()
+    family_keys: tuple[str, ...] = ()
+    instance_ids: tuple[str, ...] = ()
 
     @property
     def success_rate(self) -> float:
@@ -1028,6 +1409,9 @@ class CanaryRunSummary:
     tokens: int
     offered_candidates: int
     finished_at_ms: int
+    task_family: str = ""
+    instance_id: str = ""
+    pair_key: str = ""
 
 
 
@@ -1051,6 +1435,9 @@ def _canary_run_summaries(
         finished_at_ms = max(int(final.get("recorded_at_ms", 0)), int(start.get("recorded_at_ms", 0)))
         if since_ms is not None and finished_at_ms < since_ms:
             continue
+        task_key = start.get("task_key", "")
+        task_family = str(start.get("task_family") or "").strip().lower() or task_key
+        instance_id = str(start.get("instance_id") or "").strip()
         risk = latency = actions = model_calls = tokens = offered = 0
         for event in run_events:
             if event.get("event") == "transition":
@@ -1059,10 +1446,11 @@ def _canary_run_summaries(
                 actions += 1
                 model_calls += max(0, int(event.get("model_calls", 0)))
                 tokens += max(0, int(event.get("tokens", 0)))
-                offered += len(event.get("candidates", ()))
+                offered_count = event.get("offered_count")
+                offered += int(offered_count) if offered_count is not None else len(event.get("candidates", ()))
         summaries.append(CanaryRunSummary(
             run_id=run_id,
-            task_key=start.get("task_key", ""),
+            task_key=task_key,
             verified_success=final.get("status") == "done" and bool(final.get("verified")),
             risk_events=risk,
             latency_ms=latency,
@@ -1071,6 +1459,9 @@ def _canary_run_summaries(
             tokens=tokens,
             offered_candidates=offered,
             finished_at_ms=finished_at_ms,
+            task_family=task_family,
+            instance_id=instance_id,
+            pair_key=instance_id or task_key,
         ))
     summaries.sort(key=lambda run: (run.finished_at_ms, run.run_id))
     return summaries
@@ -1080,6 +1471,8 @@ def _canary_run_summaries(
 def _metrics_from_canary_runs(runs: Iterable[CanaryRunSummary]) -> CanaryMetrics:
     runs = list(runs)
     keys = tuple(sorted({run.task_key for run in runs if run.task_key}))
+    families = tuple(sorted({run.task_family or run.task_key for run in runs if run.task_key or run.task_family}))
+    instances = tuple(sorted({run.instance_id for run in runs if run.instance_id}))
     successes = sum(int(run.verified_success) for run in runs)
     return CanaryMetrics(
         tasks=len(runs),
@@ -1091,10 +1484,22 @@ def _metrics_from_canary_runs(runs: Iterable[CanaryRunSummary]) -> CanaryMetrics
         model_calls=sum(run.model_calls for run in runs),
         tokens=sum(run.tokens for run in runs),
         offered_candidates=sum(run.offered_candidates for run in runs),
-        task_families=len(keys),
+        task_families=len(families),
         run_ids=tuple(run.run_id for run in runs),
         task_keys=keys,
+        family_keys=families,
+        instance_ids=instances,
     )
+
+
+def _sign_test_p_value(candidate_wins: int, baseline_wins: int) -> float:
+    """Exact two-sided sign-test p-value over paired outcomes (ties excluded)."""
+    n = candidate_wins + baseline_wins
+    if n == 0:
+        return 1.0
+    k = min(candidate_wins, baseline_wins)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / (2 ** n)
+    return min(1.0, 2 * tail)
 
 
 @dataclass(frozen=True)
@@ -1109,6 +1514,8 @@ class CanaryEvidence:
     evidence_digest: str
     baseline_digest: str = ""
     candidate_digest: str = ""
+    paired_instances: int = 0
+    sign_test_p_value: float = 1.0
 
     @classmethod
     def from_events(
@@ -1118,24 +1525,27 @@ class CanaryEvidence:
         candidate_digest: str,
         *,
         candidate_since_ms: int | None = None,
+        baseline_since_ms: int | None = None,
     ):
         events = list(events)
-        baseline_runs = _canary_run_summaries(events, baseline_digest)
+        baseline_runs = _canary_run_summaries(events, baseline_digest, since_ms=baseline_since_ms)
         candidate_runs = _canary_run_summaries(events, candidate_digest, since_ms=candidate_since_ms)
         baseline = _metrics_from_canary_runs(baseline_runs)
         candidate = _metrics_from_canary_runs(candidate_runs)
         base_groups: dict[str, list[CanaryRunSummary]] = defaultdict(list)
         cand_groups: dict[str, list[CanaryRunSummary]] = defaultdict(list)
         for run in baseline_runs:
-            base_groups[run.task_key].append(run)
+            base_groups[run.pair_key or run.task_key].append(run)
         for run in candidate_runs:
-            cand_groups[run.task_key].append(run)
+            cand_groups[run.pair_key or run.task_key].append(run)
         shared = sorted(set(base_groups) & set(cand_groups))
         candidate_wins = baseline_wins = ties = 0
         pair_rows = []
+        paired_families = set()
         for key in shared:
             b = base_groups[key]
             c = cand_groups[key]
+            paired_families.add((b[0].task_family or b[0].task_key))
             b_rate = sum(int(r.verified_success) for r in b) / len(b)
             c_rate = sum(int(r.verified_success) for r in c) / len(c)
             if c_rate > b_rate:
@@ -1145,7 +1555,10 @@ class CanaryEvidence:
             else:
                 ties += 1
             pair_rows.append({
-                "task_key": key,
+                "pair_key": key,
+                "task_key": b[0].task_key,
+                "instance_id": b[0].instance_id or c[0].instance_id,
+                "task_family": b[0].task_family or c[0].task_family,
                 "baseline_runs": [r.run_id for r in b],
                 "candidate_runs": [r.run_id for r in c],
                 "baseline_success_rate": b_rate,
@@ -1166,7 +1579,7 @@ class CanaryEvidence:
         return cls(
             baseline=baseline,
             candidate=candidate,
-            paired_task_families=len(shared),
+            paired_task_families=len(paired_families),
             candidate_wins=candidate_wins,
             baseline_wins=baseline_wins,
             ties=ties,
@@ -1174,6 +1587,8 @@ class CanaryEvidence:
             evidence_digest=digest,
             baseline_digest=baseline_digest,
             candidate_digest=candidate_digest,
+            paired_instances=len(shared),
+            sign_test_p_value=_sign_test_p_value(candidate_wins, baseline_wins),
         )
 
 
@@ -1201,6 +1616,7 @@ class CanaryGate:
         max_latency_regression_ratio: float = 0.25,
         max_action_regression_ratio: float = 0.25,
         max_token_regression_ratio: float = 0.25,
+        max_pair_sign_p: float | None = None,
     ):
         self.min_tasks = min_tasks
         self.min_baseline_tasks = min_baseline_tasks
@@ -1214,6 +1630,7 @@ class CanaryGate:
         self.max_latency_regression_ratio = max_latency_regression_ratio
         self.max_action_regression_ratio = max_action_regression_ratio
         self.max_token_regression_ratio = max_token_regression_ratio
+        self.max_pair_sign_p = max_pair_sign_p
 
     def assess(
         self,
@@ -1263,6 +1680,11 @@ class CanaryGate:
                 return CanaryDecision(False, "insufficient paired task-family coverage")
             if evidence.baseline_wins > evidence.candidate_wins:
                 return CanaryDecision(False, "candidate lost more paired task families than it won")
+            if self.max_pair_sign_p is not None and evidence.sign_test_p_value > self.max_pair_sign_p:
+                return CanaryDecision(
+                    False,
+                    f"paired sign test lacks confidence (p={evidence.sign_test_p_value:.3f})",
+                )
         return CanaryDecision(True, "bound live canary gates passed" if evidence else "live canary gates passed")
 
 
@@ -1362,6 +1784,9 @@ class PolicyRegistry:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, self.path)
+        # fsync the directory so the rename itself survives a crash; the file
+        # fsync alone does not make the new directory entry durable.
+        _fsync_dir(self.path.parent)
 
     def _current_baseline_digest(self, payload: dict) -> str:
         active = payload.get("active")
@@ -1485,6 +1910,7 @@ class PolicyRegistry:
             max_latency_regression_ratio=(gate.max_latency_regression_ratio if gate else 0.25),
             max_action_regression_ratio=(gate.max_action_regression_ratio if gate else 0.25),
             max_token_regression_ratio=(gate.max_token_regression_ratio if gate else 0.25),
+            max_pair_sign_p=(gate.max_pair_sign_p if gate else None),
         )
         return self._promote_bound(evidence, permissive)
 
@@ -1493,6 +1919,7 @@ class PolicyRegistry:
         store: ExperienceStore,
         *,
         baseline_policy_digest: str | None = None,
+        baseline_since_ms: int | None = None,
         gate: CanaryGate | None = None,
     ) -> dict:
         payload = self.load()
@@ -1513,6 +1940,7 @@ class PolicyRegistry:
             baseline_policy_digest,
             staged["digest"],
             candidate_since_ms=staged.get("staged_at_ms"),
+            baseline_since_ms=baseline_since_ms,
         )
         return self._promote_bound(evidence, gate=gate)
 

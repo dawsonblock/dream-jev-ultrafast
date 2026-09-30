@@ -3,17 +3,28 @@
 from __future__ import annotations
 
 from .dream import ExperienceStore, candidate_catalog_digest, new_run_id, summarize_usage, task_key
-from .privacy import redact_text, sanitize_action, sanitize_url, tokenize
+from .policy import classify_effect
+from .privacy import action_goal_overlap, redact_text, sanitize_action, sanitize_url, tokenize
 
 _RESERVED_EVENT_KEYS = {"run_id", "task_key", "sequence"}
 
 
 class DreamTraceRecorder:
-    def __init__(self, store: ExperienceStore, *, goal: str, run_id: str | None = None):
+    def __init__(
+        self,
+        store: ExperienceStore,
+        *,
+        goal: str,
+        run_id: str | None = None,
+        task_family: str | None = None,
+        instance_id: str | None = None,
+    ):
         self.store = store
         self.goal = redact_text(goal, 4096)
         self.run_id = run_id or new_run_id()
         self.task_key = task_key(goal)
+        self.task_family = str(task_family).strip()[:256] if task_family else None
+        self.instance_id = str(instance_id).strip()[:256] if instance_id else None
         self.sequence = 0
         self.started = False
         self.finished = False
@@ -40,6 +51,8 @@ class DreamTraceRecorder:
             "url": sanitize_url(page.get("url", "")),
             "policy": policy.to_dict() if policy else None,
             "policy_digest": policy.digest if policy else None,
+            "task_family": self.task_family,
+            "instance_id": self.instance_id,
         })
 
     def transition(
@@ -50,22 +63,29 @@ class DreamTraceRecorder:
         action: dict,
         decision: dict,
         candidates: list[dict],
+        offered: list[dict] | None = None,
         helper: dict | None = None,
         risk_events=0,
     ):
         selected = sanitize_action(action)
-        compact_candidates = []
         goal_tokens = set(tokenize(self.goal))
-        for candidate in candidates:
-            clean = sanitize_action(candidate)
-            searchable = " ".join(str(clean.get(k, "")) for k in ("label", "value", "current_value", "option_label"))
-            compact_candidates.append({
-                "id": candidate.get("id"),
-                "kind": candidate.get("kind"),
-                "label": clean.get("label", ""),
-                "value": clean.get("value", clean.get("current_value", "")),
-                "goal_overlap": len(goal_tokens & set(tokenize(searchable))),
-            })
+
+        def compact(actions):
+            entries = []
+            for candidate in actions:
+                clean = sanitize_action(candidate)
+                entries.append({
+                    "id": candidate.get("id"),
+                    "kind": candidate.get("kind"),
+                    "node": candidate.get("node"),
+                    "label": clean.get("label", ""),
+                    "value": clean.get("value", clean.get("current_value", "")),
+                    "goal_overlap": action_goal_overlap(candidate, goal_tokens),
+                })
+            return entries
+
+        compact_candidates = compact(candidates)
+        compact_offered = compact(offered) if offered is not None else None
         selected_rank = next(
             (index for index, candidate in enumerate(compact_candidates) if candidate.get("id") == action.get("id")),
             None,
@@ -78,9 +98,17 @@ class DreamTraceRecorder:
                 "id": action.get("id"),
                 "kind": action.get("kind"),
                 "label": selected.get("label", ""),
+                # Deterministic effect class — auditable evidence of which
+                # authority tier the executed mutation was classified under.
+                "effect": classify_effect(action).value,
             },
             "candidates": compact_candidates,
             "candidate_digest": candidate_catalog_digest(compact_candidates),
+            "catalog": "observed" if compact_offered is not None else "recorded",
+            "offered_digest": (
+                candidate_catalog_digest(compact_offered) if compact_offered is not None else None
+            ),
+            "offered_count": len(compact_offered) if compact_offered is not None else None,
             "selected_rank": selected_rank,
             "page_changed": after.get("fingerprint") != before.get("fingerprint"),
             "latency_ms": int(decision.get("latency_ms", 0)) + int((helper or {}).get("latency_ms", 0)),

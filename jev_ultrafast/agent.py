@@ -32,6 +32,8 @@ class Agent:
         policy_registry=None,
         dream_store=None,
         run_id=None,
+        task_family=None,
+        instance_id=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -52,7 +54,15 @@ class Agent:
         if isinstance(dream_store, (str, Path)):
             dream_store = ExperienceStore(dream_store)
         self.dream_recorder = (
-            DreamTraceRecorder(dream_store, goal=task, run_id=run_id) if dream_store is not None else None
+            DreamTraceRecorder(
+                dream_store,
+                goal=task,
+                run_id=run_id,
+                task_family=task_family,
+                instance_id=instance_id,
+            )
+            if dream_store is not None
+            else None
         )
         self.browser = Browser(url)
         self.record_dir = Path(record_dir) if record_dir else None
@@ -77,6 +87,7 @@ class Agent:
             started_at=None,
             record=bool(self.record_dir),
             pending_approval=None,
+            granted_approval=None,
             verification=None,
             verification_failures=[],
             verified=False,
@@ -171,6 +182,9 @@ class Agent:
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["decision"] = None
+            # A spent or orphaned approval grant never survives into a fresh
+            # decision; only approve() can create one, bound to one act() call.
+            state["granted_approval"] = None
             if state["status"] in TERMINAL_STATUSES:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if state["status"] == "approval_required":
@@ -200,18 +214,23 @@ class Agent:
             if state["status"] != "approval_required" or not pending:
                 raise ValueError("There is no pending action to approve.")
             state["pending_approval"] = None
+            # Approval is a server-side capability bound to the pending action on
+            # the pending page. act() never derives authority from caller input;
+            # the grant is consumed exactly once by the act() it enables.
+            state["granted_approval"] = {
+                "action_id": pending["action"]["id"],
+                "fingerprint": pending["fingerprint"],
+            }
             state["decision"] = pending["decision"]
             state["status"] = "predicted"
-            return self.command(
-                "act",
-                {"fingerprint": pending["fingerprint"], "approved": True},
-            )
+            return self.command("act", {"fingerprint": pending["fingerprint"]})
 
         if name == "reject":
             if state["status"] != "approval_required" or not state.get("pending_approval"):
                 raise ValueError("There is no pending action to reject.")
             pending = state["pending_approval"]
             state["pending_approval"] = None
+            state["granted_approval"] = None
             state["status"] = "ready"
             state["history"].append(
                 {
@@ -227,6 +246,10 @@ class Agent:
             return self.snapshot()
 
         if name == "act":
+            if body.get("approved") is not None:
+                raise ValueError(
+                    "act() does not accept caller-supplied approval; use the approve command."
+                )
             decision, page = state["decision"], state["page"]
             if not decision or body.get("fingerprint") != page["fingerprint"]:
                 raise ValueError("Observe and choose before acting")
@@ -283,7 +306,8 @@ class Agent:
                     self.dream_recorder.finish(status="blocked", verified=False)
                 raise ValueError(f"Stopped at the {max_actions}-action budget")
 
-            if not body.get("approved") and getattr(self, "policy", None):
+            approval_consumed = False
+            if getattr(self, "policy", None):
                 policy_result = self.policy.assess(action, page=page, goal=state["goal"])
                 if policy_result.level == "deny":
                     state["status"] = "blocked"
@@ -297,22 +321,29 @@ class Agent:
                         self.dream_recorder.finish(status="blocked", verified=False)
                     raise ValueError(f"Action denied by policy: {policy_result.reason}")
                 if policy_result.level == "require_approval":
-                    state["pending_approval"] = {
-                        "decision": decision,
-                        "action": action,
-                        "fingerprint": page["fingerprint"],
-                        "reason": policy_result.reason,
-                    }
-                    state["status"] = "approval_required"
-                    state["elapsed_ms"] = self._elapsed()
-                    if getattr(self, "dream_recorder", None):
-                        self.dream_recorder.event(
-                            "approval_required",
-                            state=page.get("fingerprint"),
-                            selected=action.get("id"),
-                            reason=policy_result.reason,
-                        )
-                    return self.snapshot()
+                    granted = state.pop("granted_approval", None)
+                    approval_consumed = bool(
+                        granted
+                        and granted.get("action_id") == action["id"]
+                        and granted.get("fingerprint") == page["fingerprint"]
+                    )
+                    if not approval_consumed:
+                        state["pending_approval"] = {
+                            "decision": decision,
+                            "action": action,
+                            "fingerprint": page["fingerprint"],
+                            "reason": policy_result.reason,
+                        }
+                        state["status"] = "approval_required"
+                        state["elapsed_ms"] = self._elapsed()
+                        if getattr(self, "dream_recorder", None):
+                            self.dream_recorder.event(
+                                "approval_required",
+                                state=page.get("fingerprint"),
+                                selected=action.get("id"),
+                                reason=policy_result.reason,
+                            )
+                        return self.snapshot()
 
             text, helper = None, None
             if action["kind"] == "fill":
@@ -326,9 +357,13 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
 
-            trace_candidates = None
+            observed_candidates = offered_candidates = None
             if getattr(self, "dream_recorder", None):
-                trace_candidates, _trace_omitted = candidate_actions(
+                # The observed catalogue is pre-policy evidence: later replay can
+                # evaluate candidates the active policy had discarded as well as
+                # ones it offered. The offered catalogue is what the model saw.
+                observed_candidates = page["actions"]
+                offered_candidates, _ = candidate_actions(
                     page["actions"],
                     state["goal"],
                     exploration_policy=getattr(self, "exploration_policy", None),
@@ -374,9 +409,10 @@ class Agent:
                     after=state["page"],
                     action=action,
                     decision=decision,
-                    candidates=trace_candidates or [],
+                    candidates=observed_candidates or [],
+                    offered=offered_candidates,
                     helper=helper,
-                    risk_events=int(bool(body.get("approved"))),
+                    risk_events=int(approval_consumed),
                 )
             browser_history = [h for h in state["history"] if h.get("kind") not in {"verification", "approval"}]
             no_progress_window = getattr(getattr(self, "exploration_policy", None), "no_progress_window", 3)

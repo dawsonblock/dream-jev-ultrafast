@@ -54,6 +54,51 @@
   cache.pageKey=()=>[performance.timeOrigin,location.href,scrollX,scrollY,innerWidth,innerHeight,
     [...document.querySelectorAll('input,textarea,select')].filter(safe)
       .map(e=>[identity(e),clip(e.value,512),Boolean(e.checked),e.selectedIndex,Boolean(e.disabled),Boolean(e.readOnly)])];
+
+  // Structural effect context for the deterministic authority classifier in
+  // policy.py. Deliberately derived flags only — no free text leaves this
+  // function — so the authority surface adds no privacy surface.
+  const ctxOf = e => {
+    const form = e.form || e.closest('form');
+    const scope = e.closest('dialog,[role="dialog"],[aria-modal="true"],form,article,li,tr,[role="row"],[role="search"]');
+    const fieldScope = form || scope;
+    const q = sel => !!(fieldScope && fieldScope.querySelector && fieldScope.querySelector(sel));
+    const fields = fieldScope ? {
+      password: q('input[type="password"],input[autocomplete="current-password"],input[autocomplete="new-password"]'),
+      file: q('input[type="file"]'),
+      money: q('input[name*="amount" i],input[name*="price" i],input[name*="card" i],input[name*="cvv" i],input[id*="card" i],input[id*="cvv" i],input[name*="routing" i],input[name*="iban" i]'),
+      email: q('input[type="email"]'),
+      search: q('input[type="search"],[role="searchbox"]') || fieldScope.getAttribute('role')==='search',
+    } : {};
+    let submit = false;
+    if (form) {
+      const t = String(e.type||'').toLowerCase();
+      if (e.tagName==='BUTTON') submit = t!=='button' && t!=='reset';
+      if (e.tagName==='INPUT') submit = ['submit','image'].includes(t);
+    }
+    let external = false, messaging = false;
+    const href = e.getAttribute && e.getAttribute('href');
+    if (href) {
+      const scheme = href.trim().split(':')[0].toLowerCase();
+      if (['mailto','tel','sms'].includes(scheme)) messaging = true;
+      else { try { external = new URL(href, location.href).origin !== location.origin; } catch (_) {} }
+    }
+    if (e.target === '_blank') external = true;
+    let method = '', same_origin = null;
+    if (form) {
+      const m = String(form.getAttribute('method')||'get').toLowerCase();
+      method = ['get','post','dialog'].includes(m) ? m : 'post';
+      try { same_origin = new URL(form.getAttribute('action')||location.href, location.href).origin === location.origin; }
+      catch (_) { same_origin = null; }
+    }
+    return {
+      form: !!form, submit, method, same_origin, fields,
+      modal: !!e.closest('dialog,[role="dialog"],[aria-modal="true"]'),
+      row: !!e.closest('tr,li,[role="row"],[role="listitem"],article'),
+      external, messaging,
+      download: !!(e.hasAttribute && e.hasAttribute('download')),
+    };
+  };
   cache.guard=e=>{
     if (!e?.isConnected || !visible(e)) return null;
     const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
@@ -70,7 +115,7 @@
     if (!rname || r.width<=0 || r.height<=0 || x<0 || y<0 || x>=innerWidth || y>=innerHeight) continue;
     if (rname==='gridcell' && e.querySelector('button,[role="button"]')) continue;
     const base={node:identity(e),role:rname,label:name(e)||rname,
-      rect:{x:r.x,y:r.y,w:r.width,h:r.height}};
+      rect:{x:r.x,y:r.y,w:r.width,h:r.height},ctx:ctxOf(e)};
     for (const key of ['checked','selected','expanded']) {
       const value=e.getAttribute('aria-'+key);
       if (value!==null) base[key]=clip(value,32);

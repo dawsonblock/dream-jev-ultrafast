@@ -12,8 +12,32 @@ import sys
 from pathlib import Path
 
 from .dream import DreamImprover, ExperienceStore, ExplorationPolicy, PolicyRegistry, ReplayWorld
+from .dreamlearn import CostModel, OutcomeModel
 
 COMMANDS = {"improve", "verify", "promote", "status", "rollback", "health", "suspend", "resume"}
+
+
+def _add_verify_args(cmd):
+    """Store-authenticity flags shared by every command that reads evidence."""
+    cmd.add_argument("--verify-key", help="Hex Ed25519 public key; verify event signatures under this key")
+    cmd.add_argument(
+        "--verify-keys",
+        help="Comma- or space-separated trusted hex Ed25519 public keys (key rotation; also JEV_EVIDENCE_VERIFY_KEYS)",
+    )
+    cmd.add_argument(
+        "--require-signatures",
+        action="store_true",
+        help="Reject unsigned events (requires a verification key)",
+    )
+
+
+def _store(args):
+    return ExperienceStore(
+        args.experience,
+        verify_key=getattr(args, "verify_key", None),
+        verify_keys=(getattr(args, "verify_keys", None) or "").replace(",", " ").split(),
+        require_signatures=getattr(args, "require_signatures", False),
+    )
 
 
 def build_parser():
@@ -25,9 +49,21 @@ def build_parser():
     improve.add_argument("--report", default="dream-report.json", help="Write replay report to this JSON path")
     improve.add_argument("--registry", help="Optional policy registry. Its active policy is used as the baseline.")
     improve.add_argument("--stage", action="store_true", help="Stage a replay-approved changed policy in --registry")
+    improve.add_argument(
+        "--cost-model",
+        action="store_true",
+        help="Fit a learned cost model on the store and use it to prioritize among replay-qualified candidates",
+    )
+    improve.add_argument(
+        "--outcome-model",
+        action="store_true",
+        help="Fit a coarse outcome model and annotate candidates with predicted progress (never gates)",
+    )
+    _add_verify_args(improve)
 
     verify = sub.add_parser("verify", help="Verify the experience-store hash chain and print its evidence head")
     verify.add_argument("experience")
+    _add_verify_args(verify)
 
     promote = sub.add_parser("promote", help="Promote the staged policy from bound live-canary evidence")
     promote.add_argument("experience")
@@ -36,6 +72,12 @@ def build_parser():
         "--baseline-digest",
         help="Explicit baseline policy digest; must match the staged policy parent digest",
     )
+    promote.add_argument(
+        "--baseline-since-ms",
+        type=int,
+        help="Only count baseline runs finishing at or after this timestamp (matched-time canary window)",
+    )
+    _add_verify_args(promote)
 
     status = sub.add_parser("status", help="Show registry state")
     status.add_argument("--registry", required=True)
@@ -49,6 +91,7 @@ def build_parser():
     health.add_argument("--registry", required=True)
     health.add_argument("--recent-tasks", type=int, default=20)
     health.add_argument("--suspend-on-fail", action="store_true")
+    _add_verify_args(health)
 
     suspend = sub.add_parser("suspend", help="Suspend the active learned policy and fall back to baseline")
     suspend.add_argument("--registry", required=True)
@@ -71,7 +114,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
 
     if args.command == "verify":
-        _json(ExperienceStore(args.experience).verify())
+        _json(_store(args).verify())
         return 0
 
     if args.command == "status":
@@ -94,10 +137,11 @@ def main(argv=None):
         return 0
 
     if args.command == "promote":
-        store = ExperienceStore(args.experience)
+        store = _store(args)
         active = PolicyRegistry(args.registry).promote_from_store(
             store,
             baseline_policy_digest=args.baseline_digest,
+            baseline_since_ms=args.baseline_since_ms,
         )
         _json({
             "promoted": True,
@@ -109,7 +153,7 @@ def main(argv=None):
 
     if args.command == "health":
         decision = PolicyRegistry(args.registry).health_from_store(
-            ExperienceStore(args.experience),
+            _store(args),
             recent_tasks=args.recent_tasks,
             suspend_on_fail=args.suspend_on_fail,
         )
@@ -123,12 +167,20 @@ def main(argv=None):
         })
         return 0 if decision.healthy else 2
 
-    store = ExperienceStore(args.experience)
+    store = _store(args)
     events = store.load()
     worlds = ReplayWorld.from_events(events)
     registry = PolicyRegistry(args.registry) if args.registry else None
     baseline = registry.active_policy() if registry else ExplorationPolicy()
-    report = DreamImprover().improve(worlds, baseline, evidence_head_hash=store.head_hash())
+    cost_model = CostModel.fit(events) if args.cost_model else None
+    outcome_model = OutcomeModel.fit(events) if args.outcome_model else None
+    report = DreamImprover().improve(
+        worlds,
+        baseline,
+        evidence_head_hash=store.head_hash(),
+        cost_model=cost_model,
+        outcome_model=outcome_model,
+    )
     output = Path(args.report)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")

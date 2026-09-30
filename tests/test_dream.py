@@ -17,13 +17,15 @@ from jev_ultrafast.dream import (
     ReplaySimulator,
     ReplayWorld,
     candidate_catalog_digest,
+    mutate_policies,
+    split_worlds,
     task_key,
 )
 from jev_ultrafast.model import candidate_actions
 from jev_ultrafast.trace import DreamTraceRecorder
 
 
-def _append_run(store, run_id, goal, transitions, *, status, verified, policy=None):
+def _append_run(store, run_id, goal, transitions, *, status, verified, policy=None, extra=None):
     key = task_key(goal)
     policy = policy or ExplorationPolicy()
     store.append({
@@ -35,6 +37,7 @@ def _append_run(store, run_id, goal, transitions, *, status, verified, policy=No
         "state": "S",
         "policy": policy.to_dict(),
         "policy_digest": policy.digest,
+        **(extra or {}),
     })
     for i, transition in enumerate(transitions, 2):
         store.append({
@@ -440,6 +443,24 @@ def test_registry_rejects_stale_replay_parent(tmp_path):
         registry.stage(report)
 
 
+def _overlapping_distractor_world(tmp_path):
+    """Distractors share one goal token, so ``min_goal_overlap=1`` keeps them and
+    a promoted policy still leaves contraction headroom for a second winner."""
+    store = ExperienceStore(tmp_path / "overlap.jsonl")
+    goal = "find destination"
+    candidates = [
+        {"id": f"c{i}", "kind": "click", "label": f"Find control {i}", "goal_overlap": 1}
+        for i in range(229)
+    ]
+    candidates.insert(0, {"id": "selected", "kind": "fill", "label": "Destination", "goal_overlap": 5})
+    _append_run(store, "success", goal, [{
+        "state": "S", "next_state": "DONE", "selected": {"id": "selected", "kind": "fill"},
+        "candidates": candidates, "page_changed": True, "latency_ms": 50, "model_calls": 1,
+        "tokens": 1000, "stale_or_failure": 0, "risk_events": 0,
+    }], status="done", verified=True)
+    return ReplayWorld.from_events(store.load())
+
+
 def test_registry_rollback_restores_prior_active_policy(tmp_path):
     baseline = ExplorationPolicy()
     worlds = _efficiency_world(tmp_path)
@@ -452,9 +473,12 @@ def test_registry_rollback_restores_prior_active_policy(tmp_path):
         CanaryMetrics(1, 1), CanaryMetrics(1, 1), gate=permissive, allow_unbound_metrics=True,
     )
 
-    second_report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(worlds, registry.active_policy())
-    if not second_report.promotion.approved or second_report.selected.digest == first["digest"]:
-        pytest.skip("fixture produced no second replay-approved policy")
+    second_worlds = _overlapping_distractor_world(tmp_path)
+    second_report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        second_worlds, registry.active_policy()
+    )
+    assert second_report.promotion.approved
+    assert second_report.selected.digest != first["digest"]
     registry.stage(second_report)
     second = registry.promote(
         CanaryMetrics(1, 1), CanaryMetrics(1, 1), gate=permissive, allow_unbound_metrics=True,
@@ -876,3 +900,154 @@ def test_health_gate_marks_insufficient_coverage():
     assert quiet.healthy and quiet.sufficient is False
     full = gate.assess(reference, CanaryMetrics(tasks=20, verified_successes=20))
     assert full.healthy and full.sufficient is True
+
+
+def test_behavior_digest_separates_identity_from_behavior():
+    a = ExplorationPolicy(name="a", version=1)
+    b = ExplorationPolicy(name="b", version=3)
+    assert a.digest != b.digest
+    assert a.behavior_digest == b.behavior_digest
+    changed = ExplorationPolicy(name="a", version=1, click_quota=100)
+    assert changed.behavior_digest != a.behavior_digest
+
+
+def test_mutations_are_bidirectional_and_behavior_deduped():
+    base = ExplorationPolicy(name="mid", model_action_limit=100, max_actions=30, no_progress_window=4)
+    candidates = mutate_policies(base)
+    assert len(candidates) > 20
+    assert len({c.behavior_digest for c in candidates}) == len(candidates)
+    assert all(c.behavior_digest != base.behavior_digest for c in candidates)
+    assert all(c.name != base.name and c.version == base.version + 1 for c in candidates)
+    for field in ("model_action_limit", "click_quota", "fill_quota", "select_quota",
+                  "click_bonus", "fill_bonus", "select_bonus", "max_actions",
+                  "no_progress_window", "goal_overlap_weight", "order_penalty"):
+        values = {getattr(c, field) for c in candidates}
+        assert any(v < getattr(base, field) for v in values), field
+        assert any(v > getattr(base, field) for v in values), field
+
+
+def test_saturated_policy_mutations_stay_bounded():
+    base = ExplorationPolicy(
+        model_action_limit=250, click_quota=250, fill_quota=250,
+        select_quota=250, max_actions=120, no_progress_window=10,
+    )
+    for candidate in mutate_policies(base):
+        ExplorationPolicy.from_dict(candidate.to_dict())  # stays inside envelopes
+        assert candidate.model_action_limit <= 250
+        assert candidate.max_actions <= 120
+        assert candidate.no_progress_window <= 10
+
+
+def _single_transition():
+    return [{
+        "state": "S", "next_state": "D", "selected": {"id": "go", "kind": "click"},
+        "candidates": [{"id": "go", "kind": "click", "label": "Go", "goal_overlap": 1}],
+        "page_changed": True, "latency_ms": 10, "model_calls": 1, "tokens": 5,
+        "stale_or_failure": 0, "risk_events": 0,
+    }]
+
+
+def test_trace_records_observed_and_offered_catalogues(tmp_path):
+    store = ExperienceStore(tmp_path / "dual.jsonl")
+    policy = ExplorationPolicy(model_action_limit=16, click_quota=5)
+    recorder = DreamTraceRecorder(
+        store, goal="Open target", task_family="Family-A", instance_id="inst-1",
+    )
+    page = {"fingerprint": "A", "url": "https://example.test"}
+    recorder.start(page, policy)
+    actions = [{"id": f"c{i}", "kind": "click", "node": i, "label": f"Control {i}"} for i in range(20)]
+    actions.append({"id": "target", "kind": "fill", "node": 99, "label": "Target field"})
+    offered, _ = candidate_actions(actions, "Open target", exploration_policy=policy)
+    recorder.transition(
+        before=page,
+        after={"fingerprint": "B", "url": "https://example.test/done"},
+        action=actions[-1],
+        decision={"latency_ms": 1, "usage": {}},
+        candidates=actions,
+        offered=offered,
+    )
+    recorder.finish(status="done", verified=True)
+    events = store.load()
+    start = next(e for e in events if e["event"] == "run_started")
+    assert start["task_family"] == "Family-A" and start["instance_id"] == "inst-1"
+    event = next(e for e in events if e["event"] == "transition")
+    assert event["catalog"] == "observed"
+    assert len(event["candidates"]) == 21
+    assert event["offered_count"] == len(offered) < len(event["candidates"])
+    worlds = ReplayWorld.from_events(events)
+    assert worlds[0].family_key == "family-a"
+    assert worlds[0].trajectory[0].offered_digest == event["offered_digest"]
+    assert worlds[0].trajectory[0].catalog == "observed"
+
+
+def test_offered_digest_must_match_recorded_policy(tmp_path):
+    store = ExperienceStore(tmp_path / "offered.jsonl")
+    transition = _single_transition()
+    transition[0]["catalog"] = "observed"
+    transition[0]["offered_digest"] = "0" * 64
+    transition[0]["offered_count"] = 1
+    _append_run(store, "run", "goal", transition, status="done", verified=True)
+    with pytest.raises(ValueError, match="offered catalogue digest mismatch"):
+        ReplayWorld.from_events(store.load())
+
+
+def test_task_family_keeps_paraphrased_goals_in_one_partition(tmp_path):
+    store = ExperienceStore(tmp_path / "fam.jsonl")
+    transition = _single_transition()
+    _append_run(store, "r1", "Find flights Zurich to London", transition,
+                status="done", verified=True, extra={"task_family": "flights"})
+    _append_run(store, "r2", "Search flights from Zurich to London", transition,
+                status="done", verified=True, extra={"task_family": "flights"})
+    _append_run(store, "r3", "Book a hotel in Paris", transition,
+                status="done", verified=True, extra={"task_family": "hotels"})
+    worlds = ReplayWorld.from_events(store.load())
+    by_run = {world.key: world for world in worlds}
+    assert by_run["r1"].task_key != by_run["r2"].task_key
+    assert by_run["r1"].family_key == by_run["r2"].family_key == "flights"
+    splits = split_worlds(worlds)
+    assignment = {w.key: name for name, part in splits.items() for w in part}
+    assert assignment["r1"] == assignment["r2"]
+    assert assignment["r3"] != assignment["r1"]
+
+
+def test_canary_evidence_pairs_by_instance_and_reports_sign_test(tmp_path):
+    baseline = ExplorationPolicy()
+    candidate = ExplorationPolicy(name="candidate", version=2, model_action_limit=218)
+    store = ExperienceStore(tmp_path / "inst.jsonl")
+    transition = _single_transition()
+    # Equal aggregate success, split differently across instances: the candidate
+    # wins inst 6-7 but loses inst 4-5, so pair outcomes are symmetric.
+    baseline_wins = set(range(6))
+    candidate_wins = set(range(4)) | {6, 7}
+    for inst in range(8):
+        meta = {"instance_id": f"inst-{inst}", "task_family": "fam"}
+        _append_run(store, f"b{inst}", f"goal {inst}", transition,
+                    status="done" if inst in baseline_wins else "blocked",
+                    verified=inst in baseline_wins, policy=baseline, extra=meta)
+        _append_run(store, f"c{inst}", f"goal {inst}", transition,
+                    status="done" if inst in candidate_wins else "blocked",
+                    verified=inst in candidate_wins, policy=candidate, extra=meta)
+    evidence = CanaryEvidence.from_events(store.load(), baseline.digest, candidate.digest)
+    assert evidence.paired_instances == 8
+    assert evidence.paired_task_families == 1
+    assert evidence.candidate.instance_ids == tuple(f"inst-{i}" for i in range(8))
+    assert evidence.baseline_wins == 2 and evidence.candidate_wins == 2 and evidence.ties == 4
+    assert evidence.sign_test_p_value == 1.0
+    gate = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=1,
+        min_paired_task_families=1, min_pair_coverage=0.0, max_pair_sign_p=0.2,
+    )
+    assert "sign test" in gate.assess(evidence.baseline, evidence.candidate, evidence=evidence).reason
+
+
+def test_baseline_window_bounds_canary_evidence(tmp_path):
+    baseline = ExplorationPolicy()
+    candidate = ExplorationPolicy(name="candidate", version=2, model_action_limit=218)
+    store = _canary_pair_store(tmp_path, baseline, candidate)
+    events = store.load()
+    future = max(event["recorded_at_ms"] for event in events) + 1
+    evidence = CanaryEvidence.from_events(
+        events, baseline.digest, candidate.digest, baseline_since_ms=future,
+    )
+    assert evidence.baseline.tasks == 0
+    assert evidence.candidate.tasks == 12

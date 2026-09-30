@@ -100,11 +100,15 @@ def test_fill_lost_focus_never_inserts_text(monkeypatch):
             runtime_count = sum(1 for name, _ in calls if name == "Runtime.evaluate")
             if runtime_count == 1:
                 return {"result": {"value": {"x": 10, "y": 10}}}
-            return {"result": {"value": False}}
+            if runtime_count <= 3:
+                # Pre-press and pre-release identity checks pass; the atomic
+                # focus+insert evaluation then reports the focus failure.
+                return {"result": {"value": True}}
+            return {"result": {"value": {"error": "focus"}}}
         return {}
 
     monkeypatch.setattr(browser, "cdp", fake_cdp)
-    with pytest.raises(StalePage, match="lost focus"):
+    with pytest.raises(StalePage, match="failed before mutation"):
         browser_operation({
             "operation": "act",
             "session": "s",

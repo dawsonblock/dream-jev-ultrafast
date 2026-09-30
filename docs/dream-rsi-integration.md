@@ -69,12 +69,16 @@ The conceptual source is **Dream-RSI: Recursive Self-Improvement through Evolvin
 
 `ExplorationPolicy` is the complete self-improvable surface. It contains bounded values for:
 
-- goal-overlap ranking weight;
+- goal-overlap ranking weight and overlap curvature (`overlap_exponent`);
 - click/fill/select ranking bonuses;
 - model-visible action budget;
 - per-operation candidate quotas;
+- per-DOM-node fan-out bound (`duplicate_node_cap`);
+- minimum goal-overlap admission floor (`min_goal_overlap`);
 - maximum browser-action budget;
 - no-progress stopping patience.
+
+All of these remain candidate-allocation parameters, so every mutation is still replay-qualifiable: the live selector and the replay filter share scoring and bounding semantics, and tests compare their catalogues identically. A learned reordering of which offered action the decision model *chooses* remains out of scope — replay cannot verify a different choice without fabricating the model's response.
 
 A promoted policy is JSON data with a stable SHA-256 digest. The replay path cannot promote Python, JavaScript, selectors, coordinates, shell commands, browser permissions, credentials, approval rules, verifier logic, or executor code.
 
@@ -83,9 +87,9 @@ A promoted policy is JSON data with a stable SHA-256 digest. The replay path can
 The following remain outside recursive improvement:
 
 - CDP isolated-world node ownership;
-- stale-state and semantic target guards;
+- stale-state and semantic target guards, including pre-press and pre-release revalidation;
 - browser mutation implementation;
-- consequential-action approval/deny policy;
+- deterministic effect classification and the consequential-action approval/deny policy;
 - privacy/redaction rules;
 - completion-verifier contract;
 - experience schema and hash validation;
@@ -94,6 +98,12 @@ The following remain outside recursive improvement:
 - policy registry and rollback logic.
 
 A candidate may learn *how to allocate search effort*. It cannot learn itself more authority.
+
+### Authority integrity (v0.5)
+
+The approval boundary was strengthened in two places. `snapshot.js` now attaches a bounded `ctx` to every observed action — derived flags only (enclosing form, form method, submit membership, scoped field kinds such as password/money/file/search, modal scope, external or messaging destination, download semantics), never free text, so the authority surface adds no privacy surface. `policy.py` classifies each mutation into a deterministic `Effect` and maps it to an authority floor; structure wins over labels, labels may only escalate, and commit-shaped controls whose effect cannot be determined classify `UNKNOWN_COMMIT → require_approval`. An optional adviser hook may escalate an `allow` to `require_approval`/`deny` but can never downgrade.
+
+In the executor, input is bound to the same semantic target that passed authorization: the isolated-world guard, geometry, and `elementFromPoint` hit-test are re-verified immediately before `mousePressed` and again before `mouseReleased`. A mid-press mutation still dispatches the release for pointer-state hygiene, then fails closed to re-perception. Fills verify focus and run `execCommand('insertText')` inside one isolated-world evaluation, and a landed value that differs from the authorized text is a non-retryable error rather than a silent retry.
 
 ## Durable experience store
 
@@ -110,18 +120,22 @@ run id / task key / sequence
 run or transition payload
 ```
 
-`load()` verifies the entire chain. `verify()` reports event count, head hash, schemas, and TCB versions. v0.4 can read v0.3 stores; new events use `jev-dream/2` and `jev-ultrafast-tcb/0.5`. TCB 0.4 traces remain readable, but replay improvement refuses a pool that mixes TCB generations — the tokenizer used for recorded `goal_overlap` changed between them, so pre- and post-unification worlds are never scored together.
+`load()` verifies the entire chain. `verify()` reports event count, head hash, schemas, TCB versions, and signature statistics. Current stores read `jev-dream/1`–`jev-dream/2` events; new events use `jev-dream/3` and `jev-ultrafast-tcb/0.7`. Older traces remain readable, but replay improvement refuses a pool that mixes TCB generations — the tokenizer used for recorded `goal_overlap` changed between them, so pre- and post-unification worlds are never scored together.
 
-The chain is tamper-evident, not a digital signature. A party able to rewrite the whole file can recompute hashes. Deployments that need provenance against a malicious host should externally sign or anchor the head hash.
+The bare chain is tamper-evident, not a digital signature: a party able to rewrite the whole file can recompute hashes. v0.4.1 therefore adds optional Ed25519 authenticity — each `event_hash` can be signed by a signer exposing `key_id`/`sign_hex` (`JEV_EVIDENCE_SIGNING_KEY`, or an injected signer so private material stays outside the agent process). As of `jev-ultrafast-tcb/0.7` signatures are domain-separated: the signed message is `jev-dream/evidence-event/v1:<event_hash>`, never the bare digest. Readers supply a trusted-key *set* (`JEV_EVIDENCE_VERIFY_KEYS`, `JEV_EVIDENCE_VERIFY_KEY`, or `--verify-keys`); each signed event carries its `key_id` and is verified under that key, so rotation keeps older segments valid while unknown keys fail closed, as do forged signatures and unsigned events under `require_signatures`/`JEV_REQUIRE_SIGNED_EVIDENCE`. Without a signer configured the store still works — signatures are an opt-in authenticity layer, and `verify()` reports how many events were signed and whether they were actually checked.
+
+Crash recovery is deliberately narrow: a writer that dies mid-append leaves a final line that is a recognizable event-object prefix with no terminating newline. `load()` reports it (`verify()` sets `torn_tail_recovered`) and the next `append()` truncates it before continuing the chain — a torn fragment can never be a complete valid record, so truncation cannot destroy real evidence. Anything else at the tail — garbage, a non-object JSON value, or a parseable record whose hash or signature is invalid — remains fail-closed.
 
 ## Transition evidence
 
-A live transition records a privacy-bounded candidate catalogue and now binds two extra pieces of evidence:
+A live transition records a privacy-bounded candidate catalogue and now binds four pieces of evidence:
 
-- `candidate_digest`: SHA-256 over the replay-relevant candidate catalogue in its original order;
-- `selected_rank`: the position of the action actually selected online.
+- `candidates`/`candidate_digest`: the **pre-policy observed** catalogue in original order plus its SHA-256;
+- `offered_digest`/`offered_count`: the post-policy catalogue actually shown to the model;
+- `selected_rank`: the position of the action actually selected online;
+- `node`: the isolated-world node identity per candidate, so per-node bounds replay identically.
 
-`ReplayWorld.from_events()` recomputes the catalogue digest and rejects mismatches. This does not make replay counterfactual; it makes the historical input to replay auditable.
+`ReplayWorld.from_events()` recomputes both digests — re-deriving the offered catalogue from the observed one under the recorded policy — and rejects mismatches. Recording both catalogues removes the one-directional information bottleneck: a candidate can be replayed for *expansion* as well as contraction because the evidence preserves what was observed before the old policy filtered it. This does not make replay counterfactual; it makes the historical input to replay auditable.
 
 ## Conservative replay semantics
 
@@ -296,4 +310,9 @@ uv run jev-dream rollback --registry REGISTRY [--digest SHA256]
 
 DREAM-Jev remains empirical replay, not a latent browser-dynamics model. It cannot predict unseen DOM transitions, infer the outcome of an action never executed, or prove that historical page behavior still holds today. Live canary qualification is therefore mandatory by design.
 
-A future checkpointed branch orchestrator or learned world model could propose new exploration hypotheses. Such a component should remain a lower-trust hypothesis generator and should never be allowed to satisfy execution, verification, or promotion gates with synthetic outcomes alone.
+v0.4.1 introduces the first two lower-trust learned layers, both deliberately outside the evidence boundary:
+
+- `CostModel` (Level 1) learns how tokens and latency scale with offered-candidate count. Replay reports anchored `estimated_*` metrics — the recorded measurement plus the learned marginal delta — which prioritize *which replay-approved candidate gets staged first*. The estimates never enter a gate: a coverage-missing or regressing candidate stays rejected no matter how efficient it looks.
+- `OutcomeModel` (Level 2) learns bucketed `P(page_changed)` priors over `(kind, overlap, rank)` cells and annotates candidates with expected progress, useful for designing live experiments.
+
+A future checkpointed branch orchestrator or learned world model could propose new exploration hypotheses. Such components remain hypothesis generators and are never allowed to satisfy execution, verification, or promotion gates with synthetic outcomes alone.

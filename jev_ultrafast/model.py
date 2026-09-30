@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .privacy import sanitize_action, sanitize_page, tokenize
+from .privacy import action_goal_overlap, redact_text, sanitize_action, sanitize_page, tokenize
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=25)
@@ -86,11 +86,7 @@ def _goal_tokens(goal):
 def _candidate_score(action, goal_tokens, order, exploration_policy=None):
     if exploration_policy is not None:
         return exploration_policy.candidate_score(action, goal_tokens, order)
-    searchable = " ".join(
-        str(action.get(k, "")) for k in ("label", "value", "current_value", "option_label")
-    ).lower()
-    tokens = set(tokenize(searchable))
-    overlap = len(goal_tokens & tokens)
+    overlap = action_goal_overlap(action, goal_tokens)
     kind_bonus = {"fill": 1.5, "select": 1.0, "click": 0.5}.get(action.get("kind"), 0)
     return overlap * 10 + kind_bonus - order / 100000
 
@@ -99,12 +95,23 @@ def candidate_actions(actions, goal, limit=None, exploration_policy=None):
     """Goal-aware, operation-balanced candidate selection.
 
     System controls (scroll/wait) are retained. Per-kind quotas prevent one large
-    native dropdown from consuming the entire model action budget.
+    native dropdown from consuming the entire model action budget. A learned
+    ``ExplorationPolicy`` may additionally bound per-node fan-out and require a
+    minimum goal overlap; both stay replayable because trace candidates carry
+    the same ``node`` identity and sanitized overlap.
     """
     limit = int(limit or getattr(exploration_policy, "model_action_limit", MODEL_ACTION_LIMIT))
+    min_overlap = int(getattr(exploration_policy, "min_goal_overlap", 0) or 0)
+    node_cap = int(getattr(exploration_policy, "duplicate_node_cap", 250) or 250)
     controls = [a for a in actions if a.get("kind") not in {"click", "fill", "select"}]
-    regular = [(i, a) for i, a in enumerate(actions) if a.get("kind") in {"click", "fill", "select"}]
     tokens = _goal_tokens(goal)
+    regular = []
+    for i, a in enumerate(actions):
+        if a.get("kind") not in {"click", "fill", "select"}:
+            continue
+        if min_overlap and action_goal_overlap(a, tokens) < min_overlap:
+            continue
+        regular.append((i, a))
     ranked = sorted(
         regular,
         key=lambda pair: _candidate_score(pair[1], tokens, pair[0], exploration_policy),
@@ -115,21 +122,33 @@ def candidate_actions(actions, goal, limit=None, exploration_policy=None):
         "fill": getattr(exploration_policy, "fill_quota", 45),
         "select": getattr(exploration_policy, "select_quota", 55),
     }
-    selected, counts, used = [], {k: 0 for k in quotas}, set()
+    selected, counts, used, node_counts = [], {k: 0 for k in quotas}, set(), {}
     regular_budget = max(0, limit - len(controls))
     for index, action in ranked:
         kind = action["kind"]
-        if counts[kind] >= quotas[kind] or len(selected) >= regular_budget:
+        node = action.get("node")
+        group = ("n", node) if node is not None else ("~", index)
+        if (
+            counts[kind] >= quotas[kind]
+            or len(selected) >= regular_budget
+            or node_counts.get(group, 0) >= node_cap
+        ):
             continue
         selected.append((index, action))
         used.add(index)
         counts[kind] += 1
+        node_counts[group] = node_counts.get(group, 0) + 1
     if len(selected) < regular_budget:
         for index, action in ranked:
             if index in used:
                 continue
+            node = action.get("node")
+            group = ("n", node) if node is not None else ("~", index)
+            if node_counts.get(group, 0) >= node_cap:
+                continue
             selected.append((index, action))
             used.add(index)
+            node_counts[group] = node_counts.get(group, 0) + 1
             if len(selected) >= regular_budget:
                 break
     # Preserve document order after relevance selection. This keeps element indices
@@ -219,7 +238,11 @@ def choose(state, goal, history, backend=None, exploration_policy=None):
                 "omitted_for_model": omitted_for_model + int(state.get("omitted_actions", 0)),
             },
             "recent_actions": [
-                {k: h.get(k) for k in ("action", "kind", "text", "page_changed", "verification", "approval")}
+                {
+                    **{k: h.get(k) for k in ("kind", "page_changed", "verification", "approval")},
+                    "action": redact_text(h.get("action"), 256),
+                    "text": redact_text(h.get("text"), 512),
+                }
                 for h in history[-10:]
             ],
         },
@@ -276,7 +299,10 @@ def field_context(goal, action, page, history):
         "goal": goal,
         "field": {k: clean.get(k) for k in ("label", "role", "value")},
         "page": sanitize_page(page),
-        "recent_actions": [{k: h.get(k) for k in ("action", "text")} for h in history[-6:]],
+        "recent_actions": [
+            {"action": redact_text(h.get("action"), 256), "text": redact_text(h.get("text"), 512)}
+            for h in history[-6:]
+        ],
     }
 
 

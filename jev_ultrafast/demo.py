@@ -58,6 +58,7 @@ def command(name, body):
             goal,
             screenshots=True,
             record_dir=Path.cwd() / "artifacts" / "frames" if body.get("record") else None,
+            task_family=f"demo-{scenario}",
         )
         AGENT.state["scenario"] = scenario
     else:

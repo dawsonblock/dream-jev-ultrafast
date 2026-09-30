@@ -84,6 +84,19 @@ def sanitize_action(action):
     return clean
 
 
+def action_goal_overlap(action, goal_tokens):
+    """Goal-token overlap computed on the sanitized candidate view.
+
+    Live candidate scoring and trace compaction must agree on overlap, so both
+    tokenize the sanitized action fields rather than raw page text.
+    """
+    clean = sanitize_action(action)
+    searchable = " ".join(
+        str(clean.get(k, "")) for k in ("label", "value", "current_value", "option_label")
+    ).lower()
+    return len(set(goal_tokens) & set(tokenize(searchable)))
+
+
 def sanitize_page(page):
     return {
         "url": sanitize_url(page.get("url", ""), 4096),

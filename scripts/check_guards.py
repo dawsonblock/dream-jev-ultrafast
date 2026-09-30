@@ -91,6 +91,11 @@ def main():
         """))
         page = browser.observe(screenshot=False)
         buy = next(a for a in page["actions"] if a["label"] == "Buy")
+        # Structured effect context reaches Python: derived flags only, no free text.
+        ctx = buy.get("ctx") or {}
+        assert ctx.get("form") is True and (ctx.get("fields") or {}).get("password") is True
+        assert ctx.get("submit") is False  # type="button" is not a submit member
+        passed.append("bounded ctx propagates form membership and field inventory")
         browser.evaluate("document.querySelector('#unrelated').textContent='New unrelated news'")
         assert browser.fresh(page, buy)
         assert not browser.fresh(page)
@@ -147,6 +152,95 @@ def main():
         assert value == "Generated", repr(value)
         assert any(a.get("role") == "option" for a in page["actions"])
         passed.append("real text input waits for asynchronous combobox suggestions")
+
+        # --- v0.5 authority integrity: mutation between validation and input ---
+        def reset_adv():
+            browser.evaluate("document.body.innerHTML=" + repr("""
+              <style>button{width:180px;height:50px}</style>
+              <button id="adv" onclick="window.hits=(window.hits||0)+1">Continue</button>
+              <button id="nested" onclick="window.nested=(window.nested||0)+1">Go <span>nested</span></button>
+            """))
+            browser.evaluate("window.hits=0; window.nested=0; window.evil=0")
+
+        reset_adv()
+        page = browser.observe(screenshot=False)
+        adv = next(a for a in page["actions"] if a["label"] == "Continue")
+        browser.evaluate("document.querySelector('#adv').textContent='Place order'")
+        try:
+            browser.act(adv, page)
+        except (RuntimeError, StalePage):
+            pass
+        else:
+            raise AssertionError("Post-observe commit swap executed")
+        assert browser.evaluate("window.hits") == 0
+        passed.append("post-observe commit swap aborts before input")
+
+        # A page-injected listener fires during the press itself; each of these
+        # must abort at the pre-release identity check and never hit the target.
+        # handler: page JS run during mousePressed; clicks_expected: whether the
+        # hygiene release can still complete a click on the same physical
+        # element (navigation changes page identity without detaching the node).
+        for label, handler, clicks_expected in [
+            ("same-label node swap", "const b=document.querySelector('#adv');"
+             "b.outerHTML='<button id=adv onclick=\"window.evil=(window.evil||0)+1\">Continue</button>'", 0),
+            ("pre-release overlay", "const c=document.createElement('div');"
+             "c.style.cssText='position:fixed;inset:0;z-index:9999';document.body.append(c)", 0),
+            ("pre-release geometry drift",
+             "document.querySelector('#adv').style.transform='translateX(400px)'", 0),
+            # Page identity includes the live form-state fingerprint, so adding
+            # an input mid-press is a synchronous same-document page mutation.
+            ("mid-press page mutation", "document.body.append(document.createElement('input'))", 1),
+        ]:
+            reset_adv()
+            page = browser.observe(screenshot=False)
+            adv = next(a for a in page["actions"] if a["label"] == "Continue")
+            browser.evaluate(
+                "document.querySelector('#adv').addEventListener('mousedown',()=>{" + handler + "})"
+            )
+            try:
+                browser.act(adv, page)
+            except StalePage:
+                pass
+            else:
+                raise AssertionError(f"{label}: input executed")
+            assert browser.evaluate("window.hits") == clicks_expected, label
+            assert browser.evaluate("window.evil") == 0, label
+            passed.append(f"{label} aborts between press and release")
+
+        # The aborted press must leave clean pointer state: a later legitimate
+        # click still works.
+        reset_adv()
+        page = browser.observe(screenshot=False)
+        adv = next(a for a in page["actions"] if a["label"] == "Continue")
+        browser.act(adv, page)
+        assert browser.evaluate("window.hits") == 1
+        passed.append("pointer state stays clean after aborted presses")
+
+        # A nested descendant legitimately intercepts the hit test.
+        page = browser.observe(screenshot=False)
+        nested = next(a for a in page["actions"] if a["label"].startswith("Go"))
+        browser.act(nested, page)
+        assert browser.evaluate("window.nested") == 1
+        passed.append("nested descendant at click point stays valid")
+
+        # Hidden / detached targets post-observe abort before press.
+        for label, expr in [
+            ("hidden target", "document.querySelector('#adv').style.display='none'"),
+            ("detached target", "document.querySelector('#adv').remove()"),
+        ]:
+            reset_adv()
+            page = browser.observe(screenshot=False)
+            adv = next(a for a in page["actions"] if a["label"] == "Continue")
+            browser.evaluate(expr)
+            try:
+                browser.act(adv, page)
+            except (RuntimeError, StalePage):
+                pass
+            else:
+                raise AssertionError(f"{label}: input executed")
+            assert browser.evaluate("window.hits") == 0, label
+            passed.append(f"post-observe {label} aborts before input")
+
         browser.call("Page.navigate", url="about:blank")
         assert not browser.fresh(page, field)
         passed.append("navigation invalidates the old document")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sys
 import time
 from pathlib import Path
 
@@ -287,35 +286,75 @@ def browser_operation(request):
                 raise StalePage("Target changed, became unavailable, or is covered. Observe again.")
             if kind != "select":
                 x, y = target["x"], target["y"]
-                for event in ("mousePressed", "mouseReleased"):
-                    call("Input.dispatchMouseEvent", type=event, x=x, y=y, button="left", clickCount=1)
+                # Authority integrity: the physical input must land on the same
+                # semantic target that passed validation. Re-check page identity,
+                # element guard, geometry, and hit-test immediately before press
+                # and again before release — validation and dispatch are separate
+                # CDP calls, so the page could mutate in between.
+                precheck = (
+                    """((input) => {
+                      const {action,expected,x,y}=input, c=globalThis.__jevFastV2;
+                      const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+                      if (!c || !same(c.pageKey(),expected.page_key)) return false;
+                      const e=c.nodes.get(action.node);
+                      if (!e?.isConnected || !same(c.guard(e),expected.guard)) return false;
+                      if (e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
+                          !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return false;
+                      const r=e.getBoundingClientRect();
+                      if (!r.width || !r.height || Math.abs(r.x+r.width/2-x)>2 || Math.abs(r.y+r.height/2-y)>2)
+                        return false;
+                      const hit=document.elementFromPoint(x,y);
+                      return !!(hit && (hit===e || e.contains(hit)));
+                    })(""" + json.dumps({"action": action, "expected": expected, "x": x, "y": y}) + ")"
+                )
+                if not evaluate(precheck):
+                    raise StalePage("Target failed pre-press identity check. Observe again.")
+                call("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=1)
+                if not evaluate(precheck):
+                    # A press already left the process; restore pointer state at
+                    # the same point, then fail closed to re-perception.
+                    call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=1)
+                    raise StalePage("Target changed between press and release; click aborted.")
+                call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=1)
                 if kind == "fill":
-                    focused = evaluate(
-                        """(action => {
-                          const e=globalThis.__jevFastV2?.nodes.get(action.node), active=document.activeElement;
-                          if (!e?.isConnected || !active || !(active===e || e.contains(active))) return false;
-                          return !(e.readOnly || e.getAttribute('aria-readonly')==='true' ||
-                            e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]'));
-                        })(""" + json.dumps(action) + ")"
+                    # Focus verification and text insertion in one evaluation:
+                    # Input.insertText cannot be bound to the target, so typing
+                    # happens in-world, atomically with the focus check.
+                    inserted = evaluate(
+                        """((input) => {
+                          const {action,expected,text}=input, c=globalThis.__jevFastV2;
+                          const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+                          if (!c || !same(c.pageKey(),expected.page_key)) return {error:'stale-page'};
+                          const e=c.nodes.get(action.node);
+                          if (!e?.isConnected || !same(c.guard(e),expected.guard)) return {error:'stale-target'};
+                          if (e.readOnly || e.getAttribute('aria-readonly')==='true' ||
+                              e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]'))
+                            return {error:'readonly'};
+                          let active=document.activeElement;
+                          if (!(active && (active===e || e.contains(active)))) {
+                            if (e.focus) e.focus();
+                            active=document.activeElement;
+                          }
+                          if (!(active && (active===e || e.contains(active)))) return {error:'focus'};
+                          try {
+                            if ('value' in e && e.setSelectionRange) e.setSelectionRange(0, String(e.value).length);
+                            else { const s=getSelection(), r=document.createRange();
+                                   r.selectNodeContents(e); s.removeAllRanges(); s.addRange(r); }
+                          } catch (_) {}
+                          if (!document.execCommand || !document.execCommand('insertText', false, text))
+                            return {error:'insert'};
+                          const value = 'value' in e ? String(e.value) : String(e.innerText || '');
+                          return {inserted:true, matched:value===text, value:value.slice(0,1024)};
+                        })(""" + json.dumps({"action": action, "expected": expected, "text": request["text"]}) + ")"
                     )
-                    if not focused:
-                        raise StalePage("Target lost focus after click; no text inserted.")
-                    call(
-                        "Input.dispatchKeyEvent",
-                        type="keyDown",
-                        key="a",
-                        code="KeyA",
-                        modifiers=4 if sys.platform == "darwin" else 2,
-                        commands=["selectAll"],
-                    )
-                    call(
-                        "Input.dispatchKeyEvent",
-                        type="keyUp",
-                        key="a",
-                        code="KeyA",
-                        modifiers=4 if sys.platform == "darwin" else 2,
-                    )
-                    call("Input.insertText", text=request["text"])
+                    if not inserted or inserted.get("error"):
+                        raise StalePage(f"Text insertion failed before mutation: {(inserted or {}).get('error')}")
+                    if not inserted.get("matched"):
+                        # The insert already ran — a mismatch means the mutation
+                        # did not land as authorized. This is not retryable.
+                        raise RuntimeError(
+                            "Text insertion landed differently than authorized; inspect before retrying."
+                        )
         return {"executed": action["id"]}
 
     info = evaluate(READ_STATE)
