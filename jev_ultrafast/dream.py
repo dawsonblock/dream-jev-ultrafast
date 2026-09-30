@@ -1388,9 +1388,9 @@ class PolicyRegistry:
             current_parent = self._current_baseline_digest(payload)
             if current_parent != staged.get("parent_digest"):
                 raise ValueError("Staged policy parent no longer matches the active policy")
-            if evidence.candidate_digest and evidence.candidate_digest != staged["digest"]:
+            if evidence.candidate_digest != staged["digest"]:
                 raise ValueError("Canary evidence is not bound to the staged policy digest")
-            if evidence.baseline_digest and evidence.baseline_digest != staged.get("parent_digest"):
+            if evidence.baseline_digest != staged.get("parent_digest"):
                 raise ValueError("Canary evidence baseline does not match the staged policy parent digest")
             decision = (gate or CanaryGate()).assess(evidence.baseline, evidence.candidate, evidence=evidence)
             if not decision.approved:
