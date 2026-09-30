@@ -115,7 +115,7 @@ class Handler(BaseHTTPRequestHandler):
             if not 0 < length < 8192:
                 raise ValueError("Invalid request size")
             body = json.loads(self.rfile.read(length))
-            result = command(self.path.removeprefix("/api/"), body)
+            result = command(urlparse(self.path).path.removeprefix("/api/"), body)
             self.send(200, json.dumps(result))
         except (ValueError, RuntimeError, TimeoutError) as error:
             self.send(400, json.dumps({"error": str(error)}))

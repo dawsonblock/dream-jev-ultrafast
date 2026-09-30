@@ -70,7 +70,7 @@
     "average_token_regression_ratio_max": 0.25
   },
   "validation": {
-    "offline_tests_passed": 110,
+    "offline_tests_passed": 112,
     "python_compileall": "passed",
     "javascript_syntax": "passed",
     "toml_json_parse": "passed",
@@ -79,6 +79,6 @@
     "cross_process_registry_test": "passed",
     "ruff": "passed",
     "uv_build": "passed",
-    "live_browser_harness": "not run in offline build environment"
+    "live_browser_harness": "passed: 23 guard checks against dedicated Chrome 152 via BU_CDP_URL"
   }
 }
