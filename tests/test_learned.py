@@ -13,7 +13,7 @@ from jev_ultrafast.dream import (
     mutate_policies,
     task_key,
 )
-from jev_ultrafast.dreamlearn import CostModel, OutcomeModel, overlap_bucket, rank_bucket
+from jev_ultrafast.dreamlearn import ChoiceModel, CostModel, OutcomeModel, overlap_bucket, rank_bucket
 from jev_ultrafast.model import candidate_actions
 from jev_ultrafast.privacy import action_goal_overlap
 from jev_ultrafast.signing import EvidenceSigner, verify_signature
@@ -238,6 +238,218 @@ def test_improve_annotates_outcome_predictions(tmp_path):
     )
     assert report.outcome_model_digest == outcome.digest
     assert any("predicted_page_changes_per_world" in c for c in report.candidates)
+
+
+# --------------------------------------------------------------- ChoiceModel
+
+
+def test_choice_model_uncertainty_and_abstention():
+    events = [
+        {
+            **_transition(selected="sel", page_changed=True, candidates=[
+                {"id": "sel", "kind": "click", "label": "Search", "goal_overlap": 2},
+            ]),
+            "selected_rank": 0,
+        },
+        *[
+            {
+                **_transition(selected=f"w{i}", page_changed=False, candidates=[
+                    {"id": f"w{i}", "kind": "wait", "label": "wait", "goal_overlap": 0},
+                ]),
+                "selected": {"id": f"w{i}", "kind": "wait"},
+            }
+            for i in range(6)
+        ],
+    ]
+    model = ChoiceModel.fit(events)
+    assert model.samples == 7
+    sparse = model.predict(kind="click", goal_overlap=2, rank=0)
+    assert sparse["level"] == "cell" and sparse["n"] == 1
+    assert sparse["confident"] is False
+    assert 0 < sparse["uncertainty"] < 0.5
+    dense = model.predict(kind="wait", goal_overlap=0, rank=0)
+    assert dense["n"] == 6 and dense["confident"] is True
+    assert dense["uncertainty"] < sparse["uncertainty"]
+    unseen = model.predict(kind="scroll", goal_overlap=0, rank=500)
+    assert unseen["level"] == "global" and unseen["n"] == 7
+
+
+def test_choice_model_empty_fit_abstains():
+    model = ChoiceModel.fit([])
+    prediction = model.predict(kind="click", goal_overlap=0, rank=0)
+    assert prediction["level"] == "global"
+    assert prediction["n"] == 0 and prediction["confident"] is False
+    assert model.choose([{"id": "a", "kind": "click"}])["confident"] is False
+    assert model.choose([]) is None
+
+
+def test_choice_model_choose_proposes_only_offered_candidates():
+    # Mixed cells within one kind: goal-relevant clicks changed pages,
+    # irrelevant ones did not, so the cell prior beats the kind fallback.
+    events = [
+        *[
+            {
+                **_transition(selected=f"g{i}", page_changed=True, candidates=[
+                    {"id": f"g{i}", "kind": "click", "label": "Search", "goal_overlap": 2},
+                ]),
+                "selected_rank": 0,
+            }
+            for i in range(5)
+        ],
+        *[
+            {
+                **_transition(selected=f"k{i}", page_changed=False, candidates=[
+                    {"id": f"k{i}", "kind": "click", "label": "Ctl", "goal_overlap": 0},
+                ]),
+                "selected_rank": 0,
+            }
+            for i in range(5)
+        ],
+    ]
+    model = ChoiceModel.fit(events)
+    offered = [
+        {"id": "a", "kind": "click", "label": "A", "goal_overlap": 0},
+        {"id": "b", "kind": "click", "label": "Search", "goal_overlap": 2},
+        {"id": "c", "kind": "click", "label": "C", "goal_overlap": 0},
+    ]
+    proposal = model.choose(offered)
+    assert proposal["id"] in {c["id"] for c in offered}
+    assert proposal["id"] == "b"  # only candidate in the strong cell
+    assert {"p_page_changed", "uncertainty", "confident", "score"} <= set(proposal)
+
+
+def test_choice_model_ucb_can_prefer_uncertain_candidate():
+    # A dense low-payoff cell vs an unseen kind: optimism under uncertainty
+    # still proposes the unexplored action, but the proposal is flagged
+    # not-confident (global fallback is an abstention) so consumers know it
+    # is a hypothesis, not knowledge.
+    events = [
+        *[
+            {
+                **_transition(selected=f"k{i}", page_changed=False, candidates=[
+                    {"id": f"k{i}", "kind": "click", "label": "Known", "goal_overlap": 0},
+                ]),
+                "selected_rank": 0,
+            }
+            for i in range(8)
+        ],
+        *[
+            {
+                **_transition(selected=f"s{i}", page_changed=True, candidates=[
+                    {"id": f"s{i}", "kind": "select", "label": "Pick", "goal_overlap": 0},
+                ]),
+                "selected": {"id": f"s{i}", "kind": "select"},
+                "selected_rank": 0,
+            }
+            for i in range(4)
+        ],
+    ]
+    model = ChoiceModel.fit(events)
+    offered = [
+        {"id": "known", "kind": "click", "label": "Known", "goal_overlap": 0},
+        {"id": "novel", "kind": "fill", "label": "Novel", "goal_overlap": 0},
+    ]
+    proposal = model.choose(offered)
+    assert proposal["id"] == "novel"
+    assert proposal["confident"] is False
+    assert proposal["uncertainty"] > model.predict(kind="click", goal_overlap=0, rank=0)["uncertainty"]
+
+
+def test_choice_model_roundtrip_and_digest():
+    model = ChoiceModel.fit([_transition()])
+    clone = ChoiceModel.from_dict(json.loads(json.dumps(model.to_dict())))
+    assert clone.digest == model.digest
+    other = ChoiceModel.fit([_transition(), _transition()])
+    assert other.digest != model.digest
+    with pytest.raises(ValueError, match="Unknown choice model keys"):
+        ChoiceModel.from_dict({"samples": 0, "bogus": True})
+
+
+def _rank_sensitive_worlds():
+    """Recorded action sits at DOM index 6 behind six zero-overlap controls."""
+    candidates = [
+        *[{"id": f"f{i}", "kind": "click", "label": f"ctl{i}", "goal_overlap": 0} for i in range(6)],
+        {"id": "sel", "kind": "click", "label": "Search", "goal_overlap": 2},
+    ]
+    transition = _transition(selected="sel", candidates=candidates, offered=7)
+    transition["selected_rank"] = 6
+    events = []
+    for i in range(3):
+        events.append({"event": "run_started", "run_id": f"r{i}", "task_key": "t", "goal": "search",
+                       "policy": ExplorationPolicy().to_dict(),
+                       "policy_digest": ExplorationPolicy().digest})
+        events.append({**transition, "run_id": f"r{i}", "task_key": "t"})
+        events.append({"event": "run_finished", "run_id": f"r{i}", "task_key": "t",
+                       "status": "done", "verified": True})
+    return ReplayWorld.from_events(events)
+
+
+def test_choice_model_replay_uses_candidate_policy_rank():
+    worlds = _rank_sensitive_worlds()
+    # Separate priors per rank bucket: recorded at bucket "5-19" under baseline
+    # (offered rank 6) but "0-4" under the filtering policy (offered rank 0).
+    front_events = [
+        {**_transition(selected=f"s{i}", page_changed=True, candidates=[
+            {"id": f"s{i}", "kind": "click", "label": "Search", "goal_overlap": 2},
+        ]), "selected_rank": 0}
+        for i in range(6)
+    ]
+    back_events = [
+        {**_transition(selected=f"b{i}", page_changed=False, candidates=[
+            {"id": f"b{i}", "kind": "click", "label": "Back", "goal_overlap": 0},
+        ]), "selected_rank": 9}
+        for i in range(6)
+    ]
+    model = ChoiceModel.fit(front_events + back_events)
+    sim = ReplaySimulator(worlds)
+    baseline = ReplaySimulator(worlds).evaluate(ExplorationPolicy(), choice_model=model)
+    filtered = sim.evaluate(ExplorationPolicy(min_goal_overlap=1), choice_model=model)
+    base_summary = baseline.per_world[0]
+    filt_summary = filtered.per_world[0]
+    # Same recorded action, different offered rank -> different prior cell.
+    assert filt_summary["choice_predicted_change"] > base_summary["choice_predicted_change"]
+    # Annotation-only: identical empirical metrics either way.
+    assert baseline.metrics.successes == filtered.metrics.successes
+    plain = ReplaySimulator(worlds).evaluate(ExplorationPolicy(min_goal_overlap=1))
+    assert filtered.metrics.score == plain.metrics.score
+    assert filtered.metrics.actions == plain.metrics.actions
+
+
+def test_choice_model_proposals_never_reach_gates(tmp_path):
+    store = ExperienceStore(tmp_path / "choice.jsonl")
+    for i in range(3):
+        _append_run(store, f"r{i}", "search", [_transition()])
+    events = store.load()
+    worlds = ReplayWorld.from_events(events)
+    choice = ChoiceModel.fit(events)
+    improver = DreamImprover(gate=PromotionGate(min_coverage=0.5))
+    with_model = improver.improve(worlds, ExplorationPolicy(), choice_model=choice)
+    without_model = DreamImprover(gate=PromotionGate(min_coverage=0.5)).improve(
+        worlds, ExplorationPolicy()
+    )
+    assert with_model.promotion.approved == without_model.promotion.approved
+    assert with_model.selected.digest == without_model.selected.digest
+    assert with_model.choice_model_digest == choice.digest
+    annotated = [c for c in with_model.candidates if "choice_model" in c]
+    assert annotated
+    entry = annotated[0]["choice_model"]
+    assert {"divergence_rate", "mean_uncertainty", "confident_fraction",
+            "predicted_page_changes_per_step", "proposed_page_changes_per_step"} <= set(entry)
+    # A rejected candidate is annotated but still rejected.
+    rejected = [c for c in annotated if not c["replay_approved"]]
+    if rejected:
+        assert all("choice_model" in c for c in rejected)
+
+
+def test_choice_model_annotations_do_not_change_replay_outcomes():
+    worlds = _rank_sensitive_worlds()
+    model = ChoiceModel.fit([])
+    with_model = ReplaySimulator(worlds).evaluate(ExplorationPolicy(), choice_model=model)
+    without = ReplaySimulator(worlds).evaluate(ExplorationPolicy())
+    assert with_model.metrics == without.metrics
+    summary = with_model.per_world[0]
+    assert summary["actions"] == without.per_world[0]["actions"]
+    assert summary["success"] == without.per_world[0]["success"]
 
 
 # ------------------------------------------------- bounded surface expansion

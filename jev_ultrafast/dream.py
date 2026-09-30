@@ -847,6 +847,7 @@ class ReplaySimulator:
         max_steps: int | None = None,
         cost_model=None,
         outcome_model=None,
+        choice_model=None,
     ) -> ReplayResult:
         estimated = bool(cost_model is not None and getattr(cost_model, "reliable", False))
         summaries = [
@@ -856,6 +857,7 @@ class ReplaySimulator:
                 max_steps=max_steps,
                 cost_model=cost_model if estimated else None,
                 outcome_model=outcome_model,
+                choice_model=choice_model,
             )
             for world in self.worlds
         ]
@@ -869,6 +871,7 @@ class ReplaySimulator:
         max_steps: int | None,
         cost_model=None,
         outcome_model=None,
+        choice_model=None,
     ):
         summary = self._empty_world(world)
         step_limit = min(policy.max_actions, max_steps or policy.max_actions)
@@ -897,7 +900,7 @@ class ReplaySimulator:
                 summary["est_latency_ms"] += max(
                     0.0, transition.latency_ms + predicted["latency_ms"] - recorded["latency_ms"]
                 )
-            if outcome_model is not None:
+            if outcome_model is not None or choice_model is not None:
                 selected_overlap = next(
                     (
                         int(c.get("goal_overlap", 0))
@@ -906,6 +909,7 @@ class ReplaySimulator:
                     ),
                     0,
                 )
+            if outcome_model is not None:
                 prediction = outcome_model.predict(
                     kind=transition.selected_kind,
                     goal_overlap=selected_overlap,
@@ -913,6 +917,33 @@ class ReplaySimulator:
                 )
                 summary["predicted_change"] += prediction["p_page_changed"]
                 summary["prediction_samples"] += prediction["n"]
+            if choice_model is not None:
+                # The candidate policy's recomputed offered rank — the same
+                # quantity as the recorded selected_rank but under *this*
+                # policy's catalogue — so the signal is policy-dependent.
+                # Counterfactual proposals annotate the summary only; they are
+                # never evidence and never reach a gate.
+                offered_rank = next(
+                    (
+                        i for i, item in enumerate(offered)
+                        if item.get("id") == transition.selected_id
+                    ),
+                    None,
+                )
+                prediction = choice_model.predict(
+                    kind=transition.selected_kind,
+                    goal_overlap=selected_overlap,
+                    rank=offered_rank,
+                )
+                summary["choice_predicted_change"] += prediction["p_page_changed"]
+                summary["choice_uncertainty"] += prediction["uncertainty"]
+                summary["choice_confident"] += int(prediction["confident"])
+                proposal = choice_model.choose(offered)
+                if proposal is not None:
+                    summary["choice_proposed_change"] += proposal["p_page_changed"]
+                    summary["choice_divergences"] += int(
+                        proposal["id"] != transition.selected_id
+                    )
             if transition.selected_kind != "wait" and not transition.page_changed:
                 no_progress += 1
             else:
@@ -1020,6 +1051,11 @@ class ReplaySimulator:
             "est_latency_ms": 0.0,
             "predicted_change": 0.0,
             "prediction_samples": 0,
+            "choice_predicted_change": 0.0,
+            "choice_proposed_change": 0.0,
+            "choice_uncertainty": 0.0,
+            "choice_confident": 0,
+            "choice_divergences": 0,
         }
 
     def _aggregate(self, summaries: list[dict], *, estimated: bool = False) -> ReplayMetrics:
@@ -1292,6 +1328,7 @@ class DreamReport:
     live_canary_required: bool = True
     cost_model_digest: str | None = None
     outcome_model_digest: str | None = None
+    choice_model_digest: str | None = None
 
     def to_dict(self):
         return {
@@ -1319,6 +1356,7 @@ class DreamReport:
             "live_canary_required": self.live_canary_required,
             "cost_model_digest": self.cost_model_digest,
             "outcome_model_digest": self.outcome_model_digest,
+            "choice_model_digest": self.choice_model_digest,
             "tcb_version": TCB_VERSION,
         }
 
@@ -1354,6 +1392,7 @@ class DreamImprover:
         evidence_head_hash: str | None = None,
         cost_model=None,
         outcome_model=None,
+        choice_model=None,
     ) -> DreamReport:
         worlds = list(worlds)
         splits = split_worlds(worlds)
@@ -1386,7 +1425,12 @@ class DreamImprover:
             for name, items in splits.items()
         }
         base_results = {
-            name: (sim.evaluate(base, cost_model=cost_model, outcome_model=outcome_model) if sim else None)
+            name: (
+                sim.evaluate(
+                    base, cost_model=cost_model, outcome_model=outcome_model,
+                    choice_model=choice_model,
+                ) if sim else None
+            )
             for name, sim in simulators.items()
         }
 
@@ -1412,7 +1456,12 @@ class DreamImprover:
         passing: list[tuple[float, float, float, ExplorationPolicy, PromotionDecision]] = []
         for policy in mutate_policies(base):
             candidate_results = {
-                name: (sim.evaluate(policy, cost_model=cost_model, outcome_model=outcome_model) if sim else None)
+                name: (
+                    sim.evaluate(
+                        policy, cost_model=cost_model, outcome_model=outcome_model,
+                        choice_model=choice_model,
+                    ) if sim else None
+                )
                 for name, sim in simulators.items()
             }
             if policy.behavior_digest == base.behavior_digest:
@@ -1458,6 +1507,27 @@ class DreamImprover:
                 entry["predicted_page_changes_per_world"] = fmean(
                     s["predicted_change"] for s in candidate_results["train"].per_world
                 )
+            if choice_model is not None and choice_model.samples:
+                # Advisory annotation only: the choice prior evaluated under the
+                # candidate's own offered ordering, plus how often its
+                # counterfactual proposal differs from the action the recorded
+                # policy actually took. None of this enters a gate.
+                pw = candidate_results["train"].per_world
+                steps = sum(s["actions"] for s in pw)
+                if steps:
+                    entry["choice_model"] = {
+                        "predicted_page_changes_per_step": fmean(
+                            s["choice_predicted_change"] / max(1, s["actions"]) for s in pw
+                        ),
+                        "proposed_page_changes_per_step": fmean(
+                            s["choice_proposed_change"] / max(1, s["actions"]) for s in pw
+                        ),
+                        "mean_uncertainty": fmean(
+                            s["choice_uncertainty"] / max(1, s["actions"]) for s in pw
+                        ),
+                        "confident_fraction": sum(s["choice_confident"] for s in pw) / steps,
+                        "divergence_rate": sum(s["choice_divergences"] for s in pw) / steps,
+                    }
             evaluated.append(entry)
             if decision.approved:
                 passing.append((robust_gain, average_gain, estimated_gain or float("-inf"), policy, decision))
@@ -1492,6 +1562,9 @@ class DreamImprover:
             cost_model_digest=(cost_model.digest if cost_model is not None and cost_model.samples else None),
             outcome_model_digest=(
                 outcome_model.digest if outcome_model is not None and outcome_model.samples else None
+            ),
+            choice_model_digest=(
+                choice_model.digest if choice_model is not None and choice_model.samples else None
             ),
         )
 

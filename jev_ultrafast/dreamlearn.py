@@ -11,9 +11,17 @@ These are Level-1/Level-2 learners in the DREAM stack:
 - Level 2 (``OutcomeModel``): a bucketed, Beta-smoothed estimate of coarse
   transition effects (did the page change?). It annotates candidates with prior
   expectations for experiment design; it is never consulted by a gate.
+- Level 3 (``ChoiceModel``): an uncertainty-aware counterfactual choice prior.
+  It predicts under the candidate policy's *own* recomputed offered rank and
+  proposes which offered action it would prefer (posterior mean plus an
+  exploration bonus on posterior stddev), abstaining via an explicit
+  ``confident`` flag on sparse cells. A proposal is annotation metadata only —
+  never an outcome, never evidence, never a gate input. A counterfactual
+  "Candidate 17 would have succeeded" can only be tested by actually running
+  Candidate 17; real executions qualify, priors merely propose.
 
-Neither model may fabricate a model choice or a browser outcome, and neither is
-part of the trusted evidence path.
+No model may fabricate a model choice or a browser outcome, and none is part
+of the trusted evidence path.
 """
 
 from __future__ import annotations
@@ -256,4 +264,136 @@ class OutcomeModel:
             kind_totals=kind_totals,
             global_changed=payload.get("global_changed", 0),
             version=payload.get("version", "jev-outcome/1"),
+        )
+
+
+@dataclass(frozen=True)
+class ChoiceModel:
+    """Uncertainty-aware counterfactual choice prior (Level 3, advisory).
+
+    Beta-smoothed ``P(page_changed)`` over the same ``(kind, overlap, rank)``
+    cells as ``OutcomeModel``, with two deliberate differences:
+
+    - Every prediction carries the posterior standard deviation and an
+      explicit ``confident`` flag; on sparse cells the model abstains rather
+      than returning a smoothed guess.
+    - During replay it is queried under the candidate policy's *own*
+      recomputed offered rank — the rank the recorded action would have had
+      under the candidate's offered catalogue — so its signal is
+      policy-dependent instead of a descriptive prior over history.
+
+    ``choose`` proposes which offered action the prior would prefer using an
+    upper-confidence score (mean + ``EXPLORE_BONUS`` * posterior std). A
+    counterfactual proposal is annotation metadata only: it is never an
+    outcome, never evidence, and is never consulted by a qualification gate.
+    Only real executions may qualify anything.
+    """
+
+    samples: int = 0
+    cells: tuple[tuple[str, str, str, int, int], ...] = ()
+    kind_totals: tuple[tuple[str, int, int], ...] = ()
+    global_changed: int = 0
+    version: str = "jev-choice/1"
+
+    MIN_CONFIDENT = 4
+    EXPLORE_BONUS = 0.5
+
+    @classmethod
+    def fit(cls, events: Iterable[dict]) -> "ChoiceModel":
+        outcome = OutcomeModel.fit(events)
+        return cls(
+            samples=outcome.samples,
+            cells=outcome.cells,
+            kind_totals=outcome.kind_totals,
+            global_changed=outcome.global_changed,
+        )
+
+    @staticmethod
+    def _posterior(n: int, changed: int) -> tuple[float, float]:
+        """Beta(changed+1, n-changed+1) posterior mean and stddev."""
+        mean = (changed + 1) / (n + 2)
+        return mean, math.sqrt(mean * (1 - mean) / (n + 3))
+
+    def predict(self, *, kind: str, goal_overlap: int = 0, rank: int | None = None) -> dict:
+        cell_key = (str(kind), overlap_bucket(goal_overlap), rank_bucket(rank))
+        for k, o, r, n, changed in self.cells:
+            if (k, o, r) == cell_key:
+                p, std = self._posterior(n, changed)
+                return {
+                    "p_page_changed": p,
+                    "n": n,
+                    "uncertainty": std,
+                    "level": "cell",
+                    "confident": n >= self.MIN_CONFIDENT,
+                }
+        for k, n, changed in self.kind_totals:
+            if k == cell_key[0]:
+                p, std = self._posterior(n, changed)
+                return {
+                    "p_page_changed": p,
+                    "n": n,
+                    "uncertainty": std,
+                    "level": "kind",
+                    "confident": n >= self.MIN_CONFIDENT,
+                }
+        p, std = self._posterior(self.samples, self.global_changed)
+        return {
+            "p_page_changed": p,
+            "n": self.samples,
+            "uncertainty": std,
+            "level": "global",
+            # Global support says nothing about this action type in this
+            # context, so a global fallback is always an abstention.
+            "confident": False,
+        }
+
+    def choose(self, candidates: Iterable[dict]) -> dict | None:
+        """The offered candidate this prior prefers under uncertainty.
+
+        Score = posterior mean + ``EXPLORE_BONUS`` * posterior std, so sparse
+        but promising actions are still proposed (optimism) while the
+        ``confident`` flag records how much evidence backs the proposal.
+        ``rank`` is the candidate's position in the offered catalogue — the
+        same basis as the recorded ``selected_rank``.
+        """
+        best = None
+        for rank, candidate in enumerate(candidates):
+            prediction = self.predict(
+                kind=str(candidate.get("kind") or "unknown"),
+                goal_overlap=int(candidate.get("goal_overlap", 0) or 0),
+                rank=rank,
+            )
+            score = prediction["p_page_changed"] + self.EXPLORE_BONUS * prediction["uncertainty"]
+            if best is None or score > best[0]:
+                best = (score, candidate, prediction)
+        if best is None:
+            return None
+        return {
+            "id": best[1].get("id"),
+            "kind": best[1].get("kind"),
+            "p_page_changed": best[2]["p_page_changed"],
+            "uncertainty": best[2]["uncertainty"],
+            "confident": best[2]["confident"],
+            "score": best[0],
+        }
+
+    @property
+    def digest(self) -> str:
+        return _stable_hash(json.dumps(asdict(self), sort_keys=True, separators=(",", ":")))
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "ChoiceModel":
+        allowed = set(cls.__dataclass_fields__)
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValueError(f"Unknown choice model keys: {sorted(unknown)}")
+        return cls(
+            samples=payload.get("samples", 0),
+            cells=tuple(tuple(c) for c in payload.get("cells", ())),
+            kind_totals=tuple(tuple(k) for k in payload.get("kind_totals", ())),
+            global_changed=payload.get("global_changed", 0),
+            version=payload.get("version", "jev-choice/1"),
         )

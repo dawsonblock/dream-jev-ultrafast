@@ -1,10 +1,10 @@
-# Validation — Jev Ultrafast v0.5.1 DREAM-Jev
+# Validation — Jev Ultrafast v0.6.0 DREAM-Jev
 
-Validation date: 2026-09-29 (v0.5.0 validated same-day; v0.5.1 applies the independent-audit authority patch: monotonic classification, family-namespaced canary pairing, signed promotion attestations, chain-head anchoring, label redaction, complete catalogue digests, and explicit execution guarantees).
+Validation date: 2026-09-29 (v0.5.0 validated same-day; v0.5.1 applies the independent-audit authority patch: monotonic classification, family-namespaced canary pairing, signed promotion attestations, chain-head anchoring, label redaction, complete catalogue digests, and explicit execution guarantees; v0.6.0 adds the uncertainty-aware `ChoiceModel` counterfactual layer — annotation-only, never evidence).
 
 ## Reproduced in this build environment
 
-- `uv run pytest`: **229 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
+- `uv run pytest`: **237 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
 - `uv run python scripts/check_guards.py` against a dedicated headless Chrome 154 instance (`BU_CDP_URL=http://127.0.0.1:9222`, throwaway `--user-data-dir`): **all 34 live browser guard checks passed**, including the adversarial mid-input cases (post-observe commit swap, same-label node swap between press and release, pre-release overlay, pre-release geometry drift, mid-press page mutation, pointer-state hygiene after abort, nested-descendant interception, post-observe hidden/detached targets, structured `ctx` propagation) and the atomic-guarantee check proving `DOM_ATOMIC` clicks dispatch no press/release window for mid-event sabotage. Earlier validation against Chrome 152 also passed; the first v0.4.0 live run had exposed a latent defect that mocked tests could not see, which is why CI now runs this suite in a `live-guards` job on every change.
 - `uv run ruff check .`: passed.
 - `uv build`: passed.
@@ -104,6 +104,13 @@ The test suite now covers the v0.3 contracts plus:
 - **Catalogue digest completeness**: `candidate_catalog_digest` binds `node`, `role`, `option_index`, `option_label`, `current_value`, `checked`, and `ctx` alongside id/kind/label/value/goal_overlap — a mutation test flips each field and asserts the digest changes.
 - **Execution guarantees**: `DOM_ATOMIC` (single isolated-world validate+mutate turn, default for click/fill/select) versus `TRUSTED_INPUT_NONTRANSACTIONAL` (CDP mouse input with pre-press/pre-release checks; `unsupported` programmatic elements escalate to it only because the atomic evaluation provably did not mutate); mocked tests assert the atomic path dispatches zero `Input.*` events and a single evaluation.
 - New events are `jev-dream/3` / `jev-ultrafast-tcb/0.8`.
+
+## v0.6.0 counterfactual-layer coverage
+
+- `ChoiceModel` (Level 3) fits the same `(kind, overlap, rank)` cells as `OutcomeModel` but returns posterior standard deviation and an explicit `confident` flag — sparse cells and the global fallback abstain rather than guessing.
+- During replay it is queried under the *candidate* policy's recomputed offered rank (the same basis as the recorded `selected_rank`), so a filtering policy provably changes which cell the recorded action lands in — the signal is policy-dependent, not a descriptive prior.
+- `choose()` proposes only from the offered catalogue using an upper-confidence score (`mean + 0.5·std`); tests cover abstention on empty/sparse fits, proposals restricted to observed candidates, deterministic digest/round-trip, and UCB preferring an unexplored action while flagging it not-confident.
+- Counterfactual proposals are annotation-only (`choice_model` block: `divergence_rate`, `mean_uncertainty`, `confident_fraction`, `predicted/proposed_page_changes_per_step`); tests assert identical `ReplayMetrics`, promotion decisions, and selected digests with and without the model — a proposal can never open a gate or become evidence.
 
 ## Deployment gate
 

@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from .dream import DreamImprover, ExperienceStore, ExplorationPolicy, PolicyRegistry, ReplayWorld
-from .dreamlearn import CostModel, OutcomeModel
+from .dreamlearn import ChoiceModel, CostModel, OutcomeModel
 
 COMMANDS = {"improve", "verify", "promote", "status", "rollback", "health", "suspend", "resume"}
 
@@ -64,6 +64,12 @@ def build_parser():
         "--outcome-model",
         action="store_true",
         help="Fit a coarse outcome model and annotate candidates with predicted progress (never gates)",
+    )
+    improve.add_argument(
+        "--choice-model",
+        action="store_true",
+        help="Fit the uncertainty-aware choice prior; annotates candidates with "
+        "policy-dependent predictions and counterfactual proposals (never gates)",
     )
     _add_verify_args(improve)
 
@@ -180,12 +186,14 @@ def main(argv=None):
     baseline = registry.active_policy() if registry else ExplorationPolicy()
     cost_model = CostModel.fit(events) if args.cost_model else None
     outcome_model = OutcomeModel.fit(events) if args.outcome_model else None
+    choice_model = ChoiceModel.fit(events) if args.choice_model else None
     report = DreamImprover().improve(
         worlds,
         baseline,
         evidence_head_hash=store.head_hash(),
         cost_model=cost_model,
         outcome_model=outcome_model,
+        choice_model=choice_model,
     )
     output = Path(args.report)
     output.parent.mkdir(parents=True, exist_ok=True)
