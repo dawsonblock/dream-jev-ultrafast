@@ -66,6 +66,7 @@ class DreamTraceRecorder:
         offered: list[dict] | None = None,
         helper: dict | None = None,
         risk_events=0,
+        experiment: dict | None = None,
     ):
         selected = sanitize_action(action)
         goal_tokens = set(tokenize(self.goal))
@@ -142,6 +143,11 @@ class DreamTraceRecorder:
             "operation_probabilities": {
                 str(k): round(float(v), 6) for k, v in operation_probabilities.items()
             },
+            # Experiment provenance (present only on assigned trials): which
+            # arm executed, the scheduler's assignment probability — the
+            # propensity any off-policy correction is weighted by — and the
+            # model choice the trial deviated from or confirmed.
+            "experiment": experiment,
             "page_changed": after.get("fingerprint") != before.get("fingerprint"),
             "latency_ms": int(decision.get("latency_ms", 0)) + int((helper or {}).get("latency_ms", 0)),
             "model_calls": 1 + int(helper is not None),

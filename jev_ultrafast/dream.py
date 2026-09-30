@@ -37,7 +37,10 @@ from .signing import (
 
 SCHEMA_VERSION = "jev-dream/4"
 SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", "jev-dream/3", SCHEMA_VERSION}
-TCB_VERSION = "jev-ultrafast-tcb/0.9"
+# 0.10 adds experiment-tagged transitions: trial runs carry an ``experiment``
+# block and are excluded from canary metrics, so pools that predate the
+# distinction must not silently co-mingle with it.
+TCB_VERSION = "jev-ultrafast-tcb/0.10"
 SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.3",
     "jev-ultrafast-tcb/0.4",
@@ -45,6 +48,7 @@ SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.6",
     "jev-ultrafast-tcb/0.7",
     "jev-ultrafast-tcb/0.8",
+    "jev-ultrafast-tcb/0.9",
     TCB_VERSION,
 }
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
@@ -685,6 +689,7 @@ class RecordedTransition:
     offered_count: int | None = None
     selected_offered_rank: int | None = None
     selected_propensity: float | None = None
+    experiment: dict | None = None
 
 
 @dataclass
@@ -838,6 +843,7 @@ class ReplayWorld:
                         if event.get("offered_count") is not None
                         else len(event_candidates)
                     ),
+                    experiment=event.get("experiment"),
                 )
                 transitions.append(tr)
             worlds.append(cls(
@@ -893,6 +899,7 @@ class ReplaySimulator:
         cost_model=None,
         outcome_model=None,
         choice_model=None,
+        collect_proposals: bool = False,
     ) -> ReplayResult:
         estimated = bool(cost_model is not None and getattr(cost_model, "reliable", False))
         summaries = [
@@ -903,6 +910,7 @@ class ReplaySimulator:
                 cost_model=cost_model if estimated else None,
                 outcome_model=outcome_model,
                 choice_model=choice_model,
+                collect_proposals=collect_proposals,
             )
             for world in self.worlds
         ]
@@ -917,11 +925,12 @@ class ReplaySimulator:
         cost_model=None,
         outcome_model=None,
         choice_model=None,
+        collect_proposals: bool = False,
     ):
         summary = self._empty_world(world)
         step_limit = min(policy.max_actions, max_steps or policy.max_actions)
         no_progress = 0
-        for transition in world.trajectory[:step_limit]:
+        for step_index, transition in enumerate(world.trajectory[:step_limit]):
             offered = self._retained_candidates(policy, transition.candidate_actions)
             summary["offered_candidates"] += len(offered)
             if transition.selected_id not in {item["id"] for item in offered}:
@@ -988,9 +997,35 @@ class ReplaySimulator:
                     summary["choice_proposed_change"] += proposal["p_progress"]
                     summary["choice_proposal_uncertainty"] += proposal["uncertainty"]
                     summary["choice_proposal_confident"] += int(proposal["confident"])
-                    summary["choice_divergences"] += int(
-                        proposal["id"] != transition.selected_id
-                    )
+                    divergent = proposal["id"] != transition.selected_id
+                    summary["choice_divergences"] += int(divergent)
+                    if collect_proposals and divergent:
+                        # An experiment candidate: the state, the action the
+                        # recorded policy actually took, and the action the
+                        # prior would substitute. Executing it for real — under
+                        # the same authority plane — is how a counterfactual
+                        # hypothesis becomes signed evidence.
+                        summary["experiment_proposals"].append({
+                            "world": world.key,
+                            "task_key": world.task_key,
+                            "family_key": world.family_key,
+                            "step": step_index,
+                            "state": transition.state,
+                            "historical": {
+                                "id": transition.selected_id,
+                                "kind": transition.selected_kind,
+                                "goal_overlap": selected_overlap,
+                                "offered_rank": offered_rank,
+                                "propensity": transition.selected_propensity,
+                            },
+                            "proposal": proposal,
+                            "selected_prior": {
+                                "p_progress": prediction["p_progress"],
+                                "uncertainty": prediction["uncertainty"],
+                                "confident": prediction["confident"],
+                            },
+                            "expected_delta": proposal["p_progress"] - prediction["p_progress"],
+                        })
             if transition.selected_kind != "wait" and not transition.page_changed:
                 no_progress += 1
             else:
@@ -1105,6 +1140,7 @@ class ReplaySimulator:
             "choice_divergences": 0,
             "choice_proposal_uncertainty": 0.0,
             "choice_proposal_confident": 0,
+            "experiment_proposals": [],
         }
 
     def _aggregate(self, summaries: list[dict], *, estimated: bool = False) -> ReplayMetrics:
@@ -1378,6 +1414,7 @@ class DreamReport:
     cost_model_digest: str | None = None
     outcome_model_digest: str | None = None
     choice_model_digest: str | None = None
+    experiment_proposals: tuple[dict, ...] = ()
 
     def to_dict(self):
         return {
@@ -1406,6 +1443,7 @@ class DreamReport:
             "cost_model_digest": self.cost_model_digest,
             "outcome_model_digest": self.outcome_model_digest,
             "choice_model_digest": self.choice_model_digest,
+            "experiment_proposals": list(self.experiment_proposals),
             "tcb_version": TCB_VERSION,
         }
 
@@ -1478,6 +1516,10 @@ class DreamImprover:
                 sim.evaluate(
                     base, cost_model=cost_model, outcome_model=outcome_model,
                     choice_model=choice_model,
+                    # Experiment proposals come from the baseline evaluation:
+                    # they are "what the prior would test differently under the
+                    # currently deployed behavior", not candidate-policy notes.
+                    collect_proposals=(name == "train"),
                 ) if sim else None
             )
             for name, sim in simulators.items()
@@ -1614,6 +1656,25 @@ class DreamImprover:
                 base_results["holdout"].metrics if base_results["holdout"] else None,
             )
 
+        experiment_proposals = ()
+        if choice_model is not None and base_results["train"] is not None:
+            collected = [
+                proposal
+                for summary in base_results["train"].per_world
+                for proposal in summary.get("experiment_proposals", ())
+            ]
+            # Highest expected-delta hypotheses first, capped: a proposal is a
+            # hypothesis to test under the real authority plane, not a finding.
+            collected.sort(key=lambda p: (-p["expected_delta"], p["world"], p["step"]))
+            stamped = []
+            for proposal in collected[:24]:
+                item = dict(proposal)
+                item["digest"] = _stable_hash(
+                    json.dumps(item, sort_keys=True, separators=(",", ":"))
+                )
+                stamped.append(item)
+            experiment_proposals = tuple(stamped)
+
         return DreamReport(
             selected=selected,
             baseline=base,
@@ -1624,6 +1685,7 @@ class DreamImprover:
             split_manifest_digest=split_digest,
             evidence_head_hash=evidence_head_hash,
             tcb_versions=tcb_versions,
+            experiment_proposals=experiment_proposals,
             cost_model_digest=(cost_model.digest if cost_model is not None and cost_model.samples else None),
             outcome_model_digest=(
                 outcome_model.digest if outcome_model is not None and outcome_model.samples else None
@@ -1723,6 +1785,12 @@ def _canary_run_summaries(
         run_events.sort(key=lambda e: (e.get("sequence", 0), e.get("recorded_at_ms", 0)))
         start = next((e for e in run_events if e.get("event") == "run_started"), None)
         if not start or start.get("policy_digest") != policy_digest:
+            continue
+        # A run that executed an experiment arm is not a clean
+        # policy-performance sample: the deviated step belongs to the
+        # scheduler, not to the policy being qualified. Trials qualify
+        # evidence only through CounterfactualTrials, never promotion.
+        if any(event.get("experiment") for event in run_events):
             continue
         final = next((e for e in reversed(run_events) if e.get("event") == "run_finished"), None)
         # Runs abandoned before a terminal decision are not task outcomes.
@@ -2211,6 +2279,19 @@ class PolicyRegistry:
         # still replays cleanly; defeating that needs an externally anchored
         # latest head, the same residual the evidence anchor carries.
         state_digest = payload.get("state_digest")
+        stripped = (
+            payload.get("schema") == SCHEMA_VERSION
+            or payload.get("state_signature") is not None
+            or payload.get("state_key_id") is not None
+            or payload.get("prev_state_digest") is not None
+        )
+        if state_digest is None and stripped:
+            # Every jev-dream/4 write stamps a state head; its absence — or a
+            # partial strip leaving orphan chain fields — is tampering, not a
+            # legacy file. Without this check an attacker could downgrade a
+            # signed registry to legacy format and edit mutable fields (such as
+            # ``suspended``) that attestations deliberately do not bind.
+            raise ValueError("Policy registry state head is missing or stripped")
         if state_digest is not None:
             if state_digest != self._state_digest(payload):
                 raise ValueError("Policy registry state digest mismatch")
@@ -2230,9 +2311,12 @@ class PolicyRegistry:
                     domain=REGISTRY_STATE_DOMAIN,
                 ):
                     raise ValueError("Policy registry state signature verification failure")
-            elif self.verify_keys:
+            elif self.verify_keys or self.signer is not None:
+                # A configured signer produces signed writes only, so an
+                # unsigned head means the signature was stripped — not that
+                # the writer lacked a key.
                 raise ValueError(
-                    "Unsigned policy registry state while verification keys are configured"
+                    "Unsigned policy registry state while a signing/verification key is configured"
                 )
         payload.setdefault("revision", 0)
         payload.setdefault("active", None)

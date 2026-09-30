@@ -510,3 +510,123 @@ class ChoiceModel:
             global_positive=payload.get("global_positive", 0),
             version=payload.get("version", "jev-choice/1"),
         )
+
+
+@dataclass(frozen=True)
+class CounterfactualTrials:
+    """Propensity-corrected outcome estimates from *executed* experiments.
+
+    The observational ``ChoiceModel`` only ever sees actions the historical
+    policy selected — it cannot say what an unchosen action would have done.
+    Experiment-tagged transitions are different: the scheduler assigned the
+    arm with a recorded ``assignment_probability``, so inverse-propensity
+    weighting turns them into honest counterfactual evidence.
+
+    Each cell is keyed by the *context* the tension arose in — the model
+    choice's ``(kind, overlap_bucket)`` — and holds one estimate per arm:
+    ``candidate`` (the prior's proposal was executed) versus ``control``
+    (the model's own choice was executed). Outcomes use the same
+    verified-progress label as ``ChoiceModel``: intermediate steps count
+    their page change, terminal steps require verifier-confirmed ``done``.
+
+    Estimates annotate reports only; a promising candidate arm still has to
+    qualify through the replay + bound-canary path like everything else.
+    """
+
+    # (context_key, arm, trials, weighted_positive, weight_sum, weight_sq_sum)
+    cells: tuple[tuple[str, str, int, float, float, float], ...] = ()
+    version: str = "jev-trials/1"
+
+    MIN_ESS = 4.0
+
+    @classmethod
+    def fit(cls, events: Iterable[dict]) -> "CounterfactualTrials":
+        acc: dict[tuple[str, str], list[float]] = {}
+        for event, _policy, terminal, verified_done in _transitions(events):
+            meta = event.get("experiment")
+            if not isinstance(meta, dict):
+                continue
+            arm = str(meta.get("arm") or "")
+            propensity = meta.get("assignment_probability")
+            if arm not in {"candidate", "control"}:
+                continue
+            try:
+                propensity = float(propensity)
+            except (TypeError, ValueError):
+                continue
+            if not 0.0 < propensity <= 1.0:
+                continue
+            selected = event.get("selected") or {}
+            overlap = next(
+                (
+                    int(c.get("goal_overlap", 0))
+                    for c in event.get("candidates") or ()
+                    if c.get("id") == selected.get("id")
+                ),
+                0,
+            )
+            context = (
+                f"{str(meta.get('model_choice_kind') or selected.get('kind') or 'unknown')}"
+                f"|{overlap_bucket(overlap)}"
+            )
+            positive = float(
+                bool(verified_done if terminal else event.get("page_changed"))
+            )
+            weight = 1.0 / propensity
+            cell = acc.setdefault((context, arm), [0, 0.0, 0.0, 0.0])
+            cell[0] += 1
+            cell[1] += positive * weight
+            cell[2] += weight
+            cell[3] += weight * weight
+        return cls(
+            cells=tuple(
+                sorted(
+                    (context, arm, n, wpos, wsum, wsq)
+                    for (context, arm), (n, wpos, wsum, wsq) in acc.items()
+                )
+            )
+        )
+
+    def estimate(self, context: str | None = None) -> dict:
+        """Self-normalized IPW estimates per context and arm.
+
+        ``ess`` is the effective sample size — the count of independent
+        observations the weights are worth — so a few high-weight trials
+        cannot masquerade as a confident estimate.
+        """
+        arms: dict[str, dict] = {}
+        for ctx, arm, n, wpos, wsum, wsq in self.cells:
+            if context is not None and ctx != context:
+                continue
+            entry = arms.setdefault(ctx, {})
+            ess = (wsum * wsum / wsq) if wsq else 0.0
+            entry[arm] = {
+                "p_progress": (wpos / wsum) if wsum else 0.0,
+                "trials": n,
+                "ess": ess,
+                "reliable": ess >= self.MIN_ESS,
+            }
+        for entry in arms.values():
+            if "candidate" in entry and "control" in entry:
+                entry["delta"] = (
+                    entry["candidate"]["p_progress"] - entry["control"]["p_progress"]
+                )
+        return arms
+
+    @property
+    def digest(self) -> str:
+        return _stable_hash(json.dumps(asdict(self), sort_keys=True, separators=(",", ":")))
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "CounterfactualTrials":
+        allowed = set(cls.__dataclass_fields__)
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValueError(f"Unknown counterfactual-trials keys: {sorted(unknown)}")
+        return cls(
+            cells=tuple(tuple(c) for c in payload.get("cells", ())),
+            version=payload.get("version", "jev-trials/1"),
+        )

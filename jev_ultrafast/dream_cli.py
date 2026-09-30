@@ -215,6 +215,7 @@ def main(argv=None):
         "world_pool_digest": report.world_pool_digest,
         "evidence_head_hash": report.evidence_head_hash,
         "live_canary_required": report.live_canary_required,
+        "experiment_proposals": len(report.experiment_proposals),
         "staged": bool(staged),
         "report": str(output),
     })

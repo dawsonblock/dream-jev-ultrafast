@@ -125,6 +125,16 @@ The test suite now covers the v0.3 contracts plus:
 - **CostModel identifiability**: `reliable` requires ≥8 samples *and* ≥2 distinct offered counts spanning ≥4 — constant-count evidence cannot look reliable.
 - New events are `jev-dream/4` / `jev-ultrafast-tcb/0.9`. Signed registries written before v0.6.1 fail closed at the first keyed read — the attestation now binds `promotion_revision`/`canary_digest`, which old records never stored; rebuild them by re-promoting under the new schema.
 
+## v0.7.0 counterfactual-experiment coverage
+
+- **Proposal extraction**: divergent `ChoiceModel` annotations on baseline replay worlds are emitted as `DreamReport.experiment_proposals` — stamped hypotheses with expected delta, world/step/action provenance, and the model-predicted counterfactual; they remain annotation, never gate input or evidence.
+- **Payload-bound approval**: `pending_approval`/`granted_approval` now carry `payload_digest` over the exact generated text — a grant is consumed once and an approved fill cannot silently mutate into a different payload; approving the field approves the *value*, not the field type.
+- **Registry downgrade fail-closed**: a `jev-dream/4` registry file missing its state-head material (`state_digest`/`prev_state_digest`/`state_signature`) fails closed on load instead of falling back to the unsigned legacy path — mutable fields like `suspended` can no longer be unprotected by stripping the head. When a signer or verification keys are configured, the head must also verify.
+- **Real trials, one per run**: `Agent(experiment={"model", "rate", "rng"})` executes a divergent proposal (candidate arm) or the model's own choice (control arm) with a recorded `assignment_probability`, at most one deviation per run so outcomes stay attributable; the deviated action passes through the same policy/approval/payload checks as any selection — the experiment hook cannot reach around the authority plane.
+- **Canary exclusion**: transitions carrying an `experiment` block are excluded from `CanaryEvidence` — a trial never counts toward its own promotion; qualification still requires the replay + bound live-canary path.
+- **CounterfactualTrials**: `CounterfactualTrials.fit` produces self-normalized IPW estimates of verified progress per arm with `effective_sample_size`, so thin propensity support surfaces as thin rather than confident; terminal labels keep the verified-progress semantics (terminal transition positive only on `done` + verifier pass).
+- New transitions are `jev-ultrafast-tcb/0.10`: evidence pools that predate experiment semantics never silently mix with trial runs.
+
 ## Deployment gate
 
 Before production activation:

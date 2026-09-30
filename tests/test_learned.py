@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import replace
 
@@ -750,3 +751,152 @@ def test_choice_model_nonterminal_steps_still_count_page_changes():
     # 1 positive of 2 + Beta(1,1) → 2/4 = 0.5
     assert pred["n"] == 2
     assert abs(pred["p_progress"] - 0.5) < 1e-9
+
+
+def _trial(run_id, arm, *, positive=True, propensity=0.5, kind="click", model_kind="click"):
+    """One experiment-tagged transition: an executed arm with a recorded
+    assignment propensity — the denominator honest off-policy weights need."""
+    aid = f"{arm}{run_id}"
+    return {
+        "run_id": run_id,
+        **_transition(selected=aid, page_changed=positive, candidates=[
+            {"id": aid, "kind": kind, "label": "Go", "goal_overlap": 1},
+        ]),
+        "experiment": {
+            "arm": arm,
+            "assignment_probability": propensity,
+            "proposal_id": aid,
+            "proposal_kind": kind,
+            "model_choice_id": f"m{run_id}",
+            "model_choice_kind": model_kind,
+        },
+    }
+
+
+def test_counterfactual_trials_ipw_estimates():
+    """Self-normalized IPW: the rare candidate arm (propensity 0.25) is
+    weighted 4x, the control arm (0.75) 4/3x, and the estimate reflects it."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    events = []
+    for i in range(4):
+        events.append(_trial(f"c{i}", "candidate", positive=i < 3, propensity=0.25))
+        events.append(_trial(f"k{i}", "control", positive=i == 0, propensity=0.75))
+    trials = CounterfactualTrials.fit(events)
+    estimates = trials.estimate()
+    assert set(estimates) == {"click|1"}
+    arms = estimates["click|1"]
+    assert arms["candidate"]["trials"] == 4
+    assert abs(arms["candidate"]["p_progress"] - 0.75) < 1e-9
+    assert arms["control"]["trials"] == 4
+    assert abs(arms["control"]["p_progress"] - 0.25) < 1e-9
+    assert abs(arms["delta"] - 0.5) < 1e-9
+    assert arms["candidate"]["reliable"] and arms["control"]["reliable"]
+
+
+def test_counterfactual_trials_require_recorded_propensity():
+    """No honest weight, no estimate: missing/zero/out-of-range assignment
+    probabilities are skipped rather than guessed."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    bad = []
+    for prop in (None, 0.0, 1.5, "nan"):
+        t = _trial("x", "candidate")
+        t["experiment"]["assignment_probability"] = prop
+        bad.append(t)
+    # Non-experiment transitions never enter trial estimates either.
+    bad.append(_transition(selected="plain", page_changed=True, candidates=[
+        {"id": "plain", "kind": "click", "goal_overlap": 1}]))
+    assert CounterfactualTrials.fit(bad).cells == ()
+
+
+def test_counterfactual_trials_terminal_requires_verified_done():
+    """Experiment outcomes use the same verified-progress label as the prior:
+    a terminal trial counts only when the run ended verifier-confirmed done."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    events = [
+        {"event": "run_started", "run_id": "r1", "task_key": "t",
+         "policy": ExplorationPolicy().to_dict(),
+         "policy_digest": ExplorationPolicy().digest},
+        _trial("r1", "candidate", positive=True, propensity=0.5),
+        # Failed run: the terminal trial is not progress even though the page moved.
+        {"event": "run_finished", "run_id": "r1", "task_key": "t",
+         "status": "blocked", "verified": False},
+        {"event": "run_started", "run_id": "r2", "task_key": "t",
+         "policy": ExplorationPolicy().to_dict(),
+         "policy_digest": ExplorationPolicy().digest},
+        _trial("r2", "candidate", positive=True, propensity=0.5),
+        {"event": "run_finished", "run_id": "r2", "task_key": "t",
+         "status": "done", "verified": True},
+    ]
+    estimates = CounterfactualTrials.fit(events).estimate()
+    arm = estimates["click|1"]["candidate"]
+    assert arm["trials"] == 2
+    assert abs(arm["p_progress"] - 0.5) < 1e-9  # one verified success of two
+
+
+def test_report_collects_experiment_proposals(tmp_path):
+    """Replay surfaces the divergent proposals as stamped experiment
+    hypotheses — hypothesis only, never evidence or a gate input."""
+    from jev_ultrafast.dream import ReplayWorld
+
+    store = tmp_path / "events.jsonl"
+    worlds = _divergent_worlds(store)
+    model = ChoiceModel.fit(
+        [json.loads(line) for line in store.read_text().splitlines() if line.strip()]
+    )
+    report = DreamImprover(gate=PromotionGate(min_coverage=0.0)).improve(
+        worlds, ExplorationPolicy(), choice_model=model)
+    proposals = report.experiment_proposals
+    assert proposals
+    for proposal in proposals:
+        assert proposal["proposal"]["id"] != proposal["historical"]["id"]
+        assert proposal["digest"]
+        assert proposal["expected_delta"] > -1.0
+    # Digest binds the proposal material — stable and content-derived.
+    assert proposals[0]["digest"] == hashlib.sha256(
+        json.dumps(
+            {k: v for k, v in proposals[0].items() if k != "digest"},
+            sort_keys=True, separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    replay_worlds = ReplayWorld.from_events(
+        [json.loads(line) for line in store.read_text().splitlines() if line.strip()]
+    )
+    assert replay_worlds  # proposals stay annotation; replay is unchanged
+
+
+def _divergent_worlds(store_path):
+    """Runs where the recorded policy picked the low-overlap sibling while a
+    goal-relevant action sat in the same offered catalogue — plus evidence
+    that the good action works, so the prior actually prefers it."""
+    events = []
+    policy = ExplorationPolicy().to_dict()
+
+    def run(run_id, selected, positive, status):
+        events.append({"event": "run_started", "run_id": run_id, "task_key": f"t{run_id}",
+                       "policy": policy, "policy_digest": ExplorationPolicy().digest})
+        events.append({
+            "event": "transition", "run_id": run_id, "task_key": f"t{run_id}",
+            "state": "S", "next_state": "S2",
+            "selected": {"id": selected, "kind": "click"},
+            "candidates": [
+                {"id": "low", "kind": "click", "label": "Low", "goal_overlap": 0},
+                {"id": "high", "kind": "click", "label": "Goal", "goal_overlap": 3},
+            ],
+            "page_changed": positive, "latency_ms": 5, "model_calls": 1, "tokens": 1,
+            "stale_or_failure": 0, "risk_events": 0,
+        })
+        events.append({"event": "run_finished", "run_id": run_id, "task_key": f"t{run_id}",
+                       "status": status, "verified": status == "done"})
+
+    # History teaches the prior: goal-relevant clicks make progress.
+    for i in range(4):
+        run(f"good{i}", "high", True, "done")
+    # And picking the irrelevant sibling does not — divergence material.
+    for i in range(6):
+        run(f"bad{i}", "low", False, "blocked")
+    store_path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+    from jev_ultrafast.dream import ReplayWorld
+    return ReplayWorld.from_events(events)

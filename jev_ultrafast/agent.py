@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import inspect
+import json
+import random
 import time
 from pathlib import Path
 
@@ -34,6 +37,7 @@ class Agent:
         run_id=None,
         task_family=None,
         instance_id=None,
+        experiment=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -51,6 +55,12 @@ class Agent:
             )
             exploration_policy = registry.active_policy()
         self.exploration_policy = exploration_policy or ExplorationPolicy()
+        # Optional on-policy experiment config: {"model": ChoiceModel,
+        # "rate": ε, "rng": random.Random(...)}. When set, eligible steps
+        # execute the prior's divergent proposal — or the model's own choice
+        # as the control arm — with a recorded assignment probability. At most
+        # one trial per run so outcomes stay attributable.
+        self.experiment = experiment
         if isinstance(dream_store, (str, Path)):
             dream_store = ExperienceStore(dream_store)
         self.dream_recorder = (
@@ -88,6 +98,7 @@ class Agent:
             record=bool(self.record_dir),
             pending_approval=None,
             granted_approval=None,
+            experiment_spent=False,
             verification=None,
             verification_failures=[],
             verified=False,
@@ -220,6 +231,10 @@ class Agent:
             state["granted_approval"] = {
                 "action_id": pending["action"]["id"],
                 "fingerprint": pending["fingerprint"],
+                # One-shot authority bound to the exact payload reviewed: for a
+                # TYPE_TEXT fill the grant covers only the generated text that
+                # was pending, never whatever a regenerated helper would emit.
+                "payload_digest": pending.get("payload_digest"),
             }
             state["decision"] = pending["decision"]
             state["status"] = "predicted"
@@ -298,6 +313,58 @@ class Agent:
             if action is None:
                 state["status"] = "ready"
                 raise StalePage("Selected action is no longer present. Observe again.")
+
+            experiment_meta = None
+            experiment = getattr(self, "experiment", None)
+            if experiment is not None and not state.get("experiment_spent"):
+                # On-policy counterfactual trial: when the fitted choice prior
+                # prefers a different *offered* action than the model picked,
+                # the scheduler assigns an arm with a recorded probability and
+                # executes it for real. The executed action still passes
+                # through every authority check below — a trial can never
+                # bypass policy assessment, approval, or payload review.
+                trial_model = experiment.get("model")
+                rate = float(experiment.get("rate", 0.0) or 0.0)
+                if trial_model is not None and 0.0 < rate <= 1.0:
+                    offered_now, _ = candidate_actions(
+                        page["actions"], state["goal"],
+                        exploration_policy=getattr(self, "exploration_policy", None),
+                    )
+                    proposal = trial_model.choose(offered_now)
+                    if proposal is not None and proposal["id"] != selected and any(
+                        a["id"] == proposal["id"] for a in page["actions"]
+                    ):
+                        state["experiment_spent"] = True
+                        rng = experiment.get("rng")
+                        roll = (rng.random() if rng is not None else random.random())
+                        arm = "candidate" if roll < rate else "control"
+                        experiment_meta = {
+                            "arm": arm,
+                            "assignment_probability": (
+                                rate if arm == "candidate" else 1.0 - rate
+                            ),
+                            "proposal_id": proposal["id"],
+                            "proposal_kind": proposal.get("kind"),
+                            "model_choice_id": selected,
+                            "model_choice_kind": action.get("kind"),
+                            "proposal_digest": hashlib.sha256(
+                                json.dumps(
+                                    {
+                                        "state": page.get("fingerprint"),
+                                        "model_choice_id": selected,
+                                        "proposal_id": proposal["id"],
+                                    },
+                                    sort_keys=True,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        if arm == "candidate":
+                            selected = proposal["id"]
+                            action = next(
+                                a for a in page["actions"] if a["id"] == selected
+                            )
+
             browser_actions = [h for h in state["history"] if h.get("kind") not in {"verification", "approval"}]
             max_actions = getattr(getattr(self, "exploration_policy", None), "max_actions", MAX_STEPS)
             if len(browser_actions) >= max_actions:
@@ -306,7 +373,7 @@ class Agent:
                     self.dream_recorder.finish(status="blocked", verified=False)
                 raise ValueError(f"Stopped at the {max_actions}-action budget")
 
-            approval_consumed = False
+            policy_result = None
             if getattr(self, "policy", None):
                 policy_result = self.policy.assess(action, page=page, goal=state["goal"])
                 if policy_result.level == "deny":
@@ -320,35 +387,15 @@ class Agent:
                         )
                         self.dream_recorder.finish(status="blocked", verified=False)
                     raise ValueError(f"Action denied by policy: {policy_result.reason}")
-                if policy_result.level == "require_approval":
-                    granted = state.pop("granted_approval", None)
-                    approval_consumed = bool(
-                        granted
-                        and granted.get("action_id") == action["id"]
-                        and granted.get("fingerprint") == page["fingerprint"]
-                    )
-                    if not approval_consumed:
-                        state["pending_approval"] = {
-                            "decision": decision,
-                            "action": action,
-                            "fingerprint": page["fingerprint"],
-                            "reason": policy_result.reason,
-                        }
-                        state["status"] = "approval_required"
-                        state["elapsed_ms"] = self._elapsed()
-                        if getattr(self, "dream_recorder", None):
-                            self.dream_recorder.event(
-                                "approval_required",
-                                state=page.get("fingerprint"),
-                                selected=action.get("id"),
-                                reason=policy_result.reason,
-                            )
-                        return self.snapshot()
 
             text, helper = None, None
             if action["kind"] == "fill":
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
+                # The payload is generated *before* the approval decision: the
+                # granted authority binds the exact text being inserted, so an
+                # operator approving "fill field X" cannot silently authorize a
+                # payload nobody reviewed.
                 context = field_context(state["goal"], action, page, state["history"])
                 if self.pending_text and self.pending_text[0] == context:
                     _, text, helper = self.pending_text
@@ -357,48 +404,64 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
 
-            if text is not None and getattr(self, "policy", None):
-                # The first authority pass ran on page-supplied target metadata,
-                # which a hostile page controls. The generated payload is a
-                # second, independent signal: a card number or credential typed
-                # into a field that claimed to be plain text escalates the fill.
-                # The stricter of target effect and payload effect applies.
-                payload_result = assess_payload(text)
-                if payload_result.level == "deny":
-                    state["status"] = "blocked"
-                    if getattr(self, "dream_recorder", None):
-                        self.dream_recorder.event(
-                            "policy_denied",
-                            state=page.get("fingerprint"),
-                            selected=action.get("id"),
-                            reason=payload_result.reason,
-                        )
-                        self.dream_recorder.finish(status="blocked", verified=False)
-                    raise ValueError(f"Action denied by policy: {payload_result.reason}")
-                if payload_result.level != "allow" and not approval_consumed:
-                    granted = state.pop("granted_approval", None)
-                    approval_consumed = bool(
-                        granted
-                        and granted.get("action_id") == action["id"]
-                        and granted.get("fingerprint") == page["fingerprint"]
-                    )
-                    if not approval_consumed:
-                        state["pending_approval"] = {
-                            "decision": decision,
-                            "action": action,
-                            "fingerprint": page["fingerprint"],
-                            "reason": payload_result.reason,
-                        }
-                        state["status"] = "approval_required"
-                        state["elapsed_ms"] = self._elapsed()
+            payload_result = None
+            payload_digest = None
+            if text is not None:
+                payload_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                if getattr(self, "policy", None):
+                    # The target pass ran on page-supplied metadata, which a
+                    # hostile page controls. The generated payload is a second,
+                    # independent signal: a card number or credential typed into
+                    # a field that claimed to be plain text escalates the fill.
+                    payload_result = assess_payload(text)
+                    if payload_result.level == "deny":
+                        state["status"] = "blocked"
                         if getattr(self, "dream_recorder", None):
                             self.dream_recorder.event(
-                                "approval_required",
+                                "policy_denied",
                                 state=page.get("fingerprint"),
                                 selected=action.get("id"),
                                 reason=payload_result.reason,
                             )
-                        return self.snapshot()
+                            self.dream_recorder.finish(status="blocked", verified=False)
+                        raise ValueError(f"Action denied by policy: {payload_result.reason}")
+
+            approval_consumed = False
+            requires_approval = (
+                (policy_result is not None and policy_result.level == "require_approval")
+                or (payload_result is not None and payload_result.level == "require_approval")
+            )
+            if requires_approval:
+                granted = state.pop("granted_approval", None)
+                approval_consumed = bool(
+                    granted
+                    and granted.get("action_id") == action["id"]
+                    and granted.get("fingerprint") == page["fingerprint"]
+                    and granted.get("payload_digest") == payload_digest
+                )
+                if not approval_consumed:
+                    reason = (
+                        payload_result.reason
+                        if payload_result is not None and payload_result.level == "require_approval"
+                        else policy_result.reason
+                    )
+                    state["pending_approval"] = {
+                        "decision": decision,
+                        "action": action,
+                        "fingerprint": page["fingerprint"],
+                        "payload_digest": payload_digest,
+                        "reason": reason,
+                    }
+                    state["status"] = "approval_required"
+                    state["elapsed_ms"] = self._elapsed()
+                    if getattr(self, "dream_recorder", None):
+                        self.dream_recorder.event(
+                            "approval_required",
+                            state=page.get("fingerprint"),
+                            selected=action.get("id"),
+                            reason=reason,
+                        )
+                    return self.snapshot()
 
             observed_candidates = offered_candidates = None
             if getattr(self, "dream_recorder", None):
@@ -420,7 +483,7 @@ class Agent:
                     "action": action["label"],
                     "kind": action["kind"],
                     "choice": selected,
-                    "probability": decision["probabilities"][selected],
+                    "probability": decision["probabilities"].get(selected),
                     "confidence": decision["confidence"],
                     "latency_ms": decision["latency_ms"],
                     "text": text,
@@ -456,6 +519,7 @@ class Agent:
                     offered=offered_candidates,
                     helper=helper,
                     risk_events=int(approval_consumed),
+                    experiment=experiment_meta,
                 )
             browser_history = [h for h in state["history"] if h.get("kind") not in {"verification", "approval"}]
             no_progress_window = getattr(getattr(self, "exploration_policy", None), "no_progress_window", 3)

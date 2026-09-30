@@ -545,3 +545,144 @@ def test_model_boundaries_redact_history_text(monkeypatch):
     context = model.field_context("Send the mail", page()["actions"][0], page(), history)
     assert context["recent_actions"][0]["text"] == "[REDACTED_EMAIL]"
     assert "private@example.com" not in json.dumps(context["recent_actions"])
+
+
+def test_approval_grant_is_bound_to_the_pending_payload(runner, monkeypatch):
+    """The grant covers the exact text that was pending — the operator approved
+    this payload, not whatever a regenerated helper might later produce."""
+    import hashlib
+
+    from jev_ultrafast.policy import DefaultActionPolicy
+
+    runner.policy = DefaultActionPolicy()
+    p = runner.state["page"]
+    p["actions"][0]["label"] = "Credit card number"  # target alone escalates
+    p["fingerprint"] = fingerprint(p)
+    text = "4111 1111 1111 1111"
+    monkeypatch.setattr(loop, "field_context", Mock(return_value={"goal": "x"}))
+    monkeypatch.setattr(
+        loop, "field_text", Mock(return_value=(text, {"model": "t", "latency_ms": 1}))
+    )
+    state = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "approval_required"
+    assert state["pending_approval"]["payload_digest"] == hashlib.sha256(
+        text.encode("utf-8")
+    ).hexdigest()
+    runner.command("approve")
+    assert runner.state.get("granted_approval") is None  # consumed once
+    act_call = runner.state["browser"].act.call_args
+    assert act_call.args[0]["id"] == "e1"
+    assert act_call.kwargs["text"] == text
+
+
+def test_approval_grant_does_not_cover_a_changed_payload(runner, monkeypatch):
+    """A grant minted for payload A cannot execute regenerated payload B — a
+    stale or shifted helper context forces a fresh approval round."""
+    from jev_ultrafast.policy import DefaultActionPolicy
+
+    runner.policy = DefaultActionPolicy()
+    p = runner.state["page"]
+    p["actions"][0]["label"] = "Credit card number"
+    p["fingerprint"] = fingerprint(p)
+    monkeypatch.setattr(loop, "field_context", Mock(return_value={"goal": "x"}))
+    monkeypatch.setattr(
+        loop, "field_text", Mock(return_value=("4111 1111 1111 1111", {"model": "t"}))
+    )
+    state = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "approval_required"
+    # Forge a grant bound to a different payload: it must not be consumed.
+    runner.state["granted_approval"] = {
+        "action_id": "e1",
+        "fingerprint": p["fingerprint"],
+        "payload_digest": "0" * 64,
+    }
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+    again = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert again["status"] == "approval_required"
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_experiment_candidate_arm_executes_the_proposal(runner, monkeypatch, tmp_path):
+    """The scheduler deviates to the prior's proposal and records the arm,
+    the assignment propensity, and the model choice it deviated from."""
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    proposal_model = Mock()
+    proposal_model.choose = Mock(return_value={"id": "e3", "kind": "click"})
+    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.state["decision"] = decision("e1")  # the model picked the fill
+    runner.state["status"] = "predicted"
+    p = runner.state["page"]
+    state = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "ready"
+    assert runner.state["browser"].act.call_count == 1
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e3"
+    assert runner.state["history"][-1]["action"] == "Go"
+    trial = next(e for e in store.load() if e["event"] == "transition")
+    assert trial["experiment"]["arm"] == "candidate"
+    assert trial["experiment"]["assignment_probability"] == 1.0
+    assert trial["experiment"]["model_choice_id"] == "e1"
+    assert trial["experiment"]["proposal_id"] == "e3"
+    assert trial["experiment"]["proposal_digest"]
+    assert trial["selected"]["id"] == "e3"  # executed action is the record
+
+
+def test_experiment_control_arm_executes_the_model_choice(runner, monkeypatch):
+    proposal_model = Mock()
+    proposal_model.choose = Mock(return_value={"id": "e3", "kind": "click"})
+    rng = Mock()
+    rng.random = Mock(return_value=0.9)  # above rate → control arm
+    runner.experiment = {"model": proposal_model, "rate": 0.5, "rng": rng}
+    monkeypatch.setattr(
+        loop, "field_text", Mock(return_value=("book", {"model": "t", "latency_ms": 1}))
+    )
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+    p = runner.state["page"]
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
+    assert runner.state["history"][-1]["action"] == "Search"
+
+
+def test_experiment_deviation_never_bypasses_authority(runner):
+    """A trial that substitutes a high-authority action still pauses for
+    approval — the experiment layer has no authority of its own."""
+    from jev_ultrafast.policy import DefaultActionPolicy
+
+    runner.policy = DefaultActionPolicy()
+    p = runner.state["page"]
+    p["actions"].append(
+        {"id": "buy", "kind": "click", "label": "Buy now", "role": "button", "node": 30}
+    )
+    p["fingerprint"] = fingerprint(p)
+    proposal_model = Mock()
+    proposal_model.choose = Mock(return_value={"id": "buy", "kind": "click"})
+    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+    state = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "approval_required"
+    assert state["pending_approval"]["action"]["id"] == "buy"
+    runner.state["browser"].act.assert_not_called()
+
+
+def test_experiment_only_assigns_one_trial_per_run(runner):
+    proposal_model = Mock()
+    proposal_model.choose = Mock(return_value={"id": "e3", "kind": "click"})
+    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    p = runner.state["page"]
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["experiment_spent"] is True
+    # A later step is not deviated even though a proposal still exists.
+    proposal_model.choose.reset_mock()
+    runner.state["decision"] = decision("e3")
+    runner.state["status"] = "predicted"
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    proposal_model.choose.assert_not_called()

@@ -1414,3 +1414,104 @@ def test_rollback_attestation_chains_to_the_replaced_head(tmp_path):
     assert target["attestation"]["registry_revision"] == target["promotion_revision"]
     reader = PolicyRegistry(tmp_path / "signed-policy.json", verify_keys={signer.key_id})
     assert reader.active_policy().digest == report.selected.digest
+
+
+def test_registry_state_head_cannot_be_stripped_to_legacy(tmp_path):
+    """Removing every state-head field must not downgrade a jev-dream/4 file
+    to legacy format: the schema version itself promises the head exists."""
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"x" * 32)
+    _signed_registry(tmp_path, signer, verify_keys={signer.key_id})
+    path = tmp_path / "signed-policy.json"
+    payload = json.loads(path.read_text())
+    for key in ("state_digest", "state_signature", "state_key_id", "prev_state_digest"):
+        payload.pop(key, None)
+    path.write_text(json.dumps(payload))
+    # Fails closed with keys, with only a signer, and with no keys at all —
+    # a current-schema file without its head is tampered, not legacy.
+    with pytest.raises(ValueError, match="state head"):
+        PolicyRegistry(path, verify_keys={signer.key_id}).load()
+    with pytest.raises(ValueError, match="state head"):
+        PolicyRegistry(path, signer=signer).load()
+    with pytest.raises(ValueError, match="state head"):
+        PolicyRegistry(path).load()
+
+
+def test_registry_orphaned_state_fields_are_rejected(tmp_path):
+    """A partial strip that leaves signature fields behind is also evidence
+    of tampering, even on a legacy-schema payload."""
+    worlds = _efficiency_world(tmp_path)
+    registry = PolicyRegistry(tmp_path / "orphan.json")
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds, ExplorationPolicy())
+    registry.stage(report)
+    path = tmp_path / "orphan.json"
+    payload = json.loads(path.read_text())
+    payload["state_digest"] = None and payload.pop("state_digest")
+    payload["state_signature"] = "00" * 64  # orphan field without the head
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="state head"):
+        PolicyRegistry(path).load()
+
+
+def test_registry_signature_strip_fails_under_a_signer(tmp_path):
+    """A configured signer only ever produces signed writes, so a missing
+    state signature is a strip — even when no verification keys are set."""
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"y" * 32)
+    _signed_registry(tmp_path, signer)
+    path = tmp_path / "signed-policy.json"
+    payload = json.loads(path.read_text())
+    payload.pop("state_signature")
+    payload.pop("state_key_id")
+    path.write_text(json.dumps(payload))
+    # The digest still covers everything else, so only the unsigned-under-
+    # signer check can catch this.
+    with pytest.raises(ValueError, match="Unsigned policy registry state"):
+        PolicyRegistry(path, signer=signer).load()
+
+
+def test_registry_legacy_schema_without_state_head_still_loads(tmp_path):
+    """Pre-0.7 files predate the state head entirely; compat mode is honest
+    because their own schema declares it."""
+    path = tmp_path / "legacy.json"
+    legacy = {
+        "schema": "jev-dream/3",
+        "tcb_version": "jev-ultrafast-tcb/0.8",
+        "revision": 3,
+        "active": None,
+        "staged": None,
+        "history": [],
+    }
+    path.write_text(json.dumps(legacy))
+    payload = PolicyRegistry(path).load()
+    assert payload["revision"] == 3
+    assert payload["active"] is None
+
+
+def test_experiment_runs_are_excluded_from_canary_metrics(tmp_path):
+    """A run carrying an assigned experiment arm is not a clean
+    policy-performance sample; it must not qualify or disqualify a policy."""
+    baseline = ExplorationPolicy()
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    transition = _single_transition()
+    _append_run(store, "clean-1", "book a flight", transition,
+                status="done", verified=True, policy=baseline)
+    experiment_transition = {
+        **_single_transition()[0],
+        "experiment": {
+            "arm": "candidate",
+            "assignment_probability": 0.25,
+            "proposal_id": "b",
+            "proposal_kind": "click",
+            "model_choice_id": "a",
+            "model_choice_kind": "click",
+        },
+    }
+    _append_run(store, "trial-1", "book a flight", [experiment_transition],
+                status="done", verified=True, policy=baseline)
+    metrics = CanaryMetrics.from_events(store.load(), baseline.digest)
+    assert metrics.tasks == 1
+    assert metrics.run_ids == ("clean-1",)
