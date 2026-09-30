@@ -398,13 +398,15 @@ class Agent:
             yield self.command("tick")
 
     def close(self):
-        if getattr(self, "dream_recorder", None) and not self.dream_recorder.finished:
-            status = self.state.get("status", "closed")
-            self.dream_recorder.finish(
-                status=status if status in TERMINAL_STATUSES else "aborted",
-                verified=self.state.get("verified", False),
-            )
-        self.browser.close()
+        try:
+            if getattr(self, "dream_recorder", None) and not self.dream_recorder.finished:
+                status = self.state.get("status", "closed")
+                self.dream_recorder.finish(
+                    status=status if status in TERMINAL_STATUSES else "aborted",
+                    verified=self.state.get("verified", False),
+                )
+        finally:
+            self.browser.close()
 
     def __enter__(self):
         return self

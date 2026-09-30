@@ -186,9 +186,13 @@ class Browser:
         return result
 
     def close(self):
+        # Best-effort teardown: a dead daemon must not mask the error that
+        # triggered cleanup or leak through __exit__/__init__ failure paths.
         if self.target:
             try:
                 cdp("Target.closeTarget", targetId=self.target)
+            except Exception:
+                pass
             finally:
                 self.target = None
                 self.session = None
@@ -262,7 +266,7 @@ def browser_operation(request):
                       return {error:'unsupported-select'};
                     const o=e.options[action.option_index];
                     if (!o || o.disabled || o.closest('optgroup[disabled]') ||
-                        String(o.value).replace(/\s+/g,' ').trim().slice(0,512)!==String(action.value) ||
+                        String(o.value).replace(/\\s+/g,' ').trim().slice(0,512)!==String(action.value) ||
                         String(o.label).replace(/\\s+/g,' ').trim().slice(0,256)!==String(action.option_label))
                       return {error:'stale-option'};
                     e.selectedIndex=action.option_index;

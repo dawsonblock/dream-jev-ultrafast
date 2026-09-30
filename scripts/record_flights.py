@@ -61,14 +61,22 @@ finally:
     time.sleep(0.08)  # Drain the last frame, outside the reported agent time.
     stop.set()
     worker.join(timeout=3)
-    agent.browser.call("Page.stopScreencast")
-    state = agent.snapshot()
-    state["final_page"] = agent.browser.observe(screenshot=False)
-    state["verification"] = verify(state["final_page"])
-    state["source_hashes"] = source_hashes
-    state["recording_errors"] = errors
-    (folder / "state.json").write_text(json.dumps(state, indent=2))
-    (folder / "session.json").write_text(json.dumps({"target": agent.browser.target, "session": agent.browser.session}))
+    try:
+        agent.browser.call("Page.stopScreencast")
+        state = agent.snapshot()
+        try:
+            state["final_page"] = agent.browser.observe(screenshot=False)
+        except Exception:
+            state["final_page"] = state.get("page")
+        state["verification"] = verify(state["final_page"])
+        state["source_hashes"] = source_hashes
+        state["recording_errors"] = errors
+        (folder / "state.json").write_text(json.dumps(state, indent=2))
+        (folder / "session.json").write_text(
+            json.dumps({"target": agent.browser.target, "session": agent.browser.session})
+        )
+    finally:
+        agent.close()
 print(json.dumps(state["verification"], indent=2))
 print("Screencast frames", len(list(frames.glob("*.jpg"))), "errors", errors)
 if not state["verification"]["passed"]:

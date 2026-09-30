@@ -297,6 +297,17 @@ def test_fresh_treats_unreachable_guard_as_stale():
     assert b.fresh(page, {"kind": "click", "node": 0}) is False
 
 
+def test_close_best_effort_when_daemon_gone(monkeypatch):
+    """close() runs inside __exit__ and __init__ failure paths; a dead daemon
+    must not mask the original error or leak the target."""
+    b = browser.Browser.__new__(browser.Browser)
+    b.target, b.session = "t1", "s1"
+    b.world_context, b.world_frame = 7, "f"
+    monkeypatch.setattr(browser, "cdp", Mock(side_effect=RuntimeError("daemon gone")))
+    b.close()  # must not raise
+    assert (b.target, b.session, b.world_context, b.world_frame) == (None, None, None, None)
+
+
 def test_select_guard_normalizes_option_value_like_snapshot():
     """snapshot.js records clip(o.value): whitespace-normalized. The guarded
     select must apply identical normalization or a value with irregular

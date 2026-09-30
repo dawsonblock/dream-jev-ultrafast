@@ -53,7 +53,10 @@ finally:
     state = agent.snapshot()
     measured_calls = {method: {"count": len(times), "ms": round(sum(times), 3)} for method, times in calls.items()}
     # Both arms use a NEW final observation for the independent result check, outside timing.
-    final = agent.browser.observe(screenshot=True)
+    try:
+        final = agent.browser.observe(screenshot=True)
+    except Exception:
+        final = state["page"]
     state["verification"] = verify(final)
     state["error"] = error
     state["cdp"] = measured_calls

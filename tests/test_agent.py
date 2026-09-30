@@ -375,3 +375,22 @@ def test_close_preserves_terminal_status(tmp_path):
     a.browser = Mock()
     a.close()
     assert store.load()[-1]["status"] == "done"
+
+
+def test_close_releases_browser_when_finish_fails(tmp_path):
+    """A failing run_finished append must not orphan the browser target."""
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "fail.jsonl")
+    a = loop.Agent.__new__(loop.Agent)
+    recorder = DreamTraceRecorder(store, goal="Find a book")
+    recorder.start({"fingerprint": "A", "url": "https://example.test"}, ExplorationPolicy())
+    a.dream_recorder = Mock(wraps=recorder)
+    a.dream_recorder.finished = False
+    a.dream_recorder.finish.side_effect = RuntimeError("store full")
+    a.state = {"status": "ready", "verified": False}
+    a.browser = Mock()
+    with pytest.raises(RuntimeError, match="store full"):
+        a.close()
+    a.browser.close.assert_called_once()
