@@ -1438,6 +1438,36 @@ def test_registry_state_head_cannot_be_stripped_to_legacy(tmp_path):
         PolicyRegistry(path).load()
 
 
+def test_registry_schema_downgrade_cannot_launder_a_stripped_head(tmp_path):
+    """Stripping the head AND flipping schema to jev-dream/3 must still fail
+    closed under configured trust keys — otherwise the downgrade un-binds
+    mutable fields (``suspended``) under a still-valid attestation."""
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"z" * 32)
+    registry, _report, _active = _signed_registry(
+        tmp_path, signer, verify_keys={signer.key_id})
+    registry.suspend("drift detected")
+    path = tmp_path / "signed-policy.json"
+    payload = json.loads(path.read_text())
+    assert payload["active"]["suspended"] is True
+    for key in ("state_digest", "state_signature", "state_key_id", "prev_state_digest"):
+        payload.pop(key, None)
+    payload["schema"] = "jev-dream/3"  # the field `stripped` keys on
+    payload["active"]["suspended"] = False  # the edit the attacker wants
+    payload["active"].pop("suspend_attestation", None)
+    payload["active"].pop("suspended_at_ms", None)
+    path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="state head"):
+        PolicyRegistry(path, verify_keys={signer.key_id}).load()
+    with pytest.raises(ValueError, match="state head"):
+        PolicyRegistry(path, signer=signer).load()
+    # With no trust keys at all the file is unsigned data either way — legacy
+    # compat stays honest, the downgrade gains the attacker nothing.
+    assert PolicyRegistry(path).load()["active"]["suspended"] is False
+
+
 def test_registry_orphaned_state_fields_are_rejected(tmp_path):
     """A partial strip that leaves signature fields behind is also evidence
     of tampering, even on a legacy-schema payload."""

@@ -753,21 +753,30 @@ def test_choice_model_nonterminal_steps_still_count_page_changes():
     assert abs(pred["p_progress"] - 0.5) < 1e-9
 
 
-def _trial(run_id, arm, *, positive=True, propensity=0.5, kind="click", model_kind="click"):
+def _trial(run_id, arm, *, positive=True, propensity=0.5, kind="click", model_kind="click",
+           overlap=1, model_overlap=0):
     """One experiment-tagged transition: an executed arm with a recorded
-    assignment propensity — the denominator honest off-policy weights need."""
-    aid = f"{arm}{run_id}"
+    assignment propensity — the denominator honest off-policy weights need.
+    The model choice stays in the candidate catalogue (it was an offered
+    action), so both arms of a divergence share its context cell."""
+    proposal_id = f"p{run_id}"
+    model_id = f"m{run_id}"
     return {
         "run_id": run_id,
-        **_transition(selected=aid, page_changed=positive, candidates=[
-            {"id": aid, "kind": kind, "label": "Go", "goal_overlap": 1},
-        ]),
+        **_transition(
+            selected=proposal_id if arm == "candidate" else model_id,
+            page_changed=positive,
+            candidates=[
+                {"id": proposal_id, "kind": kind, "label": "Go", "goal_overlap": overlap},
+                {"id": model_id, "kind": model_kind, "label": "M", "goal_overlap": model_overlap},
+            ],
+        ),
         "experiment": {
             "arm": arm,
             "assignment_probability": propensity,
-            "proposal_id": aid,
+            "proposal_id": proposal_id,
             "proposal_kind": kind,
-            "model_choice_id": f"m{run_id}",
+            "model_choice_id": model_id,
             "model_choice_kind": model_kind,
         },
     }
@@ -784,13 +793,16 @@ def test_counterfactual_trials_ipw_estimates():
         events.append(_trial(f"k{i}", "control", positive=i == 0, propensity=0.75))
     trials = CounterfactualTrials.fit(events)
     estimates = trials.estimate()
-    assert set(estimates) == {"click|1"}
-    arms = estimates["click|1"]
+    # Context keys on the model choice's features (overlap 0), not the
+    # executed arm's — otherwise the two arms would land in different cells.
+    assert set(estimates) == {"click|0"}
+    arms = estimates["click|0"]
     assert arms["candidate"]["trials"] == 4
     assert abs(arms["candidate"]["p_progress"] - 0.75) < 1e-9
     assert arms["control"]["trials"] == 4
     assert abs(arms["control"]["p_progress"] - 0.25) < 1e-9
     assert abs(arms["delta"] - 0.5) < 1e-9
+    assert arms["delta_reliable"] is True
     assert arms["candidate"]["reliable"] and arms["control"]["reliable"]
 
 
@@ -831,9 +843,24 @@ def test_counterfactual_trials_terminal_requires_verified_done():
          "status": "done", "verified": True},
     ]
     estimates = CounterfactualTrials.fit(events).estimate()
-    arm = estimates["click|1"]["candidate"]
+    arm = estimates["click|0"]["candidate"]
     assert arm["trials"] == 2
     assert abs(arm["p_progress"] - 0.5) < 1e-9  # one verified success of two
+
+
+def test_counterfactual_trials_context_is_arm_independent():
+    """The two arms of one divergence share the model choice's context cell —
+    keying on the executed action would compare different populations."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    # Same divergence point: the prior proposed a high-overlap action over the
+    # model's overlap-0 choice. Both arms must land in the model choice's cell.
+    events = [_trial("x", "candidate"), _trial("x", "control")]
+    estimates = CounterfactualTrials.fit(events).estimate()
+    assert set(estimates) == {"click|0"}
+    entry = estimates["click|0"]
+    assert set(entry["candidate"]) and set(entry["control"])
+    assert "delta" in entry
 
 
 def test_report_collects_experiment_proposals(tmp_path):

@@ -2285,12 +2285,16 @@ class PolicyRegistry:
             or payload.get("state_key_id") is not None
             or payload.get("prev_state_digest") is not None
         )
-        if state_digest is None and stripped:
+        if state_digest is None and (stripped or self.verify_keys or self.signer is not None):
             # Every jev-dream/4 write stamps a state head; its absence — or a
             # partial strip leaving orphan chain fields — is tampering, not a
-            # legacy file. Without this check an attacker could downgrade a
-            # signed registry to legacy format and edit mutable fields (such as
-            # ``suspended``) that attestations deliberately do not bind.
+            # legacy file. And under configured trust keys a headless file can
+            # never prove lineage: downgrading the schema field itself to
+            # jev-dream/3 must not launder a stripped signed registry into a
+            # "legacy" one whose mutable fields (``suspended``) attestations
+            # deliberately leave unbound. Genuine pre-/4 files carry no
+            # attestations and were already unloadable under keys; re-anchor
+            # them by loading without keys and letting a trusted write restamp.
             raise ValueError("Policy registry state head is missing or stripped")
         if state_digest is not None:
             if state_digest != self._state_digest(payload):

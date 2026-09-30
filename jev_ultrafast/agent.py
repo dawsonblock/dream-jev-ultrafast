@@ -14,6 +14,7 @@ from .browser import Browser, StalePage
 from .dream import ExperienceStore, ExplorationPolicy, PolicyRegistry
 from .model import action_space, candidate_actions, choose, field_context, field_text
 from .policy import DefaultActionPolicy, assess_payload
+from .privacy import action_goal_overlap, tokenize
 from .questions import MAX_STEPS
 from .trace import DreamTraceRecorder
 
@@ -59,7 +60,19 @@ class Agent:
         # "rate": ε, "rng": random.Random(...)}. When set, eligible steps
         # execute the prior's divergent proposal — or the model's own choice
         # as the control arm — with a recorded assignment probability. At most
-        # one trial per run so outcomes stay attributable.
+        # one trial per run so outcomes stay attributable. Validated here so a
+        # malformed config fails before the browser starts, not mid-run.
+        if experiment is not None:
+            if not isinstance(experiment, dict):
+                raise ValueError("experiment must be a config dict")
+            try:
+                rate = float(experiment.get("rate", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                raise ValueError("experiment rate must be a number") from None
+            if not 0.0 < rate <= 1.0:
+                raise ValueError("experiment rate must be in (0, 1]")
+            if experiment.get("model") is None:
+                raise ValueError("experiment requires a fitted model")
         self.experiment = experiment
         if isinstance(dream_store, (str, Path)):
             dream_store = ExperienceStore(dream_store)
@@ -99,6 +112,7 @@ class Agent:
             pending_approval=None,
             granted_approval=None,
             experiment_spent=False,
+            experiment_assignment=None,
             verification=None,
             verification_failures=[],
             verified=False,
@@ -195,7 +209,10 @@ class Agent:
             state["decision"] = None
             # A spent or orphaned approval grant never survives into a fresh
             # decision; only approve() can create one, bound to one act() call.
+            # The same goes for a trial assignment left over from an approval
+            # that never executed — it dies with the decision it belonged to.
             state["granted_approval"] = None
+            state["experiment_assignment"] = None
             if state["status"] in TERMINAL_STATUSES:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if state["status"] == "approval_required":
@@ -236,7 +253,14 @@ class Agent:
                 # was pending, never whatever a regenerated helper would emit.
                 "payload_digest": pending.get("payload_digest"),
             }
-            state["decision"] = pending["decision"]
+            # Execute the action that was actually presented for approval — for
+            # an experiment-deviated step that is the proposal, not the model's
+            # original decision choice, which act() would otherwise re-derive.
+            state["decision"] = {
+                **pending["decision"],
+                "choice": pending["action"]["id"],
+            }
+            state["experiment_assignment"] = pending.get("experiment")
             state["status"] = "predicted"
             return self.command("act", {"fingerprint": pending["fingerprint"]})
 
@@ -314,9 +338,12 @@ class Agent:
                 state["status"] = "ready"
                 raise StalePage("Selected action is no longer present. Observe again.")
 
-            experiment_meta = None
+            # A trial assigned before an approval pause resumes with its arm —
+            # approve() restores it so the executed action and its provenance
+            # survive the round trip instead of silently reverting.
+            experiment_meta = state.pop("experiment_assignment", None)
             experiment = getattr(self, "experiment", None)
-            if experiment is not None and not state.get("experiment_spent"):
+            if experiment_meta is None and experiment is not None and not state.get("experiment_spent"):
                 # On-policy counterfactual trial: when the fitted choice prior
                 # prefers a different *offered* action than the model picked,
                 # the scheduler assigns an arm with a recorded probability and
@@ -330,6 +357,15 @@ class Agent:
                         page["actions"], state["goal"],
                         exploration_policy=getattr(self, "exploration_policy", None),
                     )
+                    # The prior was trained on the trace's sanitized features;
+                    # raw page actions carry no goal_overlap, so annotate it —
+                    # otherwise every live proposal is scored on a zeroed
+                    # overlap the model never saw in training.
+                    goal_tokens = set(tokenize(state["goal"]))
+                    offered_now = [
+                        {**c, "goal_overlap": action_goal_overlap(c, goal_tokens)}
+                        for c in offered_now
+                    ]
                     proposal = trial_model.choose(offered_now)
                     if proposal is not None and proposal["id"] != selected and any(
                         a["id"] == proposal["id"] for a in page["actions"]
@@ -383,6 +419,10 @@ class Agent:
                             "policy_denied",
                             state=page.get("fingerprint"),
                             selected=action.get("id"),
+                            # A denied trial action ends the run — tag it so the
+                            # scheduler-caused block is never scored as the
+                            # policy's own failure in canary.
+                            experiment=experiment_meta,
                             reason=policy_result.reason,
                         )
                         self.dream_recorder.finish(status="blocked", verified=False)
@@ -421,6 +461,7 @@ class Agent:
                                 "policy_denied",
                                 state=page.get("fingerprint"),
                                 selected=action.get("id"),
+                                experiment=experiment_meta,
                                 reason=payload_result.reason,
                             )
                             self.dream_recorder.finish(status="blocked", verified=False)
@@ -450,6 +491,9 @@ class Agent:
                         "action": action,
                         "fingerprint": page["fingerprint"],
                         "payload_digest": payload_digest,
+                        # A trial assigned this step keeps its provenance across
+                        # the approval pause; reject still drops the assignment.
+                        "experiment": experiment_meta,
                         "reason": reason,
                     }
                     state["status"] = "approval_required"
@@ -459,6 +503,9 @@ class Agent:
                             "approval_required",
                             state=page.get("fingerprint"),
                             selected=action.get("id"),
+                            # Tag the run even if the trial never executes —
+                            # an operator veto is still scheduler influence.
+                            experiment=experiment_meta,
                             reason=reason,
                         )
                     return self.snapshot()

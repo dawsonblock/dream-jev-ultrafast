@@ -557,17 +557,27 @@ class CounterfactualTrials:
             if not 0.0 < propensity <= 1.0:
                 continue
             selected = event.get("selected") or {}
-            overlap = next(
+            # The context is the *model choice's* features — where the tension
+            # arose — not the executed action's. Keying on ``selected`` would
+            # put the two arms of one assignment in different cells whenever
+            # the proposal's overlap differs from the model choice's, which is
+            # exactly when the prior diverged for a reason.
+            model_choice = next(
                 (
-                    int(c.get("goal_overlap", 0))
+                    c
                     for c in event.get("candidates") or ()
-                    if c.get("id") == selected.get("id")
+                    if c.get("id") == meta.get("model_choice_id")
                 ),
-                0,
+                None,
+            )
+            overlap = (
+                overlap_bucket(int(model_choice.get("goal_overlap", 0) or 0))
+                if model_choice is not None
+                else "unknown"
             )
             context = (
                 f"{str(meta.get('model_choice_kind') or selected.get('kind') or 'unknown')}"
-                f"|{overlap_bucket(overlap)}"
+                f"|{overlap}"
             )
             positive = float(
                 bool(verified_done if terminal else event.get("page_changed"))
@@ -610,6 +620,10 @@ class CounterfactualTrials:
             if "candidate" in entry and "control" in entry:
                 entry["delta"] = (
                     entry["candidate"]["p_progress"] - entry["control"]["p_progress"]
+                )
+                # The contrast is only as trustworthy as its weaker arm.
+                entry["delta_reliable"] = (
+                    entry["candidate"]["reliable"] and entry["control"]["reliable"]
                 )
         return arms
 

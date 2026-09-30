@@ -671,6 +671,60 @@ def test_experiment_deviation_never_bypasses_authority(runner):
     runner.state["browser"].act.assert_not_called()
 
 
+def test_experiment_deviated_trial_executes_the_approved_action(runner, tmp_path):
+    """Approving a deviated trial runs the *approved* proposal — not the
+    model's original choice — and keeps the experiment tag on the transition."""
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.policy import DefaultActionPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    runner.policy = DefaultActionPolicy()
+    p = runner.state["page"]
+    p["actions"].append(
+        {"id": "buy", "kind": "click", "label": "Buy now", "role": "button", "node": 30}
+    )
+    p["fingerprint"] = fingerprint(p)
+    proposal_model = Mock()
+    proposal_model.choose = Mock(return_value={"id": "buy", "kind": "click"})
+    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+
+    state = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "approval_required"
+    assert state["pending_approval"]["action"]["id"] == "buy"
+    assert state["pending_approval"]["experiment"]["arm"] == "candidate"
+
+    runner.command("approve")
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "buy"
+    trial = next(e for e in store.load() if e["event"] == "transition")
+    assert trial["experiment"]["arm"] == "candidate"
+    assert trial["experiment"]["assignment_probability"] == 1.0
+    assert trial["experiment"]["model_choice_id"] == "e1"
+    assert trial["experiment"]["proposal_id"] == "buy"
+    assert trial["selected"]["id"] == "buy"
+    assert trial["risk_events"] == 1  # the approved action consumed the grant
+
+
+def test_experiment_config_is_validated_before_browser_launch(monkeypatch):
+    """A malformed experiment config raises in the constructor — not mid-run
+    after the decision was already consumed."""
+    browser_cls = Mock()
+    monkeypatch.setattr(loop, "Browser", browser_cls)
+    with pytest.raises(ValueError, match="rate"):
+        loop.Agent("https://example.test", "goal", experiment={"model": Mock(), "rate": 0})
+    with pytest.raises(ValueError, match="rate"):
+        loop.Agent("https://example.test", "goal", experiment={"model": Mock(), "rate": 2.0})
+    with pytest.raises(ValueError, match="model"):
+        loop.Agent("https://example.test", "goal", experiment={"rate": 0.5})
+    with pytest.raises(ValueError, match="dict"):
+        loop.Agent("https://example.test", "goal", experiment="yes")
+    browser_cls.assert_not_called()
+
+
 def test_experiment_only_assigns_one_trial_per_run(runner):
     proposal_model = Mock()
     proposal_model.choose = Mock(return_value={"id": "e3", "kind": "click"})
