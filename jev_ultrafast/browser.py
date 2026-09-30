@@ -121,7 +121,7 @@ class Browser:
                         else requestAnimationFrame(ready);
                       };
                       requestAnimationFrame(ready);
-                    }))""" + json.dumps(action) + ")",
+                    }))(""" + json.dumps(action) + ")",
                     await_promise=True,
                 )
             except (RuntimeError, StalePage):
@@ -145,16 +145,19 @@ class Browser:
         raise StalePage("Page did not settle")
 
     def fresh(self, page, action=None):
-        if action is not None and action.get("kind") in {"click", "select", "fill"}:
-            node = action.get("node")
-            if type(node) is not int:
-                return False
-            current = self._isolated(
-                "(() => { const c=globalThis.__jevFastV2; "
-                f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
-            )
-            return current == [page["page_key"], page["guards"].get(str(node))]
-        return self._isolated(MARKER) == page["marker"]
+        try:
+            if action is not None and action.get("kind") in {"click", "select", "fill"}:
+                node = action.get("node")
+                if type(node) is not int:
+                    return False
+                current = self._isolated(
+                    "(() => { const c=globalThis.__jevFastV2; "
+                    f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
+                )
+                return current == [page["page_key"], page["guards"].get(str(node))]
+            return self._isolated(MARKER) == page["marker"]
+        except StalePage:
+            return False
 
     def act(self, action, page, text=None):
         if not self.fresh(page, action):
@@ -264,7 +267,7 @@ def browser_operation(request):
                     return {x,y,selected_index:e.selectedIndex};
                   }
                   return {x,y};
-                })""" + json.dumps({"action": action, "expected": expected})
+                })(""" + json.dumps({"action": action, "expected": expected}) + ")"
             )
             if not target or target.get("error"):
                 # The guarded script only mutates in its final statement, so every
@@ -285,7 +288,7 @@ def browser_operation(request):
                           if (!e?.isConnected || !active || !(active===e || e.contains(active))) return false;
                           return !(e.readOnly || e.getAttribute('aria-readonly')==='true' ||
                             e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]'));
-                        })""" + json.dumps(action) + ")"
+                        })(""" + json.dumps(action) + ")"
                     )
                     if not focused:
                         raise StalePage("Target lost focus after click; no text inserted.")

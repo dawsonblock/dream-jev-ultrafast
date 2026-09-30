@@ -4,7 +4,8 @@ Validation date: 2026-09-29.
 
 ## Reproduced in this build environment
 
-- `uv run pytest`: **110 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
+- `uv run pytest`: **112 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
+- `uv run python scripts/check_guards.py` against a dedicated Chrome 152 instance (`BU_CDP_URL=http://127.0.0.1:9222`): **all 23 live browser guard checks passed**. The first live run exposed a latent defect: the guarded act/select/fill and post-input wait expressions concatenated their JSON argument without call parentheses, so every mutation path raised a `SyntaxError` that surfaced as `StalePage`. Unit mocks could not see this. The expressions were corrected to invoke their argument, `fresh()` now treats an unreachable/destroyed guard context as stale, and the live suite was re-run to green.
 - `uv run ruff check .`: passed.
 - `uv build`: passed (`dist/jev_ultrafast-0.4.0.tar.gz`, `dist/jev_ultrafast-0.4.0-py3-none-any.whl`).
 - `python -m compileall -q jev_ultrafast tests examples scripts`: passed.
@@ -18,9 +19,7 @@ Validation date: 2026-09-29.
 
 ## Remaining environment limitation
 
-- The real Browser Harness / Chrome live integration suite (`scripts/check_guards.py`) was not executed here; the package is installed but no live Chrome target was exercised.
-
-Run the live-browser checks on the deployment machine before unattended use.
+- The live guard suite ran against a dedicated throwaway Chrome profile on this machine. Re-run `scripts/check_guards.py` on each deployment machine with its intended Chrome/Browser Harness installation before unattended use.
 
 ## Documented decisions
 
@@ -63,7 +62,9 @@ The test suite now covers the v0.3 contracts plus:
 - optional `strict` experience stores that verify the full hash chain before every append;
 - replay improvement refuses pools that mix DREAM TCB generations (new events are `jev-ultrafast-tcb/0.5`; pre-unification traces recorded `goal_overlap` with the legacy tokenizer);
 - health decisions mark insufficient observed coverage (`sufficient=false`) separately from drift outcomes;
-- promotion requires non-empty bound evidence digests in every path.
+- promotion requires non-empty bound evidence digests in every path;
+- isolated-world `(fn)(arg)` expression templates verified to invoke their argument;
+- `fresh()` reports stale rather than raising when the guard context is destroyed or unreachable.
 
 ## Deployment gate
 

@@ -1,5 +1,6 @@
 """Regression tests for v0.2 execution-integrity and policy boundaries."""
 
+import re
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -271,3 +272,26 @@ def test_verifier_signature_dispatch_covers_supported_shapes():
         a = terminal_runner(verifier=verifier)
         state = a.command("act", {"fingerprint": a.state["page"]["fingerprint"]})
         assert state["status"] == "done"
+
+
+def test_isolated_expressions_invoke_their_argument():
+    """The (fn)(arg) templates must actually call the function with the JSON arg.
+
+    A missing call paren turns `((input) => ...){...}` into a SyntaxError that
+    only surfaces against a real browser — mocks can't catch it (v0.4 live run).
+    """
+    src = Path(browser.__file__).read_text()
+    joins = [m.start() for m in re.finditer(r'"""\s*\+\s*json\.dumps\(', src)]
+    assert joins, "expected templated isolated-world expressions"
+    for pos in joins:
+        assert src.rstrip()[:pos].rstrip().endswith("("), (
+            "expression argument is concatenated without a call paren"
+        )
+
+
+def test_fresh_treats_unreachable_guard_as_stale():
+    b = browser.Browser.__new__(browser.Browser)
+    b._isolated = Mock(side_effect=StalePage("Isolated execution context changed"))
+    page = {"marker": "m", "page_key": "k", "guards": {"0": "g"}}
+    assert b.fresh(page) is False
+    assert b.fresh(page, {"kind": "click", "node": 0}) is False
