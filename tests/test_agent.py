@@ -478,6 +478,47 @@ def test_approved_execution_marks_risk_events_in_trace(runner, tmp_path):
     assert events[-1]["risk_events"] == 1
 
 
+def test_sensitive_generated_text_escalates_a_benign_field(runner, monkeypatch):
+    """Audit regression: the policy runs again on the generated payload, so a
+    field that describes itself as plain text cannot launder a sensitive fill."""
+    from jev_ultrafast.policy import DefaultActionPolicy
+
+    runner.policy = DefaultActionPolicy()
+    runner.state["decision"] = decision("e1")  # "Search" fill: FORM_EDIT → allow
+    monkeypatch.setattr(loop, "field_context", Mock(return_value={"goal": "x"}))
+    monkeypatch.setattr(
+        loop, "field_text",
+        Mock(return_value=("4111 1111 1111 1111", {"model": "t", "latency_ms": 1})),
+    )
+    p = runner.state["page"]
+    state = runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "approval_required"
+    assert "payload" in state["pending_approval"]["reason"]
+    runner.state["browser"].act.assert_not_called()
+
+    # Approval binds to this action on this page; the executed payload is the
+    # exact text that was assessed (pending_text is reused verbatim).
+    runner.command("approve")
+    runner.state["browser"].act.assert_called_once()
+    assert runner.state["browser"].act.call_args.kwargs.get("text") == "4111 1111 1111 1111" \
+        or "4111 1111 1111 1111" in runner.state["browser"].act.call_args.args
+
+
+def test_ordinary_generated_text_keeps_benign_fill_autonomous(runner, monkeypatch):
+    from jev_ultrafast.policy import DefaultActionPolicy
+
+    runner.policy = DefaultActionPolicy()
+    runner.state["decision"] = decision("e1")
+    monkeypatch.setattr(loop, "field_context", Mock(return_value={"goal": "x"}))
+    monkeypatch.setattr(
+        loop, "field_text", Mock(return_value=("Zurich", {"model": "t", "latency_ms": 1}))
+    )
+    p = runner.state["page"]
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    runner.state["browser"].act.assert_called_once()
+    assert runner.state["status"] == "ready"
+
+
 def test_model_boundaries_redact_history_text(monkeypatch):
     monkeypatch.setenv("JEV_MODEL_PRIVACY", "basic")
     monkeypatch.setenv("TYPESAFE_API_KEY", "test")

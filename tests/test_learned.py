@@ -249,7 +249,7 @@ def test_choice_model_uncertainty_and_abstention():
             **_transition(selected="sel", page_changed=True, candidates=[
                 {"id": "sel", "kind": "click", "label": "Search", "goal_overlap": 2},
             ]),
-            "selected_rank": 0,
+            "selected_offered_rank": 0,
         },
         *[
             {
@@ -292,7 +292,7 @@ def test_choice_model_choose_proposes_only_offered_candidates():
                 **_transition(selected=f"g{i}", page_changed=True, candidates=[
                     {"id": f"g{i}", "kind": "click", "label": "Search", "goal_overlap": 2},
                 ]),
-                "selected_rank": 0,
+                "selected_offered_rank": 0,
             }
             for i in range(5)
         ],
@@ -301,7 +301,7 @@ def test_choice_model_choose_proposes_only_offered_candidates():
                 **_transition(selected=f"k{i}", page_changed=False, candidates=[
                     {"id": f"k{i}", "kind": "click", "label": "Ctl", "goal_overlap": 0},
                 ]),
-                "selected_rank": 0,
+                "selected_offered_rank": 0,
             }
             for i in range(5)
         ],
@@ -315,7 +315,7 @@ def test_choice_model_choose_proposes_only_offered_candidates():
     proposal = model.choose(offered)
     assert proposal["id"] in {c["id"] for c in offered}
     assert proposal["id"] == "b"  # only candidate in the strong cell
-    assert {"p_page_changed", "uncertainty", "confident", "score"} <= set(proposal)
+    assert {"p_progress", "uncertainty", "confident", "score"} <= set(proposal)
 
 
 def test_choice_model_ucb_can_prefer_uncertain_candidate():
@@ -329,7 +329,7 @@ def test_choice_model_ucb_can_prefer_uncertain_candidate():
                 **_transition(selected=f"k{i}", page_changed=False, candidates=[
                     {"id": f"k{i}", "kind": "click", "label": "Known", "goal_overlap": 0},
                 ]),
-                "selected_rank": 0,
+                "selected_offered_rank": 0,
             }
             for i in range(8)
         ],
@@ -339,7 +339,7 @@ def test_choice_model_ucb_can_prefer_uncertain_candidate():
                     {"id": f"s{i}", "kind": "select", "label": "Pick", "goal_overlap": 0},
                 ]),
                 "selected": {"id": f"s{i}", "kind": "select"},
-                "selected_rank": 0,
+                "selected_offered_rank": 0,
             }
             for i in range(4)
         ],
@@ -372,7 +372,8 @@ def _rank_sensitive_worlds():
         {"id": "sel", "kind": "click", "label": "Search", "goal_overlap": 2},
     ]
     transition = _transition(selected="sel", candidates=candidates, offered=7)
-    transition["selected_rank"] = 6
+    transition["selected_observed_rank"] = 6
+    transition["selected_offered_rank"] = 6
     events = []
     for i in range(3):
         events.append({"event": "run_started", "run_id": f"r{i}", "task_key": "t", "goal": "search",
@@ -391,13 +392,16 @@ def test_choice_model_replay_uses_candidate_policy_rank():
     front_events = [
         {**_transition(selected=f"s{i}", page_changed=True, candidates=[
             {"id": f"s{i}", "kind": "click", "label": "Search", "goal_overlap": 2},
-        ]), "selected_rank": 0}
+        ]), "selected_offered_rank": 0}
         for i in range(6)
     ]
     back_events = [
-        {**_transition(selected=f"b{i}", page_changed=False, candidates=[
+        # The selected action honestly sits at offered rank 9.
+        {**_transition(selected=f"b{i}", page_changed=False, offered=10, candidates=[
+            *[{"id": f"x{i}-{j}", "kind": "click", "label": f"X{j}", "goal_overlap": 0}
+              for j in range(9)],
             {"id": f"b{i}", "kind": "click", "label": "Back", "goal_overlap": 0},
-        ]), "selected_rank": 9}
+        ]), "selected_offered_rank": 9}
         for i in range(6)
     ]
     model = ChoiceModel.fit(front_events + back_events)
@@ -434,7 +438,13 @@ def test_choice_model_proposals_never_reach_gates(tmp_path):
     assert annotated
     entry = annotated[0]["choice_model"]
     assert {"divergence_rate", "mean_uncertainty", "confident_fraction",
-            "predicted_page_changes_per_step", "proposed_page_changes_per_step"} <= set(entry)
+            "predicted_progress_per_step", "proposed_progress_per_step",
+            "selected_mean_uncertainty", "selected_confident_fraction",
+            "proposal_mean_uncertainty", "proposal_confident_fraction"} <= set(entry)
+    # The two subjects stay separate: selected-action metrics describe the
+    # recorded action's prior, proposal metrics the counterfactual proposal's.
+    assert entry["mean_uncertainty"] == entry["selected_mean_uncertainty"]
+    assert entry["confident_fraction"] == entry["selected_confident_fraction"]
     # A rejected candidate is annotated but still rejected.
     rejected = [c for c in annotated if not c["replay_approved"]]
     if rejected:
@@ -623,3 +633,120 @@ def test_store_rejects_unsigned_when_required_and_reserved_key_injection(tmp_pat
         store.append({"signature": "spoofed"})
     with pytest.raises(ValueError, match="reserved"):
         store.append({"key_id": "spoofed"})
+
+
+# ------------------------------------------------ v0.6.1 correction pass ---
+
+def test_cost_model_requires_design_variation_for_reliability():
+    """The audit's identifiability gap: N samples at one offered count carry
+    zero information about the per-candidate slope."""
+    flat = CostModel.fit([_transition(offered=40) for _ in range(8)])
+    assert flat.samples == 8 and flat.distinct_offered == 1
+    assert not flat.reliable
+    # Two distinct counts but a trivially narrow span is not identifying either.
+    narrow = CostModel.fit([_transition(offered=o) for o in (40, 41) * 4])
+    assert narrow.distinct_offered == 2 and not narrow.reliable
+    # Distinct counts spanning the minimum range: identifiable.
+    wide = CostModel.fit([_transition(offered=o) for o in (40, 80) * 4])
+    assert wide.reliable
+
+
+def test_choice_model_trains_on_the_offered_rank_coordinate():
+    """Regression for the v0.6 evidence-coordinate bug: ``selected_rank`` in old
+    traces was the *observed* catalogue index. Fitting must use the offered
+    rank — here recorded explicitly, and derived when absent."""
+    policy = ExplorationPolicy(min_goal_overlap=1)
+    observed = [
+        *[{"id": f"f{i}", "kind": "click", "label": f"ctl{i}", "goal_overlap": 0}
+          for i in range(6)],
+        {"id": "sel", "kind": "click", "label": "Search", "goal_overlap": 2},
+    ]
+    events = []
+    for i in range(3):
+        events.append({"event": "run_started", "run_id": f"r{i}", "task_key": "t",
+                       "goal": "search", "policy": policy.to_dict(),
+                       "policy_digest": policy.digest})
+        # Recorded offered rank: the filtered catalogue exposes only "sel".
+        events.append({**_transition(selected="sel", candidates=observed, offered=1),
+                       "run_id": f"r{i}", "task_key": "t", "catalog": "observed",
+                       "selected_observed_rank": 6, "selected_offered_rank": 0})
+        events.append({"event": "run_finished", "run_id": f"r{i}", "task_key": "t",
+                       "status": "done", "verified": True})
+    # Same shape again but WITHOUT the recorded rank — fit derives it through
+    # the recorded policy, exactly like ReplayWorld.from_events does.
+    for i in range(3, 6):
+        events.append({"event": "run_started", "run_id": f"r{i}", "task_key": "t",
+                       "goal": "search", "policy": policy.to_dict(),
+                       "policy_digest": policy.digest})
+        events.append({**_transition(selected="sel", candidates=observed, offered=1),
+                       "run_id": f"r{i}", "task_key": "t", "catalog": "observed",
+                       "selected_observed_rank": 6})
+        events.append({"event": "run_finished", "run_id": f"r{i}", "task_key": "t",
+                       "status": "done", "verified": True})
+    model = ChoiceModel.fit(events)
+    front = model.predict(kind="click", goal_overlap=2, rank=0)
+    assert front["level"] == "cell" and front["n"] == 6
+    assert front["p_progress"] > 0.8
+    # Under the buggy basis the mass would sit in the "5-19" bucket instead.
+    back = model.predict(kind="click", goal_overlap=2, rank=6)
+    assert back["level"] != "cell" or back["n"] == 0
+
+
+def test_choice_model_terminal_progress_requires_verified_done():
+    """The audit's objective fix: page activity on a terminal transition is not
+    progress unless the run ended verifier-confirmed done."""
+    def run(run_id, kind, status, verified):
+        return [
+            {"event": "run_started", "run_id": run_id, "task_key": "t", "goal": "g",
+             "policy": ExplorationPolicy().to_dict(),
+             "policy_digest": ExplorationPolicy().digest},
+            {"event": "transition", "run_id": run_id, "task_key": "t",
+             "state": "S", "next_state": "D",
+             "selected": {"id": f"a{run_id}", "kind": kind},
+             "candidates": [{"id": f"a{run_id}", "kind": kind, "label": "Go",
+                             "goal_overlap": 1}],
+             "page_changed": True, "latency_ms": 10, "model_calls": 1, "tokens": 1},
+            {"event": "run_finished", "run_id": run_id, "task_key": "t",
+             "status": status, "verified": verified},
+        ]
+
+    events = []
+    for i in range(6):
+        events += run(f"bad{i}", "navbad", "blocked", False)
+        events += run(f"good{i}", "navgood", "done", True)
+        # Done but never verified is not progress either.
+        events += run(f"unverified{i}", "navunv", "done", False)
+    model = ChoiceModel.fit(events)
+    bad = model.predict(kind="navbad", goal_overlap=1, rank=0)
+    unverified = model.predict(kind="navunv", goal_overlap=1, rank=0)
+    good = model.predict(kind="navgood", goal_overlap=1, rank=0)
+    assert bad["n"] == 6 and bad["p_progress"] < 0.2
+    assert unverified["n"] == 6 and unverified["p_progress"] < 0.2
+    assert good["n"] == 6 and good["p_progress"] > 0.8
+
+
+def test_choice_model_nonterminal_steps_still_count_page_changes():
+    """Intermediate transitions keep the page-change signal — only the run's
+    terminal transition is gated on verified completion."""
+    events = [
+        {"event": "run_started", "run_id": "mid", "task_key": "t", "goal": "g",
+         "policy": ExplorationPolicy().to_dict(),
+         "policy_digest": ExplorationPolicy().digest},
+        {"event": "transition", "run_id": "mid", "task_key": "t",
+         "state": "S", "next_state": "M", "selected": {"id": "m", "kind": "click"},
+         "candidates": [{"id": "m", "kind": "click", "label": "Mid", "goal_overlap": 1}],
+         "page_changed": True, "latency_ms": 5, "model_calls": 1, "tokens": 1},
+        {"event": "transition", "run_id": "mid", "task_key": "t",
+         "state": "M", "next_state": "D", "selected": {"id": "e", "kind": "click"},
+         "candidates": [{"id": "e", "kind": "click", "label": "End", "goal_overlap": 1}],
+         "page_changed": True, "latency_ms": 5, "model_calls": 1, "tokens": 1},
+        # The run failed: the terminal transition is not progress, but the
+        # intermediate page change still counts.
+        {"event": "run_finished", "run_id": "mid", "task_key": "t",
+         "status": "blocked", "verified": False},
+    ]
+    model = ChoiceModel.fit(events)
+    pred = model.predict(kind="click", goal_overlap=1, rank=0)
+    # 1 positive of 2 + Beta(1,1) → 2/4 = 0.5
+    assert pred["n"] == 2
+    assert abs(pred["p_progress"] - 0.5) < 1e-9

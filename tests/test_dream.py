@@ -372,10 +372,19 @@ def test_trace_records_candidate_catalogue_digest_and_rank(tmp_path):
     )
     recorder.finish(status="done", verified=True)
     event = next(item for item in store.load() if item["event"] == "transition")
-    assert event["selected_rank"] == 1
+    assert event["selected_observed_rank"] == 1
+    # No separate offer was made (offered=None): the observed catalogue was the
+    # offer, so no offered-rank coordinate is recorded and catalog is "recorded".
+    assert event["selected_offered_rank"] is None
+    assert event["catalog"] == "recorded"
     assert event["candidate_digest"] == candidate_catalog_digest(event["candidates"])
     world = ReplayWorld.from_events(store.load())[0]
-    assert world.trajectory[0].candidate_digest == event["candidate_digest"]
+    transition = world.trajectory[0]
+    assert transition.candidate_digest == event["candidate_digest"]
+    assert transition.selected_observed_rank == 1
+    # Replay resolves the offered coordinate for a recorded catalogue to the
+    # observed rank — observed and offered are the same catalogue here.
+    assert transition.selected_offered_rank == 1
 
 
 def _canary_pair_store(tmp_path, baseline, candidate, *, candidate_success=True,
@@ -484,7 +493,9 @@ def test_unsigned_active_record_fails_closed_when_keys_configured(tmp_path):
     payload["active"].pop("attestation")  # direct local write: strip authority
     path.write_text(json.dumps(payload))
     reader = PolicyRegistry(path, verify_keys={signer.key_id})
-    with pytest.raises(ValueError, match="attestation"):
+    # The tamper is caught by the chained state head before attestation checks
+    # even run — either layer failing closed is the required behavior.
+    with pytest.raises(ValueError, match="state digest|attestation"):
         reader.active_policy()
 
 
@@ -498,7 +509,9 @@ def test_forged_and_wrong_key_attestations_fail(tmp_path):
     payload = json.loads(path.read_text())
     payload["active"]["attestation"]["signature"] = "0" * 128  # forged
     path.write_text(json.dumps(payload))
-    with pytest.raises(ValueError, match="attestation"):
+    # State head catches the write first; the attestation verifier is the
+    # deeper layer for a payload whose head was legitimately produced.
+    with pytest.raises(ValueError, match="state digest|attestation"):
         PolicyRegistry(path, verify_keys={signer.key_id}).load()
 
     attacker = EvidenceSigner(b"d" * 32)
@@ -509,7 +522,7 @@ def test_forged_and_wrong_key_attestations_fail(tmp_path):
     attacker_registry = PolicyRegistry(tmp_path / "attacker.json", signer=attacker)
     payload["active"]["attestation"] = attacker_registry._sign_attestation(material)
     (tmp_path / "k.json").write_text(json.dumps(payload))
-    with pytest.raises(ValueError, match="unexpected key"):
+    with pytest.raises(ValueError, match="unexpected key|state digest"):
         PolicyRegistry(tmp_path / "k.json", verify_keys={signer.key_id}).load()
 
 
@@ -1095,10 +1108,82 @@ def test_trace_records_observed_and_offered_catalogues(tmp_path):
     assert event["catalog"] == "observed"
     assert len(event["candidates"]) == 21
     assert event["offered_count"] == len(offered) < len(event["candidates"])
+    # The two rank coordinates are recorded separately: observed index 20 vs
+    # the action's position inside the offered catalogue.
+    assert event["selected_observed_rank"] == 20
+    assert event["selected_offered_rank"] == [
+        a.get("id") for a in offered
+    ].index("target")
     worlds = ReplayWorld.from_events(events)
     assert worlds[0].family_key == "family-a"
     assert worlds[0].trajectory[0].offered_digest == event["offered_digest"]
     assert worlds[0].trajectory[0].catalog == "observed"
+    assert worlds[0].trajectory[0].selected_observed_rank == 20
+    assert worlds[0].trajectory[0].selected_offered_rank == event["selected_offered_rank"]
+
+
+def test_trace_records_behavior_propensities(tmp_path):
+    """Off-policy groundwork: the recorded behavior-policy probabilities are the
+    denominator any future counterfactual estimate is weighted by."""
+    store = ExperienceStore(tmp_path / "propensity.jsonl")
+    policy = ExplorationPolicy(min_goal_overlap=1)
+    recorder = DreamTraceRecorder(store, goal="Open target")
+    page = {"fingerprint": "A", "url": "https://example.test"}
+    recorder.start(page, policy)
+    actions = [
+        {"id": "f0", "kind": "click", "node": 1, "label": "Filler", "goal_overlap": 0},
+        {"id": "target", "kind": "fill", "node": 2, "label": "Target field"},
+    ]
+    offered = [actions[1]]  # what the model actually saw
+    decision = {
+        "latency_ms": 1, "usage": {}, "confidence": 0.9,
+        "operation": "TYPE_TEXT", "target": "1",
+        "probabilities": {"target": 0.8, "f0": 0.2},
+        "operation_probabilities": {"TYPE_TEXT": 0.7, "CLICK": 0.3},
+        "target_probabilities": {"1": 0.8},
+    }
+    recorder.transition(
+        before=page, after={"fingerprint": "B", "url": "https://example.test"},
+        action=actions[1], decision=decision, candidates=actions, offered=offered,
+    )
+    recorder.finish(status="done", verified=True)
+    event = next(e for e in store.load() if e["event"] == "transition")
+    assert event["selected_observed_rank"] == 1
+    assert event["selected_offered_rank"] == 0
+    assert event["selected_propensity"] == 0.8
+    assert event["operation_probability"] == 0.7
+    assert event["target_probability"] == 0.8
+    assert event["decision_confidence"] == 0.9
+    assert event["action_probabilities"] == {"target": 0.8, "f0": 0.2}
+    transition = ReplayWorld.from_events(store.load())[0].trajectory[0]
+    assert transition.selected_observed_rank == 1
+    assert transition.selected_offered_rank == 0
+    assert transition.selected_propensity == 0.8
+
+
+def test_replay_world_rejects_inconsistent_offered_metadata(tmp_path):
+    """The audit's missing checks: offered_count and the recorded offered rank
+    must both agree with the catalogue the recorded policy re-derives."""
+    transition = _single_transition()
+    transition[0]["catalog"] = "observed"
+    transition[0]["offered_count"] = 2  # "go" alone re-derives to 1
+    _append_run(
+        ExperienceStore(tmp_path / "count.jsonl"), "run", "goal", transition,
+        status="done", verified=True,
+    )
+    with pytest.raises(ValueError, match="offered count mismatch"):
+        ReplayWorld.from_events(ExperienceStore(tmp_path / "count.jsonl").load())
+
+    transition = _single_transition()
+    transition[0]["catalog"] = "observed"
+    transition[0]["offered_count"] = 1
+    transition[0]["selected_offered_rank"] = 3  # "go" sits at rank 0
+    _append_run(
+        ExperienceStore(tmp_path / "rank.jsonl"), "run", "goal", transition,
+        status="done", verified=True,
+    )
+    with pytest.raises(ValueError, match="selected offered-rank mismatch"):
+        ReplayWorld.from_events(ExperienceStore(tmp_path / "rank.jsonl").load())
 
 
 def test_offered_digest_must_match_recorded_policy(tmp_path):
@@ -1172,3 +1257,160 @@ def test_baseline_window_bounds_canary_evidence(tmp_path):
     )
     assert evidence.baseline.tasks == 0
     assert evidence.candidate.tasks == 12
+
+
+# --- registry state head and full attestation binding (v0.6.1) --------------
+
+def test_registry_state_head_is_chained_and_tamper_evident(tmp_path):
+    """Every write chains to the head it replaces; any post-write field edit —
+    including mutable ones like ``suspended`` — invalidates the digest."""
+    worlds = _efficiency_world(tmp_path)
+    path = tmp_path / "chain.json"
+    registry = PolicyRegistry(path)
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds, ExplorationPolicy())
+    registry.stage(report)
+    first = json.loads(path.read_text())
+    assert first["state_digest"]
+    assert first["prev_state_digest"] == "0" * 64
+    permissive = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=0, min_paired_task_families=0)
+    registry.promote(
+        CanaryMetrics(1, 1), CanaryMetrics(1, 1), gate=permissive, allow_unbound_metrics=True)
+    second = json.loads(path.read_text())
+    assert second["prev_state_digest"] == first["state_digest"]
+    registry.suspend("drift")
+    third = json.loads(path.read_text())
+    assert third["prev_state_digest"] == second["state_digest"]
+    # Post-write tamper: flip a mutable field without resealing the head.
+    third["active"]["suspended"] = False
+    path.write_text(json.dumps(third))
+    with pytest.raises(ValueError, match="state digest"):
+        PolicyRegistry(path).load()
+
+
+def test_promotion_attestation_must_bind_the_whole_record(tmp_path):
+    """The audit's tamper reproduction: a valid signature must not float over a
+    record whose parent, canary evidence, or promotion fields were edited
+    after signing."""
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"t" * 32)
+    registry, report, active = _signed_registry(
+        tmp_path, signer, verify_keys={signer.key_id})
+    att = active["attestation"]
+    for field, value in (
+        ("parent_digest", "tampered-parent"),
+        ("promoted_at_ms", 1),
+        ("promotion_revision", 99),
+    ):
+        tampered = {**active, field: value}
+        with pytest.raises(ValueError, match="not bound"):
+            registry._check_attestation(att, tampered, "active")
+    # Canary evidence fields — including the health-check reference metrics
+    # health_from_store() trusts — are bound through canary_digest.
+    tampered = {**active, "canary": {**active["canary"], "evidence_digest": "x" * 64}}
+    with pytest.raises(ValueError, match="not bound"):
+        registry._check_attestation(att, tampered, "active")
+    tampered = {
+        **active,
+        "canary": {
+            **active["canary"],
+            "candidate": {**active["canary"]["candidate"], "tasks": 999},
+        },
+    }
+    with pytest.raises(ValueError, match="not bound"):
+        registry._check_attestation(att, tampered, "active")
+    # The untouched record still verifies.
+    registry._check_attestation(att, active, "active")
+
+
+def test_registry_state_transitions_are_signed_and_chained(tmp_path):
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"s" * 32)
+    registry, report, active = _signed_registry(
+        tmp_path, signer, verify_keys={signer.key_id})
+    path = tmp_path / "signed-policy.json"
+    promoted = json.loads(path.read_text())
+    assert promoted["state_signature"] and promoted["state_key_id"] == signer.key_id
+
+    suspended = registry.suspend("drift check")
+    assert suspended["suspend_attestation"]["kind"] == "suspend_attestation"
+    # The transition attestation chains to the head it replaced.
+    assert suspended["suspend_attestation"]["prev_state_head"] == promoted["state_digest"]
+    assert suspended["suspend_attestation"]["registry_revision"] == suspended["suspend_revision"]
+    state = json.loads(path.read_text())
+    assert state["prev_state_digest"] == promoted["state_digest"]
+
+    resumed = registry.resume()
+    assert resumed["resume_attestation"]["kind"] == "resume_attestation"
+    assert resumed["resume_attestation"]["prev_state_head"] == state["state_digest"]
+
+    # A fresh reader trusting the key verifies every transition attestation on
+    # the record — the signatures are bound, not decorative.
+    reader = PolicyRegistry(path, verify_keys={signer.key_id})
+    record = reader.load()["active"]
+    for key in ("attestation", "suspend_attestation", "resume_attestation"):
+        reader._check_attestation(record[key], record, f"active {key}")
+
+
+def test_signed_registry_state_fails_closed_without_keys(tmp_path, monkeypatch):
+    from jev_ultrafast.signing import EvidenceSigner
+
+    for var in (
+        "JEV_EVIDENCE_SIGNING_KEY", "JEV_PROMOTION_SIGNING_KEY",
+        "JEV_EVIDENCE_VERIFY_KEY", "JEV_EVIDENCE_VERIFY_KEYS",
+        "JEV_PROMOTION_VERIFY_KEYS",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    signer = EvidenceSigner(b"k" * 32)
+    _signed_registry(tmp_path, signer)
+    # A reader with no configured authority cannot trust a signed state head.
+    with pytest.raises(ValueError, match="no verification key"):
+        PolicyRegistry(tmp_path / "signed-policy.json").load()
+
+
+def test_unsigned_registry_state_fails_closed_with_keys(tmp_path):
+    from jev_ultrafast.signing import EvidenceSigner
+
+    worlds = _efficiency_world(tmp_path)
+    path = tmp_path / "unsigned.json"
+    registry = PolicyRegistry(path)
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds, ExplorationPolicy())
+    registry.stage(report)
+    permissive = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=0, min_paired_task_families=0)
+    registry.promote(
+        CanaryMetrics(1, 1), CanaryMetrics(1, 1), gate=permissive, allow_unbound_metrics=True)
+    assert "state_signature" not in json.loads(path.read_text())
+    signer = EvidenceSigner(b"u" * 32)
+    with pytest.raises(ValueError, match="Unsigned policy registry"):
+        PolicyRegistry(path, verify_keys={signer.key_id}).load()
+
+
+def test_rollback_attestation_chains_to_the_replaced_head(tmp_path):
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"r" * 32)
+    registry, report, _ = _signed_registry(
+        tmp_path, signer, verify_keys={signer.key_id})
+    worlds2 = _overlapping_distractor_world(tmp_path)
+    second = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds2, report.selected)
+    if not second.promotion.approved or second.selected.digest == report.selected.digest:
+        pytest.skip("deterministic search did not find a second distinct winner")
+    registry.stage(second)
+    store2 = _canary_pair_store(
+        tmp_path, report.selected, second.selected, name="canary-chain.jsonl")
+    registry.promote_from_store(store2, baseline_policy_digest=report.selected.digest)
+    before = json.loads((tmp_path / "signed-policy.json").read_text())
+    target = registry.rollback()
+    att = target["rollback_attestation"]
+    assert att["prev_state_head"] == before["state_digest"]
+    assert att["registry_revision"] == target["rollback_revision"]
+    # The record's own promotion attestation still binds its original revision.
+    assert target["attestation"]["registry_revision"] == target["promotion_revision"]
+    reader = PolicyRegistry(tmp_path / "signed-policy.json", verify_keys={signer.key_id})
+    assert reader.active_policy().digest == report.selected.digest

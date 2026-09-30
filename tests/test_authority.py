@@ -8,7 +8,14 @@ import pytest
 from jev_ultrafast import browser
 from jev_ultrafast.browser import StalePage, browser_operation
 from jev_ultrafast.dream import ExperienceStore
-from jev_ultrafast.policy import DefaultActionPolicy, Effect, PolicyDecision, classify_effect
+from jev_ultrafast.policy import (
+    DefaultActionPolicy,
+    Effect,
+    PolicyDecision,
+    assess_payload,
+    classify_effect,
+    classify_payload,
+)
 from jev_ultrafast.signing import EvidenceSigner, frame_digest, verify_signature
 
 
@@ -447,3 +454,40 @@ def test_consistent_anchor_passes_and_reanchor_restores(tmp_path):
     assert ExperienceStore(
         path, verify_keys={signer.key_id}, anchor_path=tmp_path / "store.head"
     ).load()[0]["event"] == "run_finished"
+
+
+# --- unknown kinds and the payload authority signal ------------------------
+
+@pytest.mark.parametrize("kind", ["upload", "script", "future_mutation", "drag", "hotkey"])
+def test_unknown_mutation_kinds_fail_closed(kind):
+    """Audit regression: an unrecognized kind classifies UNKNOWN_COMMIT and
+    must escalate — the v0.6 kind shortcut let it pass as ``allow``."""
+    decision = DefaultActionPolicy().assess({"kind": kind, "label": "Anything"})
+    assert classify_effect({"kind": kind, "label": "Anything"}) == Effect.UNKNOWN_COMMIT
+    assert decision.level == "require_approval"
+    assert decision.effect == Effect.UNKNOWN_COMMIT
+
+
+def test_only_non_mutating_kinds_stay_autonomous():
+    policy = DefaultActionPolicy()
+    assert policy.assess({"kind": "wait"}).level == "allow"
+    assert policy.assess({"kind": "scroll"}).level == "allow"
+
+
+def test_payload_classification_is_a_second_authority_signal():
+    """The target's self-description is page-controlled; the generated text is
+    the second, independent signal — sensitive content cannot hide behind a
+    benign field label."""
+    assert classify_payload("4111 1111 1111 1111") == Effect.FINANCIAL
+    assert classify_payload("dawson@example.com") == Effect.DISCLOSURE
+    assert classify_payload("sk-ABCDEFGHIJKLMNOPQRST") == Effect.DISCLOSURE
+    assert classify_payload("123-45-6789") == Effect.DISCLOSURE
+    assert classify_payload(
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3OCJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c"
+    ) == Effect.DISCLOSURE
+    assert classify_payload("Zurich") == Effect.OBSERVE
+    assert classify_payload("") == Effect.OBSERVE
+    assert classify_payload(None) == Effect.OBSERVE
+    assert assess_payload("4111 1111 1111 1111").level == "require_approval"
+    assert assess_payload("dawson@example.com").level == "require_approval"
+    assert assess_payload("Zurich").level == "allow"

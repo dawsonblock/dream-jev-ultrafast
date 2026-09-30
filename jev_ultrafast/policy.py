@@ -202,6 +202,52 @@ def classify_effect(action) -> Effect:
     return max(candidates, key=lambda e: _AUTHORITY_RANK[_AUTHORITY[e]])
 
 
+# Payload classes: the text a TYPE_TEXT operation is about to insert is a
+# second, page-independent authority signal. A field may describe itself
+# innocently (ctx.field == "text") while the generated value is a card number
+# or a credential — page metadata is page-controlled, the payload is not.
+_PAYLOAD_CARD = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_PAYLOAD_IDENTITY = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_PAYLOAD_SECRET = re.compile(
+    r"\b(?:sk|pk|api|token)[-_][A-Za-z0-9_-]{16,}\b|"
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|"
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+)
+_PAYLOAD_EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
+
+
+def classify_payload(text) -> Effect:
+    """Effect class of the concrete text a TYPE_TEXT operation will insert.
+
+    Only high-confidence shapes escalate: a payment-card-length number is a
+    financial disclosure, and credentials/contact data are disclosures no
+    matter how the target field described itself. Ordinary text stays OBSERVE
+    (the target's own effect still applies — the caller takes the maximum).
+    """
+    value = str(text or "")
+    if not value.strip():
+        return Effect.OBSERVE
+    if _PAYLOAD_CARD.search(value):
+        return Effect.FINANCIAL
+    if (
+        _PAYLOAD_SECRET.search(value)
+        or _PAYLOAD_IDENTITY.search(value)
+        or _PAYLOAD_EMAIL.search(value)
+    ):
+        return Effect.DISCLOSURE
+    return Effect.OBSERVE
+
+
+def assess_payload(text) -> "PolicyDecision":
+    """Authority floor for the payload alone.
+
+    Combined with the target classification by the caller: the stricter of the
+    two wins, so a deceptive field label cannot launder a sensitive fill.
+    """
+    effect = classify_payload(text)
+    return PolicyDecision(_AUTHORITY[effect], f"payload:{effect.value}", effect.value)
+
+
 @dataclass(frozen=True)
 class PolicyDecision:
     level: str
@@ -240,8 +286,10 @@ class DefaultActionPolicy:
 
     def assess(self, action, *, page=None, goal=None) -> PolicyDecision:
         effect = classify_effect(action)
-        if action.get("kind") not in {"click", "select", "fill"}:
-            return PolicyDecision("allow", f"effect:{effect.value}", effect.value)
+        # No kind shortcut: scroll/wait classify as OBSERVE above and stay
+        # autonomous, but every other kind — including mutation primitives
+        # this build does not emit — must flow through the authority floor.
+        # An unrecognized kind is UNKNOWN_COMMIT and therefore never allowed.
         floor = _AUTHORITY[effect]
         reason = f"effect:{effect.value}"
         label = str(action.get("label", ""))[:512]

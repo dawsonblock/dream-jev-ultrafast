@@ -86,10 +86,29 @@ class DreamTraceRecorder:
 
         compact_candidates = compact(candidates)
         compact_offered = compact(offered) if offered is not None else None
-        selected_rank = next(
+        # The two rank coordinates are different evidence: the observed rank is
+        # the action's position in the pre-policy catalogue, the offered rank
+        # its position in what the model was actually shown. Learned models
+        # must train on the offered basis — replay queries them there.
+        selected_observed_rank = next(
             (index for index, candidate in enumerate(compact_candidates) if candidate.get("id") == action.get("id")),
             None,
         )
+        selected_offered_rank = (
+            next(
+                (index for index, candidate in enumerate(compact_offered) if candidate.get("id") == action.get("id")),
+                None,
+            )
+            if compact_offered is not None
+            else None
+        )
+        # Behavior-policy propensities: without them a later counterfactual
+        # estimate has no denominator for inverse-propensity weighting and
+        # observational correlation is indistinguishable from evidence.
+        probabilities = decision.get("probabilities") or {}
+        operation_probabilities = decision.get("operation_probabilities") or {}
+        target_probabilities = decision.get("target_probabilities") or {}
+        target = decision.get("target")
         self._append({
             "event": "transition",
             "state": before.get("fingerprint", ""),
@@ -109,7 +128,20 @@ class DreamTraceRecorder:
                 candidate_catalog_digest(compact_offered) if compact_offered is not None else None
             ),
             "offered_count": len(compact_offered) if compact_offered is not None else None,
-            "selected_rank": selected_rank,
+            "selected_observed_rank": selected_observed_rank,
+            "selected_offered_rank": selected_offered_rank,
+            "selected_propensity": probabilities.get(action.get("id")),
+            "operation_probability": operation_probabilities.get(decision.get("operation")),
+            "target_probability": (
+                target_probabilities.get(target) if target is not None else None
+            ),
+            "decision_confidence": decision.get("confidence"),
+            "action_probabilities": {
+                str(k): round(float(v), 6) for k, v in probabilities.items()
+            },
+            "operation_probabilities": {
+                str(k): round(float(v), 6) for k, v in operation_probabilities.items()
+            },
             "page_changed": after.get("fingerprint") != before.get("fingerprint"),
             "latency_ms": int(decision.get("latency_ms", 0)) + int((helper or {}).get("latency_ms", 0)),
             "model_calls": 1 + int(helper is not None),

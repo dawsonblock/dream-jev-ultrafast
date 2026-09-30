@@ -43,6 +43,7 @@ PROMOTION_VERIFY_KEYS_ENV = "JEV_PROMOTION_VERIFY_KEYS"
 SIGNING_DOMAIN = b"jev-dream/evidence-event/v1:"
 ATTESTATION_DOMAIN = b"jev-dream/promotion-attestation/v1:"
 ANCHOR_DOMAIN = b"jev-dream/chain-head-anchor/v1:"
+REGISTRY_STATE_DOMAIN = b"jev-dream/registry-state/v1:"
 
 
 def frame_digest(digest_hex: str, domain: bytes = SIGNING_DOMAIN) -> bytes:

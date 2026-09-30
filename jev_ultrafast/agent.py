@@ -10,7 +10,7 @@ from pathlib import Path
 from .browser import Browser, StalePage
 from .dream import ExperienceStore, ExplorationPolicy, PolicyRegistry
 from .model import action_space, candidate_actions, choose, field_context, field_text
-from .policy import DefaultActionPolicy
+from .policy import DefaultActionPolicy, assess_payload
 from .questions import MAX_STEPS
 from .trace import DreamTraceRecorder
 
@@ -356,6 +356,49 @@ class Agent:
                     text, helper = field_text(context)
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
+
+            if text is not None and getattr(self, "policy", None):
+                # The first authority pass ran on page-supplied target metadata,
+                # which a hostile page controls. The generated payload is a
+                # second, independent signal: a card number or credential typed
+                # into a field that claimed to be plain text escalates the fill.
+                # The stricter of target effect and payload effect applies.
+                payload_result = assess_payload(text)
+                if payload_result.level == "deny":
+                    state["status"] = "blocked"
+                    if getattr(self, "dream_recorder", None):
+                        self.dream_recorder.event(
+                            "policy_denied",
+                            state=page.get("fingerprint"),
+                            selected=action.get("id"),
+                            reason=payload_result.reason,
+                        )
+                        self.dream_recorder.finish(status="blocked", verified=False)
+                    raise ValueError(f"Action denied by policy: {payload_result.reason}")
+                if payload_result.level != "allow" and not approval_consumed:
+                    granted = state.pop("granted_approval", None)
+                    approval_consumed = bool(
+                        granted
+                        and granted.get("action_id") == action["id"]
+                        and granted.get("fingerprint") == page["fingerprint"]
+                    )
+                    if not approval_consumed:
+                        state["pending_approval"] = {
+                            "decision": decision,
+                            "action": action,
+                            "fingerprint": page["fingerprint"],
+                            "reason": payload_result.reason,
+                        }
+                        state["status"] = "approval_required"
+                        state["elapsed_ms"] = self._elapsed()
+                        if getattr(self, "dream_recorder", None):
+                            self.dream_recorder.event(
+                                "approval_required",
+                                state=page.get("fingerprint"),
+                                selected=action.get("id"),
+                                reason=payload_result.reason,
+                            )
+                        return self.snapshot()
 
             observed_candidates = offered_candidates = None
             if getattr(self, "dream_recorder", None):

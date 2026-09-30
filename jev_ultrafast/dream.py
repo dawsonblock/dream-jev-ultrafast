@@ -26,6 +26,7 @@ from .signing import (
     ANCHOR_DOMAIN,
     PROMOTION_SIGNING_KEY_ENV,
     PROMOTION_VERIFY_KEYS_ENV,
+    REGISTRY_STATE_DOMAIN,
     EvidenceSigner,
     verify_keys_from_env,
     verify_signature,
@@ -34,15 +35,16 @@ from .signing import (
     ATTESTATION_DOMAIN as ATTESTATION_SIG_DOMAIN,
 )
 
-SCHEMA_VERSION = "jev-dream/3"
-SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", SCHEMA_VERSION}
-TCB_VERSION = "jev-ultrafast-tcb/0.8"
+SCHEMA_VERSION = "jev-dream/4"
+SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", "jev-dream/3", SCHEMA_VERSION}
+TCB_VERSION = "jev-ultrafast-tcb/0.9"
 SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.3",
     "jev-ultrafast-tcb/0.4",
     "jev-ultrafast-tcb/0.5",
     "jev-ultrafast-tcb/0.6",
     "jev-ultrafast-tcb/0.7",
+    "jev-ultrafast-tcb/0.8",
     TCB_VERSION,
 }
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
@@ -669,7 +671,7 @@ class RecordedTransition:
     selected_kind: str
     candidate_actions: tuple[dict, ...]
     candidate_digest: str
-    selected_rank: int | None
+    selected_observed_rank: int | None
     page_changed: bool
     latency_ms: int
     model_calls: int
@@ -681,6 +683,8 @@ class RecordedTransition:
     catalog: str = "recorded"
     offered_digest: str | None = None
     offered_count: int | None = None
+    selected_offered_rank: int | None = None
+    selected_propensity: float | None = None
 
 
 @dataclass
@@ -753,21 +757,60 @@ class ReplayWorld:
                 stored_digest = event.get("candidate_digest")
                 if stored_digest and stored_digest != observed_digest:
                     raise ValueError(f"Run {run_id} has a candidate catalogue digest mismatch")
+                selected_id = event["selected"]["id"]
+                observed_rank = event.get("selected_observed_rank")
+                if observed_rank is None:
+                    # Pre-0.9 traces recorded the observed-catalogue rank under
+                    # the ambiguous name ``selected_rank``.
+                    observed_rank = event.get("selected_rank")
+                if observed_rank is None:
+                    observed_rank = next(
+                        (i for i, item in enumerate(event_candidates) if item.get("id") == selected_id),
+                        None,
+                    )
                 stored_offered = event.get("offered_digest")
-                if stored_offered and run_policy is not None:
+                recorded_offered_rank = event.get("selected_offered_rank")
+                recorded_offered_rank = (
+                    int(recorded_offered_rank) if recorded_offered_rank is not None else None
+                )
+                # A *distinct* offered catalogue exists only when the trace says
+                # so: catalog=="observed", an offered digest/count, or an
+                # explicit offered rank. A recorded catalogue means the observed
+                # catalogue itself was the offer.
+                has_offered = (
+                    event.get("catalog") == "observed"
+                    or stored_offered is not None
+                    or event.get("offered_count") is not None
+                    or recorded_offered_rank is not None
+                )
+                if has_offered and run_policy is not None:
                     # The recorded policy must be able to re-derive the catalogue
                     # the model was offered from the observed catalogue, or the
                     # trace evidence is inconsistent.
                     expected_offered = ReplaySimulator._retained_candidates(run_policy, event_candidates)
-                    if candidate_catalog_digest(expected_offered) != stored_offered:
+                    if stored_offered is not None and candidate_catalog_digest(expected_offered) != stored_offered:
                         raise ValueError(f"Run {run_id} has an offered catalogue digest mismatch")
-                selected_id = event["selected"]["id"]
-                selected_rank = event.get("selected_rank")
-                if selected_rank is None:
-                    selected_rank = next(
-                        (i for i, item in enumerate(event_candidates) if item.get("id") == selected_id),
+                    if event.get("offered_count") is not None and int(event["offered_count"]) != len(
+                        expected_offered
+                    ):
+                        raise ValueError(f"Run {run_id} has an offered count mismatch")
+                    selected_offered_rank = next(
+                        (i for i, item in enumerate(expected_offered) if item.get("id") == selected_id),
                         None,
                     )
+                    if recorded_offered_rank is not None and recorded_offered_rank != selected_offered_rank:
+                        raise ValueError(f"Run {run_id} has a selected offered-rank mismatch")
+                elif has_offered:
+                    # Offered catalogue recorded but the policy is unknown; the
+                    # recorded coordinate is the only honest value available.
+                    selected_offered_rank = recorded_offered_rank
+                else:
+                    # "recorded" catalogues: offered == observed, so a recorded
+                    # offered rank must equal the observed rank.
+                    if recorded_offered_rank is not None and recorded_offered_rank != observed_rank:
+                        raise ValueError(f"Run {run_id} has a selected offered-rank mismatch")
+                    selected_offered_rank = observed_rank
+                propensity = event.get("selected_propensity")
                 tr = RecordedTransition(
                     run_id=run_id,
                     task_key=key,
@@ -777,7 +820,9 @@ class ReplayWorld:
                     selected_kind=event["selected"].get("kind", ""),
                     candidate_actions=event_candidates,
                     candidate_digest=observed_digest,
-                    selected_rank=selected_rank,
+                    selected_observed_rank=observed_rank,
+                    selected_offered_rank=selected_offered_rank,
+                    selected_propensity=float(propensity) if propensity is not None else None,
                     page_changed=bool(event.get("page_changed")),
                     latency_ms=max(0, int(event.get("latency_ms", 0))),
                     model_calls=max(0, int(event.get("model_calls", 1))),
@@ -913,16 +958,16 @@ class ReplaySimulator:
                 prediction = outcome_model.predict(
                     kind=transition.selected_kind,
                     goal_overlap=selected_overlap,
-                    rank=transition.selected_rank,
+                    rank=transition.selected_offered_rank,
                 )
                 summary["predicted_change"] += prediction["p_page_changed"]
                 summary["prediction_samples"] += prediction["n"]
             if choice_model is not None:
-                # The candidate policy's recomputed offered rank — the same
-                # quantity as the recorded selected_rank but under *this*
-                # policy's catalogue — so the signal is policy-dependent.
-                # Counterfactual proposals annotate the summary only; they are
-                # never evidence and never reach a gate.
+                # The candidate policy's recomputed offered rank — the rank the
+                # recorded action would have had under *this* policy's offered
+                # catalogue — so the signal is policy-dependent. Counterfactual
+                # proposals annotate the summary only; they are never evidence
+                # and never reach a gate.
                 offered_rank = next(
                     (
                         i for i, item in enumerate(offered)
@@ -935,12 +980,14 @@ class ReplaySimulator:
                     goal_overlap=selected_overlap,
                     rank=offered_rank,
                 )
-                summary["choice_predicted_change"] += prediction["p_page_changed"]
+                summary["choice_predicted_change"] += prediction["p_progress"]
                 summary["choice_uncertainty"] += prediction["uncertainty"]
                 summary["choice_confident"] += int(prediction["confident"])
                 proposal = choice_model.choose(offered)
                 if proposal is not None:
-                    summary["choice_proposed_change"] += proposal["p_page_changed"]
+                    summary["choice_proposed_change"] += proposal["p_progress"]
+                    summary["choice_proposal_uncertainty"] += proposal["uncertainty"]
+                    summary["choice_proposal_confident"] += int(proposal["confident"])
                     summary["choice_divergences"] += int(
                         proposal["id"] != transition.selected_id
                     )
@@ -1056,6 +1103,8 @@ class ReplaySimulator:
             "choice_uncertainty": 0.0,
             "choice_confident": 0,
             "choice_divergences": 0,
+            "choice_proposal_uncertainty": 0.0,
+            "choice_proposal_confident": 0,
         }
 
     def _aggregate(self, summaries: list[dict], *, estimated: bool = False) -> ReplayMetrics:
@@ -1511,22 +1560,38 @@ class DreamImprover:
                 # Advisory annotation only: the choice prior evaluated under the
                 # candidate's own offered ordering, plus how often its
                 # counterfactual proposal differs from the action the recorded
-                # policy actually took. None of this enters a gate.
+                # policy actually took. None of this enters a gate. The two
+                # subjects are reported separately: the *selected* action's
+                # prior uncertainty/confidence and the *proposal's* — mixing
+                # them would make a confident divergent proposal look like a
+                # confident recorded action or vice versa.
                 pw = candidate_results["train"].per_world
                 steps = sum(s["actions"] for s in pw)
                 if steps:
+                    selected_uncertainty = fmean(
+                        s["choice_uncertainty"] / max(1, s["actions"]) for s in pw
+                    )
+                    selected_confident = sum(s["choice_confident"] for s in pw) / steps
                     entry["choice_model"] = {
-                        "predicted_page_changes_per_step": fmean(
+                        "predicted_progress_per_step": fmean(
                             s["choice_predicted_change"] / max(1, s["actions"]) for s in pw
                         ),
-                        "proposed_page_changes_per_step": fmean(
+                        "proposed_progress_per_step": fmean(
                             s["choice_proposed_change"] / max(1, s["actions"]) for s in pw
                         ),
-                        "mean_uncertainty": fmean(
-                            s["choice_uncertainty"] / max(1, s["actions"]) for s in pw
-                        ),
-                        "confident_fraction": sum(s["choice_confident"] for s in pw) / steps,
                         "divergence_rate": sum(s["choice_divergences"] for s in pw) / steps,
+                        "selected_mean_uncertainty": selected_uncertainty,
+                        "selected_confident_fraction": selected_confident,
+                        "proposal_mean_uncertainty": fmean(
+                            s["choice_proposal_uncertainty"] / max(1, s["actions"]) for s in pw
+                        ),
+                        "proposal_confident_fraction": sum(
+                            s["choice_proposal_confident"] for s in pw
+                        ) / steps,
+                        # Pre-split names retained as aliases; their subject was
+                        # always the recorded (selected) action.
+                        "mean_uncertainty": selected_uncertainty,
+                        "confident_fraction": selected_confident,
                     }
             evaluated.append(entry)
             if decision.approved:
@@ -2019,6 +2084,88 @@ class PolicyRegistry:
         return {**material, "digest": digest, "key_id": self.signer.key_id,
                 "signature": self.signer.sign_hex(digest, domain=ATTESTATION_SIG_DOMAIN)}
 
+    # Attestation kind → record fields the signed material must equal. The
+    # signature authenticates the *statement*; these bindings authenticate
+    # that the statement describes this exact record — otherwise a signed
+    # promotion could ride along on a record whose parent, canary evidence,
+    # promotion timestamp, or revision was edited after signing.
+    _ATTESTATION_BINDINGS = {
+        "promotion_attestation": {
+            "candidate_digest": ("digest",),
+            "parent_digest": ("parent_digest",),
+            "replay_report_hash": ("replay_report_hash",),
+            "world_pool_digest": ("world_pool_digest",),
+            "split_manifest_digest": ("split_manifest_digest",),
+            "evidence_head_hash": ("evidence_head_hash",),
+            "evidence_digest": ("canary", "evidence_digest"),
+            "event_head_hash": ("canary", "event_head_hash"),
+            "promoted_at_ms": ("promoted_at_ms",),
+            "registry_revision": ("promotion_revision",),
+        },
+        # Registry-state transition attestations chain to the state head they
+        # replace (binding the head of the write that contains them would be
+        # circular). Fields that later transitions legitimately mutate — the
+        # suspended flag, suspension timestamps — are deliberately not bound;
+        # the signed chained state head covers the payload as written.
+        "suspend_attestation": {
+            "candidate_digest": ("digest",),
+            "prev_state_head": ("suspend_prev_state_head",),
+            "registry_revision": ("suspend_revision",),
+        },
+        "resume_attestation": {
+            "candidate_digest": ("digest",),
+            "prev_state_head": ("resume_prev_state_head",),
+            "registry_revision": ("resume_revision",),
+        },
+        "rollback_attestation": {
+            "candidate_digest": ("digest",),
+            "rollback_from_digest": ("rollback_from_digest",),
+            "promoted_at_ms": ("rollback_at_ms",),
+            "registry_revision": ("rollback_revision",),
+            "prev_state_head": ("rollback_prev_state_head",),
+        },
+    }
+
+    def _check_attestation_binding(self, att: dict, record: dict, label: str):
+        kind = att.get("kind")
+        bindings = self._ATTESTATION_BINDINGS.get(kind, {"candidate_digest": ("digest",)})
+        mismatched = []
+        for field, path in bindings.items():
+            if field not in att:
+                continue
+            current = record
+            for key in path:
+                current = current.get(key) if isinstance(current, dict) else None
+            if current != att[field]:
+                mismatched.append(field)
+        if kind == "promotion_attestation":
+            if "behavior_digest" in att:
+                behavior = None
+                policy = record.get("policy")
+                if isinstance(policy, dict):
+                    try:
+                        behavior = ExplorationPolicy.from_dict(policy).behavior_digest
+                    except (ValueError, TypeError):
+                        behavior = None
+                if att["behavior_digest"] != behavior:
+                    mismatched.append("behavior_digest")
+            # The whole canary block — including the reference metrics that
+            # health_from_store() later trusts — is bound by a content digest
+            # rather than field-by-field paths.
+            if "canary_digest" in att:
+                canary = record.get("canary")
+                digest = (
+                    _stable_hash(json.dumps(canary, sort_keys=True, separators=(",", ":")))
+                    if isinstance(canary, dict) else None
+                )
+                if att["canary_digest"] != digest:
+                    mismatched.append("canary_digest")
+        if mismatched:
+            raise ValueError(
+                f"Policy registry {label} attestation is not bound to the record: "
+                f"{sorted(mismatched)}"
+            )
+
     def _check_attestation(self, att: dict, record: dict, label: str):
         material = {k: v for k, v in att.items() if k not in {"digest", "signature", "key_id"}}
         digest = self._attestation_digest(material)
@@ -2031,8 +2178,7 @@ class PolicyRegistry:
             domain=ATTESTATION_SIG_DOMAIN,
         ):
             raise ValueError(f"Policy registry {label} attestation signature invalid")
-        if att.get("candidate_digest") != record.get("digest"):
-            raise ValueError(f"Policy registry {label} attestation is not bound to the record digest")
+        self._check_attestation_binding(att, record, label)
 
     def _verify_attestation(self, record: dict | None, label: str):
         """Verify a record's promotion attestation when trust keys are configured."""
@@ -2042,9 +2188,10 @@ class PolicyRegistry:
         if not isinstance(att, dict):
             raise ValueError(f"Policy registry {label} record lacks a promotion attestation")
         self._check_attestation(att, record, label)
-        rollback_att = record.get("rollback_attestation")
-        if isinstance(rollback_att, dict):
-            self._check_attestation(rollback_att, record, f"{label} rollback")
+        for key in ("rollback_attestation", "suspend_attestation", "resume_attestation"):
+            transition_att = record.get(key)
+            if isinstance(transition_att, dict):
+                self._check_attestation(transition_att, record, f"{label} {key}")
 
     def load(self) -> dict:
         with self._lock, _file_lock(self.lock_path):
@@ -2056,6 +2203,37 @@ class PolicyRegistry:
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         if payload.get("schema") not in SUPPORTED_SCHEMAS or payload.get("tcb_version") not in SUPPORTED_TCB_VERSIONS:
             raise ValueError("Unsupported policy registry schema/TCB version")
+        # Chained registry state head (jev-dream/4): the digest covers the whole
+        # written payload — revision, active, staged, history, prev_state_digest —
+        # so post-write edits to any field (including mutable ones such as
+        # ``suspended``) are caught, and under a signer the head cannot be
+        # resealed without the key. A wholesale restore of an older signed file
+        # still replays cleanly; defeating that needs an externally anchored
+        # latest head, the same residual the evidence anchor carries.
+        state_digest = payload.get("state_digest")
+        if state_digest is not None:
+            if state_digest != self._state_digest(payload):
+                raise ValueError("Policy registry state digest mismatch")
+            signature = payload.get("state_signature")
+            if signature is not None:
+                trusted = set(self.verify_keys)
+                if self.signer is not None:
+                    trusted.add(self.signer.key_id)
+                if not trusted:
+                    raise ValueError(
+                        "Signed policy registry state but no verification key is configured"
+                    )
+                if payload.get("state_key_id") not in trusted:
+                    raise ValueError("Policy registry state signed by an unexpected key")
+                if not verify_signature(
+                    str(payload["state_key_id"]), str(state_digest), str(signature),
+                    domain=REGISTRY_STATE_DOMAIN,
+                ):
+                    raise ValueError("Policy registry state signature verification failure")
+            elif self.verify_keys:
+                raise ValueError(
+                    "Unsigned policy registry state while verification keys are configured"
+                )
         payload.setdefault("revision", 0)
         payload.setdefault("active", None)
         payload.setdefault("staged", None)
@@ -2080,11 +2258,31 @@ class PolicyRegistry:
         payload["tcb_version"] = TCB_VERSION
         return payload
 
+    @staticmethod
+    def _state_digest(payload: dict) -> str:
+        material = {
+            k: v for k, v in payload.items()
+            if k not in {"state_digest", "state_key_id", "state_signature"}
+        }
+        canonical = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return _stable_hash(f"{REGISTRY_STATE_DOMAIN.decode()}\n{canonical}")
+
     def _write(self, payload: dict):
         payload = dict(payload)
         payload["schema"] = SCHEMA_VERSION
         payload["tcb_version"] = TCB_VERSION
         payload["revision"] = int(payload.get("revision", 0)) + 1
+        # Chain each write to the head it replaces so history cannot be
+        # reordered, truncated, or rewritten without invalidating the digest.
+        payload["prev_state_digest"] = payload.get("state_digest") or "0" * 64
+        payload.pop("state_signature", None)
+        payload.pop("state_key_id", None)
+        payload["state_digest"] = self._state_digest(payload)
+        if self.signer is not None:
+            payload["state_key_id"] = self.signer.key_id
+            payload["state_signature"] = self.signer.sign_hex(
+                payload["state_digest"], domain=REGISTRY_STATE_DOMAIN
+            )
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         with tmp.open("w", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -2148,26 +2346,32 @@ class PolicyRegistry:
                     "deactivation_reason": "superseded",
                 })
             promoted_at = int(time.time() * 1000)
+            # The revision _write() will assign this promotion.
+            promotion_revision = int(payload.get("revision", 0)) + 1
+            canary = {
+                "baseline": asdict(evidence.baseline),
+                "candidate": asdict(evidence.candidate),
+                "paired_task_families": evidence.paired_task_families,
+                "candidate_wins": evidence.candidate_wins,
+                "baseline_wins": evidence.baseline_wins,
+                "ties": evidence.ties,
+                "event_head_hash": evidence.event_head_hash,
+                "evidence_digest": evidence.evidence_digest,
+                "reason": decision.reason,
+            }
             payload["active"] = {
                 **staged,
                 "promoted_at_ms": promoted_at,
+                "promotion_revision": promotion_revision,
                 "suspended": False,
-                "canary": {
-                    "baseline": asdict(evidence.baseline),
-                    "candidate": asdict(evidence.candidate),
-                    "paired_task_families": evidence.paired_task_families,
-                    "candidate_wins": evidence.candidate_wins,
-                    "baseline_wins": evidence.baseline_wins,
-                    "ties": evidence.ties,
-                    "event_head_hash": evidence.event_head_hash,
-                    "evidence_digest": evidence.evidence_digest,
-                    "reason": decision.reason,
-                },
+                "canary": canary,
             }
             if self.signer is not None:
                 # The promotion itself is signed authority: the attestation
-                # binds candidate, parent, and the exact evidence digests that
-                # qualified it, at the registry revision _write will assign.
+                # binds candidate, parent, the exact evidence digests that
+                # qualified it, the whole canary block (so the health-check
+                # reference metrics cannot be edited under a valid signature),
+                # and the registry revision _write will assign.
                 payload["active"]["attestation"] = self._sign_attestation({
                     "kind": "promotion_attestation",
                     "candidate_digest": staged["digest"],
@@ -2179,7 +2383,10 @@ class PolicyRegistry:
                     "evidence_head_hash": staged.get("evidence_head_hash"),
                     "evidence_digest": evidence.evidence_digest,
                     "event_head_hash": evidence.event_head_hash,
-                    "registry_revision": int(payload.get("revision", 0)) + 1,
+                    "canary_digest": _stable_hash(
+                        json.dumps(canary, sort_keys=True, separators=(",", ":"))
+                    ),
+                    "registry_revision": promotion_revision,
                     "promoted_at_ms": promoted_at,
                 })
             payload["staged"] = None
@@ -2291,6 +2498,20 @@ class PolicyRegistry:
             active["suspended"] = True
             active["suspended_at_ms"] = int(time.time() * 1000)
             active["suspension_reason"] = str(reason)[:512]
+            if self.signer is not None:
+                # The transition is a signed statement chained to the state
+                # head it replaces; the payload's signed state head then covers
+                # the whole post-transition registry.
+                active["suspend_revision"] = int(payload.get("revision", 0)) + 1
+                active["suspend_prev_state_head"] = payload.get("state_digest") or "0" * 64
+                active["suspend_attestation"] = self._sign_attestation({
+                    "kind": "suspend_attestation",
+                    "candidate_digest": active["digest"],
+                    "registry_revision": active["suspend_revision"],
+                    "prev_state_head": active["suspend_prev_state_head"],
+                    "suspended_at_ms": active["suspended_at_ms"],
+                    "reason": active["suspension_reason"],
+                })
             self._write(payload)
             return active
 
@@ -2303,6 +2524,16 @@ class PolicyRegistry:
             active["suspended"] = False
             active.pop("suspended_at_ms", None)
             active.pop("suspension_reason", None)
+            if self.signer is not None:
+                active["resume_revision"] = int(payload.get("revision", 0)) + 1
+                active["resume_prev_state_head"] = payload.get("state_digest") or "0" * 64
+                active["resume_attestation"] = self._sign_attestation({
+                    "kind": "resume_attestation",
+                    "candidate_digest": active["digest"],
+                    "registry_revision": active["resume_revision"],
+                    "prev_state_head": active["resume_prev_state_head"],
+                    "resumed_at_ms": int(time.time() * 1000),
+                })
             self._write(payload)
             return active
 
@@ -2332,20 +2563,30 @@ class PolicyRegistry:
                 })
             target = {k: v for k, v in target.items() if k not in {"deactivated_at_ms", "deactivation_reason"}}
             target["suspended"] = False
-            target["rollback_at_ms"] = int(time.time() * 1000)
-            target["rollback_from_digest"] = current.get("digest") if current else None
             # A rolled-back record re-enters authority: when verification keys
-            # are configured its original promotion attestation must hold.
+            # are configured its existing attestations must hold against the
+            # record as written — verify before stamping the new transition
+            # fields, since a prior rollback attestation binds the prior
+            # rollback_revision.
             if self.verify_keys:
                 self._verify_attestation(target, "rollback")
+            target["rollback_at_ms"] = int(time.time() * 1000)
+            target["rollback_from_digest"] = current.get("digest") if current else None
+            # The revision _write() will assign this rollback; the record's
+            # promotion_revision stays untouched so its promotion attestation
+            # still verifies against the original promotion.
+            target["rollback_revision"] = int(payload.get("revision", 0)) + 1
+            target["rollback_prev_state_head"] = payload.get("state_digest") or "0" * 64
             if self.signer is not None:
                 # Sign the rollback transition itself so authority restoration
-                # is attested rather than only the original promotion.
+                # is attested rather than only the original promotion, chained
+                # to the registry state head it replaces.
                 target["rollback_attestation"] = self._sign_attestation({
                     "kind": "rollback_attestation",
                     "candidate_digest": target["digest"],
                     "rollback_from_digest": target["rollback_from_digest"],
-                    "registry_revision": int(payload.get("revision", 0)) + 1,
+                    "registry_revision": target["rollback_revision"],
+                    "prev_state_head": target["rollback_prev_state_head"],
                     "promoted_at_ms": target["rollback_at_ms"],
                 })
             payload["active"] = target

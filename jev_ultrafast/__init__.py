@@ -16,12 +16,19 @@ from .dream import (
     ReplaySimulator,
     ReplayWorld,
 )
-from .dreamlearn import CostModel, OutcomeModel
+from .dreamlearn import ChoiceModel, CostModel, OutcomeModel
 from .model import DecisionBackend, SystemOneBackend
-from .policy import DefaultActionPolicy, Effect, PolicyDecision, classify_effect
+from .policy import (
+    DefaultActionPolicy,
+    Effect,
+    PolicyDecision,
+    assess_payload,
+    classify_effect,
+    classify_payload,
+)
 from .signing import EvidenceSigner
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 __all__ = [
     "Agent",
@@ -32,6 +39,8 @@ __all__ = [
     "PolicyDecision",
     "Effect",
     "classify_effect",
+    "classify_payload",
+    "assess_payload",
     "ExplorationPolicy",
     "ExperienceStore",
     "ReplayWorld",
@@ -46,5 +55,6 @@ __all__ = [
     "HealthGate",
     "CostModel",
     "OutcomeModel",
+    "ChoiceModel",
     "EvidenceSigner",
 ]
