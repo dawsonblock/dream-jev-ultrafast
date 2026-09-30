@@ -21,7 +21,7 @@ These thresholds are intentionally minimum operational gates. They are not claim
 
 ## Compatibility
 
-- Reads v0.3 `jev-dream/1` / `jev-ultrafast-tcb/0.3` trace events.
-- New events are `jev-dream/2` / `jev-ultrafast-tcb/0.4`.
+- Reads v0.3 `jev-dream/1` and `jev-ultrafast-tcb/0.3`/`0.4` trace events.
+- New events are `jev-dream/2` / `jev-ultrafast-tcb/0.5`: post-review hardening unified the tokenizer used for recorded candidate `goal_overlap`, and replay improvement refuses pools that mix TCB generations.
 - The v0.3 CLI form `jev-dream EXPERIENCE ...` remains accepted and maps to `jev-dream improve EXPERIENCE ...`.
 - Old staged registry entries lack v0.4 lineage/evidence fields and should be restaged under v0.4 before promotion.

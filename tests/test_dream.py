@@ -4,6 +4,7 @@ import multiprocessing
 import pytest
 
 from jev_ultrafast.dream import (
+    TCB_VERSION,
     CanaryEvidence,
     CanaryGate,
     CanaryMetrics,
@@ -791,3 +792,70 @@ def test_v04_reads_v03_experience_events(tmp_path):
     loaded = ExperienceStore(path).load()
     assert loaded[0]["schema"] == "jev-dream/1"
     assert loaded[0]["tcb_version"] == "jev-ultrafast-tcb/0.3"
+
+
+def _write_legacy_tcb_run(path, run_id, tcb_version, goal, *, status="done", verified=True):
+    """Append a complete hash-valid run stamped with an older TCB version."""
+    key = task_key(goal)
+    policy = ExplorationPolicy()
+    events = [
+        {"run_id": run_id, "task_key": key, "sequence": 1, "event": "run_started",
+         "goal": goal, "state": "S", "policy": policy.to_dict(), "policy_digest": policy.digest},
+        {"run_id": run_id, "task_key": key, "sequence": 2, "event": "transition",
+         "state": "S", "next_state": "D", "selected": {"id": "go", "kind": "click"},
+         "candidates": [{"id": "go", "kind": "click", "label": "Go", "goal_overlap": 1}],
+         "page_changed": True, "latency_ms": 10, "model_calls": 1, "tokens": 5,
+         "stale_or_failure": 0, "risk_events": 0},
+        {"run_id": run_id, "task_key": key, "sequence": 3, "event": "run_finished",
+         "status": status, "verified": verified},
+    ]
+    lines = path.read_text().splitlines() if path.exists() else []
+    prev = json.loads(lines[-1])["event_hash"] if lines else "0" * 64
+    for event in events:
+        payload = {
+            "schema": "jev-dream/2",
+            "tcb_version": tcb_version,
+            "recorded_at_ms": 1,
+            "prev_hash": prev,
+            **event,
+        }
+        payload["event_hash"] = ExperienceStore._event_hash(payload)
+        lines.append(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        prev = payload["event_hash"]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_new_events_use_current_tcb_and_read_legacy_tail(tmp_path):
+    path = tmp_path / "mixed-tcb.jsonl"
+    _write_legacy_tcb_run(path, "legacy", "jev-ultrafast-tcb/0.4", "goal")
+    store = ExperienceStore(path)
+    store.append({"run_id": "new", "event": "fresh"})
+    events = store.load()
+    assert events[0]["tcb_version"] == "jev-ultrafast-tcb/0.4"
+    assert events[-1]["tcb_version"] == TCB_VERSION
+
+
+def test_improve_rejects_replay_pools_mixing_tcb_generations(tmp_path):
+    path = tmp_path / "mixed-pool.jsonl"
+    _write_legacy_tcb_run(path, "old", "jev-ultrafast-tcb/0.4", "goal")
+    transition = [{
+        "state": "S", "next_state": "D", "selected": {"id": "go", "kind": "click"},
+        "candidates": [{"id": "go", "kind": "click", "label": "Go", "goal_overlap": 1}],
+        "page_changed": True, "latency_ms": 10, "model_calls": 1, "tokens": 5,
+        "stale_or_failure": 0, "risk_events": 0,
+    }]
+    store = ExperienceStore(path)
+    _append_run(store, "new", "goal", transition, status="done", verified=True)
+    worlds = ReplayWorld.from_events(store.load())
+    assert {world.tcb_version for world in worlds} == {"jev-ultrafast-tcb/0.4", TCB_VERSION}
+    with pytest.raises(ValueError, match="TCB"):
+        DreamImprover().improve(worlds, ExplorationPolicy())
+
+
+def test_health_gate_marks_insufficient_coverage():
+    gate = HealthGate(min_tasks=20)
+    reference = CanaryMetrics(tasks=20, verified_successes=20)
+    quiet = gate.assess(reference, CanaryMetrics(tasks=3, verified_successes=3))
+    assert quiet.healthy and quiet.sufficient is False
+    full = gate.assess(reference, CanaryMetrics(tasks=20, verified_successes=20))
+    assert full.healthy and full.sufficient is True

@@ -4,7 +4,7 @@ Validation date: 2026-09-29.
 
 ## Reproduced in this build environment
 
-- `uv run pytest`: **107 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
+- `uv run pytest`: **110 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
 - `uv run ruff check .`: passed.
 - `uv build`: passed (`dist/jev_ultrafast-0.4.0.tar.gz`, `dist/jev_ultrafast-0.4.0-py3-none-any.whl`).
 - `python -m compileall -q jev_ultrafast tests examples scripts`: passed.
@@ -21,6 +21,12 @@ Validation date: 2026-09-29.
 - The real Browser Harness / Chrome live integration suite (`scripts/check_guards.py`) was not executed here; the package is installed but no live Chrome target was exercised.
 
 Run the live-browser checks on the deployment machine before unattended use.
+
+## Documented decisions
+
+- `candidate_since_ms` uses `>=` when binding canary evidence to `staged_at_ms`: a candidate run finishing in the same millisecond as staging is admissible, and a stricter `>` would silently drop valid evidence.
+- `ExperienceStore(strict=False)` remains the default; the O(n) full-chain verify is opt-in for qualification-critical stores.
+- `demo.py` binds `127.0.0.1` only, with token, Host, and Origin checks; it is a local inspector by design.
 
 ## New v0.4 regression coverage
 
@@ -54,7 +60,10 @@ The test suite now covers the v0.3 contracts plus:
 - trace candidate catalogues computed only when a DREAM recorder is active;
 - cross-process serialization of policy-registry stage/promote/suspend/resume/rollback writes;
 - canary risk comparison per task (rate) as well as absolute count;
-- optional `strict` experience stores that verify the full hash chain before every append.
+- optional `strict` experience stores that verify the full hash chain before every append;
+- replay improvement refuses pools that mix DREAM TCB generations (new events are `jev-ultrafast-tcb/0.5`; pre-unification traces recorded `goal_overlap` with the legacy tokenizer);
+- health decisions mark insufficient observed coverage (`sufficient=false`) separately from drift outcomes;
+- promotion requires non-empty bound evidence digests in every path.
 
 ## Deployment gate
 

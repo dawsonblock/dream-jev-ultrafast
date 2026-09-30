@@ -25,8 +25,8 @@ from .privacy import tokenize
 
 SCHEMA_VERSION = "jev-dream/2"
 SUPPORTED_SCHEMAS = {"jev-dream/1", SCHEMA_VERSION}
-TCB_VERSION = "jev-ultrafast-tcb/0.4"
-SUPPORTED_TCB_VERSIONS = {"jev-ultrafast-tcb/0.3", TCB_VERSION}
+TCB_VERSION = "jev-ultrafast-tcb/0.5"
+SUPPORTED_TCB_VERSIONS = {"jev-ultrafast-tcb/0.3", "jev-ultrafast-tcb/0.4", TCB_VERSION}
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
 
 
@@ -864,6 +864,10 @@ class DreamImprover:
         pool_digest = replay_pool_digest(worlds)
         split_digest = split_manifest_digest(splits)
         tcb_versions = tuple(sorted({world.tcb_version for world in worlds}))
+        if len(tcb_versions) > 1:
+            raise ValueError(
+                "Replay worlds mix DREAM TCB versions; improve each evidence generation separately"
+            )
         split_sizes = {k: len(v) for k, v in splits.items()}
         train = splits["train"]
         if not train:
@@ -1265,6 +1269,7 @@ class HealthDecision:
     reason: str
     reference: CanaryMetrics
     observed: CanaryMetrics
+    sufficient: bool = True
 
 
 class HealthGate:
@@ -1277,7 +1282,9 @@ class HealthGate:
 
     def assess(self, reference: CanaryMetrics, observed: CanaryMetrics) -> HealthDecision:
         if observed.tasks < self.min_tasks:
-            return HealthDecision(True, "insufficient recent tasks for drift decision", reference, observed)
+            return HealthDecision(
+                True, "insufficient recent tasks for drift decision", reference, observed, sufficient=False
+            )
         if reference.tasks and observed.success_rate + self.max_success_regression < reference.success_rate:
             return HealthDecision(False, "active policy verified-success drift", reference, observed)
         if observed.risk_rate > reference.risk_rate + self.max_extra_risk_rate:

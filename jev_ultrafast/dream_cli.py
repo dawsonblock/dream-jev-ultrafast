@@ -115,6 +115,7 @@ def main(argv=None):
         )
         _json({
             "healthy": decision.healthy,
+            "sufficient": decision.sufficient,
             "reason": decision.reason,
             "reference": decision.reference.__dict__,
             "observed": decision.observed.__dict__,

@@ -14,11 +14,12 @@
     ],
     "intentional_deviation": "DREAM-Jev remains conservative trajectory-retention replay: it never predicts that the fixed decision model would choose a different browser action or invent an unseen DOM outcome."
   },
-  "trusted_computing_base": "jev-ultrafast-tcb/0.4",
+  "trusted_computing_base": "jev-ultrafast-tcb/0.5",
   "experience_schema": "jev-dream/2",
   "backward_read_compatibility": [
     "jev-dream/1",
-    "jev-ultrafast-tcb/0.3"
+    "jev-ultrafast-tcb/0.3",
+    "jev-ultrafast-tcb/0.4"
   ],
   "self_improvable": [
     "candidate ranking weights",
@@ -62,22 +63,22 @@
     "paired_family_coverage_min": 0.8,
     "verified_success_regression": 0.0,
     "extra_risk_events": 0,
+    "extra_risk_rate": 0.0,
     "failure_rate_regression": 0.0,
     "average_latency_regression_ratio_max": 0.25,
     "average_action_regression_ratio_max": 0.25,
     "average_token_regression_ratio_max": 0.25
   },
   "validation": {
-    "offline_tests_passed": 68,
+    "offline_tests_passed": 110,
     "python_compileall": "passed",
     "javascript_syntax": "passed",
     "toml_json_parse": "passed",
     "dream_cli_smoke": "passed",
     "cross_process_store_test": "passed",
-    "uv_lock_check_offline": "not reproduced; browser-harness absent from cache",
-    "uv_sync_offline": "not completed; typing-extensions==4.16.0 absent from cache",
-    "uv_build_offline": "not completed; hatchling absent from cache",
-    "ruff": "not reproduced; Ruff unavailable offline",
+    "cross_process_registry_test": "passed",
+    "ruff": "passed",
+    "uv_build": "passed",
     "live_browser_harness": "not run in offline build environment"
   }
 }

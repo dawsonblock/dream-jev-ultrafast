@@ -110,7 +110,7 @@ run id / task key / sequence
 run or transition payload
 ```
 
-`load()` verifies the entire chain. `verify()` reports event count, head hash, schemas, and TCB versions. v0.4 can read v0.3 stores; new events use `jev-dream/2` and `jev-ultrafast-tcb/0.4`.
+`load()` verifies the entire chain. `verify()` reports event count, head hash, schemas, and TCB versions. v0.4 can read v0.3 stores; new events use `jev-dream/2` and `jev-ultrafast-tcb/0.5`. TCB 0.4 traces remain readable, but replay improvement refuses a pool that mixes TCB generations — the tokenizer used for recorded `goal_overlap` changed between them, so pre- and post-unification worlds are never scored together.
 
 The chain is tamper-evident, not a digital signature. A party able to rewrite the whole file can recompute hashes. Deployments that need provenance against a malicious host should externally sign or anchor the head hash.
 
