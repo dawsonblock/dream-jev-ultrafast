@@ -22,16 +22,27 @@ from statistics import fmean
 from typing import Iterable
 
 from .privacy import action_goal_overlap
-from .signing import EvidenceSigner, verify_keys_from_env, verify_signature
+from .signing import (
+    ANCHOR_DOMAIN,
+    PROMOTION_SIGNING_KEY_ENV,
+    PROMOTION_VERIFY_KEYS_ENV,
+    EvidenceSigner,
+    verify_keys_from_env,
+    verify_signature,
+)
+from .signing import (
+    ATTESTATION_DOMAIN as ATTESTATION_SIG_DOMAIN,
+)
 
 SCHEMA_VERSION = "jev-dream/3"
 SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", SCHEMA_VERSION}
-TCB_VERSION = "jev-ultrafast-tcb/0.7"
+TCB_VERSION = "jev-ultrafast-tcb/0.8"
 SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.3",
     "jev-ultrafast-tcb/0.4",
     "jev-ultrafast-tcb/0.5",
     "jev-ultrafast-tcb/0.6",
+    "jev-ultrafast-tcb/0.7",
     TCB_VERSION,
 }
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
@@ -94,14 +105,27 @@ def new_run_id() -> str:
 
 
 def candidate_catalog_digest(candidates: Iterable[dict]) -> str:
-    """Digest the replay-relevant candidate catalogue in its original order."""
+    """Digest the replay-relevant candidate catalogue in its original order.
+
+    Every field that can alter retention, ordering, grouping, or policy
+    evaluation is bound — including ``node``, which ``duplicate_node_cap``
+    groups by. Two catalogues differing only in node identity are different
+    replay evidence.
+    """
     compact = []
     for candidate in candidates:
         compact.append({
             "id": candidate.get("id"),
             "kind": candidate.get("kind"),
+            "node": candidate.get("node"),
+            "role": candidate.get("role"),
             "label": candidate.get("label", ""),
             "value": candidate.get("value", ""),
+            "current_value": candidate.get("current_value"),
+            "option_index": candidate.get("option_index"),
+            "option_label": candidate.get("option_label"),
+            "checked": candidate.get("checked"),
+            "ctx": candidate.get("ctx"),
             "goal_overlap": max(0, int(candidate.get("goal_overlap", 0))),
         })
     return _stable_hash(json.dumps(compact, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
@@ -284,6 +308,7 @@ class ExperienceStore:
         verify_key: str | None = None,
         verify_keys=None,
         require_signatures: bool = False,
+        anchor_path: str | os.PathLike | None = None,
     ):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -293,6 +318,12 @@ class ExperienceStore:
         # verifies the whole chain first so a mid-chain corruption cannot keep
         # accumulating events into a store that load() would reject.
         self.strict = strict
+        # Optional chain-head anchor: after each append the current head is
+        # written to a separate (signed) checkpoint file that may live on
+        # different storage. Reads fail closed when the anchor records a head
+        # the log no longer reaches — the difference between a torn crash
+        # write and deliberate tail truncation becomes observable.
+        self.anchor_path = Path(anchor_path) if anchor_path else None
         # Optional authenticity: a signer object exposing ``key_id`` and
         # ``sign_hex`` (Ed25519 EvidenceSigner by default via env key). The
         # signer interface is injectable so private material can live outside
@@ -354,8 +385,13 @@ class ExperienceStore:
             )
         with self._lock, _file_lock(self.lock_path):
             needs_separator = self._truncate_torn_tail_unlocked()
-            if self.strict:
-                self._load_unlocked()
+            if self.strict or self.anchor_path is not None:
+                # Anchored stores check the log against the checkpoint BEFORE
+                # appending — otherwise an append would re-anchor over a
+                # truncated tail and erase the very gap the anchor detects.
+                events, _ = self._load_unlocked()
+                if self.anchor_path is not None:
+                    self._check_anchor_unlocked(events)
             tail = self._tail_event_unlocked()
             if tail:
                 if tail.get("schema") not in SUPPORTED_SCHEMAS or tail.get("tcb_version") not in SUPPORTED_TCB_VERSIONS:
@@ -384,7 +420,118 @@ class ExperienceStore:
                 os.fsync(handle.fileno())
             if created:
                 _fsync_dir(self.path.parent)
+            if self.anchor_path is not None:
+                # Checkpoint the new head under the same lock so the anchor is
+                # never ahead of a head that did not survive.
+                self._write_anchor_unlocked(
+                    payload["event_hash"], self._anchor_sequence_unlocked())
             return payload
+
+    _ANCHOR_CONTENT_DOMAIN = "jev-dream/chain-head-anchor/v1"
+
+    def _anchor_sequence_unlocked(self) -> int:
+        anchor = self._read_anchor()
+        if anchor is not None:
+            return int(anchor.get("sequence", 0)) + 1
+        # Bootstrap: count the records the log currently holds (O(n) once).
+        if not self.path.exists():
+            return 0
+        return sum(1 for raw in self.path.read_bytes().split(b"\n") if raw.strip())
+
+    def _read_anchor(self) -> dict | None:
+        if self.anchor_path is None or not self.anchor_path.exists():
+            return None
+        try:
+            anchor = json.loads(self.anchor_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ValueError("Invalid DREAM chain-head anchor file") from exc
+        if not isinstance(anchor, dict) or anchor.get("kind") != "chain_head_anchor":
+            raise ValueError("Invalid DREAM chain-head anchor file")
+        return anchor
+
+    def _write_anchor_unlocked(self, head: str, sequence: int) -> dict | None:
+        if self.anchor_path is None:
+            return None
+        material = {
+            "kind": "chain_head_anchor",
+            "head": head,
+            "sequence": sequence,
+            "signed_at_ms": int(time.time() * 1000),
+        }
+        digest = _stable_hash(
+            f"{self._ANCHOR_CONTENT_DOMAIN}\n"
+            + json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        anchor = {**material, "digest": digest}
+        if self.signer is not None:
+            anchor["key_id"] = self.signer.key_id
+            anchor["signature"] = self.signer.sign_hex(digest, domain=ANCHOR_DOMAIN)
+        self.anchor_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.anchor_path.with_suffix(self.anchor_path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(anchor, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, self.anchor_path)
+        _fsync_dir(self.anchor_path.parent)
+        return anchor
+
+    def _check_anchor_unlocked(self, events: list[dict]) -> dict | None:
+        """Anchor consistency when ``anchor_path`` is configured.
+
+        Fails closed when the anchor is missing while the store holds events,
+        when a signed anchor fails verification, when an unsigned anchor is
+        found while trust keys are configured, or when the anchor head
+        disagrees with the recomputed log head (truncation or stale anchor).
+        """
+        if self.anchor_path is None:
+            return None
+        anchor = self._read_anchor()
+        if anchor is None:
+            if events:
+                raise ValueError("DREAM chain-head anchor missing while the store holds events")
+            return None
+        material = {k: v for k, v in anchor.items() if k not in {"digest", "signature", "key_id"}}
+        digest = _stable_hash(
+            f"{self._ANCHOR_CONTENT_DOMAIN}\n"
+            + json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        if anchor.get("digest") != digest:
+            raise ValueError("DREAM chain-head anchor digest mismatch")
+        signature = anchor.get("signature")
+        if signature is not None:
+            if not self.verify_keys:
+                raise ValueError("Signed DREAM anchor but no verification key is configured")
+            if anchor.get("key_id") not in self.verify_keys:
+                raise ValueError("DREAM anchor signed by an unexpected key")
+            if not verify_signature(
+                anchor["key_id"], digest, str(signature), domain=ANCHOR_DOMAIN
+            ):
+                raise ValueError("DREAM anchor signature verification failure")
+        elif self.verify_keys or self.require_signatures:
+            raise ValueError("Unsigned DREAM chain-head anchor while trust keys are configured")
+        head = events[-1]["event_hash"] if events else "0" * 64
+        if anchor.get("head") != head or int(anchor.get("sequence", -1)) != len(events):
+            raise ValueError(
+                "DREAM chain-head anchor disagrees with the log: evidence tail "
+                "truncated or anchor stale"
+            )
+        return anchor
+
+    def reanchor(self) -> dict:
+        """Write a fresh anchor for the current verified head.
+
+        This is the operator-level resolution after a confirmed truncation or
+        a lost anchor file. It is deliberately explicit — appends never
+        silently re-anchor, so a gap between anchor and log always surfaces.
+        """
+        with self._lock, _file_lock(self.lock_path):
+            events, _ = self._load_unlocked()
+            head = events[-1]["event_hash"] if events else "0" * 64
+            anchor = self._write_anchor_unlocked(head, len(events))
+            if anchor is None:
+                raise ValueError("No anchor_path configured for this store")
+            return anchor
 
     def _truncate_torn_tail_unlocked(self) -> bool:
         """Discard a crash-torn final fragment; return True when a separator is owed.
@@ -479,13 +626,15 @@ class ExperienceStore:
     def load(self) -> list[dict]:
         with self._lock, _file_lock(self.lock_path):
             events, _ = self._load_unlocked()
+            self._check_anchor_unlocked(events)
             return events
 
     def verify(self) -> dict:
         with self._lock, _file_lock(self.lock_path):
             events, torn_offset = self._load_unlocked()
+            anchor = self._check_anchor_unlocked(events)
         signed = sum(1 for event in events if event.get("signature"))
-        return {
+        report = {
             "events": len(events),
             "head_hash": events[-1]["event_hash"] if events else "0" * 64,
             "schemas": sorted({event["schema"] for event in events}),
@@ -496,6 +645,15 @@ class ExperienceStore:
             "signatures_checked": bool(self.verify_keys) if signed else None,
             "torn_tail_recovered": torn_offset is not None,
         }
+        if self.anchor_path is not None:
+            report["anchor"] = {
+                "path": str(self.anchor_path),
+                "present": anchor is not None,
+                "consistent": anchor is not None,
+                "sequence": anchor.get("sequence") if anchor else None,
+                "signed": bool(anchor.get("signature")) if anchor else False,
+            }
+        return report
 
     def head_hash(self) -> str:
         return self.verify()["head_hash"]
@@ -1461,7 +1619,10 @@ def _canary_run_summaries(
             finished_at_ms=finished_at_ms,
             task_family=task_family,
             instance_id=instance_id,
-            pair_key=instance_id or task_key,
+            # Namespaced by family: an instance_id only means "the same task
+            # instance" *within* a family — bare instance ids collide across
+            # families (flights#1 ≠ hotels#1).
+            pair_key=f"{task_family}\x00{instance_id}" if instance_id else task_key,
         ))
     summaries.sort(key=lambda run: (run.finished_at_ms, run.run_id))
     return summaries
@@ -1545,6 +1706,10 @@ class CanaryEvidence:
         for key in shared:
             b = base_groups[key]
             c = cand_groups[key]
+            # A pair key embeds its family, so equal keys should imply equal
+            # families; a mismatch means the evidence is structurally corrupt.
+            if b[0].task_family != c[0].task_family:
+                raise ValueError(f"Canary pair key {key!r} spans inconsistent task families")
             paired_families.add((b[0].task_family or b[0].task_key))
             b_rate = sum(int(r.verified_success) for r in b) / len(b)
             c_rate = sum(int(r.verified_success) for r in c) / len(c)
@@ -1717,19 +1882,40 @@ class HealthGate:
         return HealthDecision(True, "active policy health gates passed", reference, observed)
 
 
+ATTESTATION_DOMAIN = "jev-dream/promotion-attestation/v1"  # content prefix (inside the digest)
+# ATTESTATION_SIG_DOMAIN is the signature frame — separate from evidence events.
+
+
 class PolicyRegistry:
     """Atomic registry with lineage binding, evidence binding, suspension, and rollback.
 
     Only bounded ``ExplorationPolicy`` data can be promoted. Staging is bound to
     the active parent policy and replay evidence digests, preventing a report
     generated against stale policy state from being activated later.
+
+    When a ``signer`` is configured (``JEV_PROMOTION_SIGNING_KEY``, falling back
+    to the evidence key), every promotion attaches a signed ``attestation``
+    binding the candidate digest, parent digest, replay/canary evidence digests,
+    and the registry revision at promotion time. When ``verify_keys`` is
+    configured (``JEV_PROMOTION_VERIFY_KEYS`` or the evidence verify keys), any
+    ``active`` record without a valid, correctly bound attestation fails closed
+    on load — the registry becomes a view over signed authority rather than
+    the authority itself.
     """
 
-    def __init__(self, path: str | os.PathLike):
+    def __init__(self, path: str | os.PathLike, *, signer=None, verify_keys=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         self._lock = threading.RLock()
+        self.signer = signer if signer is not None else (
+            EvidenceSigner.from_env(PROMOTION_SIGNING_KEY_ENV) or EvidenceSigner.from_env()
+        )
+        keys = {k.strip() for k in (verify_keys or []) if k and k.strip()}
+        keys.update(verify_keys_from_env(PROMOTION_VERIFY_KEYS_ENV))
+        # Evidence verification keys are a valid promotion authority too.
+        keys.update(verify_keys_from_env())
+        self.verify_keys = keys
 
     @staticmethod
     def _empty():
@@ -1750,6 +1936,43 @@ class PolicyRegistry:
         if policy.digest != record.get("digest"):
             raise ValueError(f"Policy registry {label} digest mismatch")
 
+    @staticmethod
+    def _attestation_digest(material: dict) -> str:
+        canonical = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return _stable_hash(f"{ATTESTATION_DOMAIN}\n{canonical}")
+
+    def _sign_attestation(self, material: dict) -> dict:
+        digest = self._attestation_digest(material)
+        return {**material, "digest": digest, "key_id": self.signer.key_id,
+                "signature": self.signer.sign_hex(digest, domain=ATTESTATION_SIG_DOMAIN)}
+
+    def _check_attestation(self, att: dict, record: dict, label: str):
+        material = {k: v for k, v in att.items() if k not in {"digest", "signature", "key_id"}}
+        digest = self._attestation_digest(material)
+        if att.get("digest") != digest:
+            raise ValueError(f"Policy registry {label} attestation digest mismatch")
+        if att.get("key_id") not in self.verify_keys:
+            raise ValueError(f"Policy registry {label} attestation signed by an unexpected key")
+        if not verify_signature(
+            att["key_id"], digest, str(att.get("signature") or ""),
+            domain=ATTESTATION_SIG_DOMAIN,
+        ):
+            raise ValueError(f"Policy registry {label} attestation signature invalid")
+        if att.get("candidate_digest") != record.get("digest"):
+            raise ValueError(f"Policy registry {label} attestation is not bound to the record digest")
+
+    def _verify_attestation(self, record: dict | None, label: str):
+        """Verify a record's promotion attestation when trust keys are configured."""
+        if record is None or not self.verify_keys:
+            return
+        att = record.get("attestation")
+        if not isinstance(att, dict):
+            raise ValueError(f"Policy registry {label} record lacks a promotion attestation")
+        self._check_attestation(att, record, label)
+        rollback_att = record.get("rollback_attestation")
+        if isinstance(rollback_att, dict):
+            self._check_attestation(rollback_att, record, f"{label} rollback")
+
     def load(self) -> dict:
         with self._lock, _file_lock(self.lock_path):
             return self._load_unlocked()
@@ -1768,6 +1991,17 @@ class PolicyRegistry:
         self._validate_record(payload.get("staged"), "staged")
         for index, record in enumerate(payload.get("history", [])):
             self._validate_record(record, f"history[{index}]")
+        # Promotion attestations: the active record must prove signed
+        # qualification when verification keys are configured; staged and
+        # history records are verified whenever they carry one.
+        if self.verify_keys:
+            self._verify_attestation(payload.get("active"), "active")
+        for label, record in (
+            [("staged", payload.get("staged"))]
+            + [(f"history[{i}]", r) for i, r in enumerate(payload.get("history", []))]
+        ):
+            if record and record.get("attestation") is not None:
+                self._verify_attestation(record, label)
         # In-memory migration; the next mutation writes the current schema/TCB.
         payload["schema"] = SCHEMA_VERSION
         payload["tcb_version"] = TCB_VERSION
@@ -1840,9 +2074,10 @@ class PolicyRegistry:
                     "deactivated_at_ms": int(time.time() * 1000),
                     "deactivation_reason": "superseded",
                 })
+            promoted_at = int(time.time() * 1000)
             payload["active"] = {
                 **staged,
-                "promoted_at_ms": int(time.time() * 1000),
+                "promoted_at_ms": promoted_at,
                 "suspended": False,
                 "canary": {
                     "baseline": asdict(evidence.baseline),
@@ -1856,6 +2091,24 @@ class PolicyRegistry:
                     "reason": decision.reason,
                 },
             }
+            if self.signer is not None:
+                # The promotion itself is signed authority: the attestation
+                # binds candidate, parent, and the exact evidence digests that
+                # qualified it, at the registry revision _write will assign.
+                payload["active"]["attestation"] = self._sign_attestation({
+                    "kind": "promotion_attestation",
+                    "candidate_digest": staged["digest"],
+                    "behavior_digest": ExplorationPolicy.from_dict(staged["policy"]).behavior_digest,
+                    "parent_digest": staged.get("parent_digest"),
+                    "replay_report_hash": staged.get("replay_report_hash"),
+                    "world_pool_digest": staged.get("world_pool_digest"),
+                    "split_manifest_digest": staged.get("split_manifest_digest"),
+                    "evidence_head_hash": staged.get("evidence_head_hash"),
+                    "evidence_digest": evidence.evidence_digest,
+                    "event_head_hash": evidence.event_head_hash,
+                    "registry_revision": int(payload.get("revision", 0)) + 1,
+                    "promoted_at_ms": promoted_at,
+                })
             payload["staged"] = None
             self._write(payload)
             return payload["active"]
@@ -2008,6 +2261,20 @@ class PolicyRegistry:
             target["suspended"] = False
             target["rollback_at_ms"] = int(time.time() * 1000)
             target["rollback_from_digest"] = current.get("digest") if current else None
+            # A rolled-back record re-enters authority: when verification keys
+            # are configured its original promotion attestation must hold.
+            if self.verify_keys:
+                self._verify_attestation(target, "rollback")
+            if self.signer is not None:
+                # Sign the rollback transition itself so authority restoration
+                # is attested rather than only the original promotion.
+                target["rollback_attestation"] = self._sign_attestation({
+                    "kind": "rollback_attestation",
+                    "candidate_digest": target["digest"],
+                    "rollback_from_digest": target["rollback_from_digest"],
+                    "registry_revision": int(payload.get("revision", 0)) + 1,
+                    "promoted_at_ms": target["rollback_at_ms"],
+                })
             payload["active"] = target
             payload["history"] = history
             payload["staged"] = None

@@ -91,8 +91,25 @@
       try { same_origin = new URL(form.getAttribute('action')||location.href, location.href).origin === location.origin; }
       catch (_) { same_origin = null; }
     }
+    // The target's own data class — typing into a sensitive field is itself a
+    // disclosure because page JS observes every input event before any submit.
+    let field = '';
+    if (e.matches && e.matches('input,textarea,select,[contenteditable=""],[contenteditable="true"]')) {
+      const t = String(e.type||'').toLowerCase();
+      const ac = String(e.getAttribute('autocomplete')||'').toLowerCase();
+      const nm = `${e.name||''} ${e.id||''} ${e.getAttribute('aria-label')||''}`.toLowerCase();
+      if (t==='password' || /password|username/.test(ac)) field = 'auth';
+      else if (ac==='one-time-code' || /\botp\b|2fa|verification.code/.test(nm)) field = 'otp';
+      else if (t==='file') field = 'file';
+      else if (t==='search' || e.getAttribute('role')==='searchbox') field = 'search';
+      else if (t==='email' || ac.includes('email')) field = 'email';
+      else if (t==='tel' || ac.includes('tel')) field = 'tel';
+      else if (/cc[-_ ]|card|cvv|cvc|routing|iban|payment|billing|amount|price|acct/.test(ac+' '+nm)) field = 'money';
+      else if (/comment|message|bio|review|post|tweet/.test(nm)) field = 'message';
+      else field = 'text';
+    }
     return {
-      form: !!form, submit, method, same_origin, fields,
+      form: !!form, submit, method, same_origin, fields, field,
       modal: !!e.closest('dialog,[role="dialog"],[aria-modal="true"]'),
       row: !!e.closest('tr,li,[role="row"],[role="listitem"],article'),
       external, messaging,

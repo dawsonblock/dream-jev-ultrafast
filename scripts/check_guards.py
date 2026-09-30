@@ -175,8 +175,9 @@ def main():
         assert browser.evaluate("window.hits") == 0
         passed.append("post-observe commit swap aborts before input")
 
-        # A page-injected listener fires during the press itself; each of these
-        # must abort at the pre-release identity check and never hit the target.
+        # A page-injected listener fires during the trusted press itself; each of
+        # these must abort at the pre-release identity check and never hit the
+        # target. (Atomic execution has no press/release window — see below.)
         # handler: page JS run during mousePressed; clicks_expected: whether the
         # hygiene release can still complete a click on the same physical
         # element (navigation changes page identity without detaching the node).
@@ -198,7 +199,7 @@ def main():
                 "document.querySelector('#adv').addEventListener('mousedown',()=>{" + handler + "})"
             )
             try:
-                browser.act(adv, page)
+                browser.act(adv, page, guarantee="trusted")
             except StalePage:
                 pass
             else:
@@ -207,12 +208,29 @@ def main():
             assert browser.evaluate("window.evil") == 0, label
             passed.append(f"{label} aborts between press and release")
 
-        # The aborted press must leave clean pointer state: a later legitimate
-        # click still works.
+        # Atomic guarantee: validation + e.click() happen in one isolated-world
+        # turn. A hostile mousedown handler cannot interleave because no press
+        # or release is ever dispatched — the sabotage listener never even runs.
         reset_adv()
         page = browser.observe(screenshot=False)
         adv = next(a for a in page["actions"] if a["label"] == "Continue")
+        browser.evaluate(
+            "window.sabotage=0; document.querySelector('#adv').addEventListener('mousedown',()=>{"
+            "window.sabotage=1; const b=document.querySelector('#adv');"
+            "b.outerHTML='<button id=adv onclick=\"window.evil=(window.evil||0)+1\">Continue</button>'})"
+        )
         browser.act(adv, page)
+        assert browser.evaluate("window.hits") == 1
+        assert browser.evaluate("window.sabotage") == 0  # no press was dispatched at all
+        assert browser.evaluate("window.evil") == 0
+        passed.append("atomic click has no press window for mid-event sabotage")
+
+        # The aborted press must leave clean pointer state: a later legitimate
+        # trusted click still works.
+        reset_adv()
+        page = browser.observe(screenshot=False)
+        adv = next(a for a in page["actions"] if a["label"] == "Continue")
+        browser.act(adv, page, guarantee="trusted")
         assert browser.evaluate("window.hits") == 1
         passed.append("pointer state stays clean after aborted presses")
 

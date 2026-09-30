@@ -71,7 +71,9 @@ def sanitize_url(value, limit=4096):
 
 def sanitize_action(action):
     clean = dict(action)
-    clean["label"] = str(clean.get("label", ""))[:256]
+    # Labels are page-controlled text and can carry emails, card numbers, or
+    # tokens — they cross every external model boundary, so redact them too.
+    clean["label"] = redact_text(str(clean.get("label", "")), 256)
     if "value" in clean:
         if _mode() not in {"off", "none", "0", "false"} and _SENSITIVE_LABEL.search(clean["label"]):
             clean["value"] = "[REDACTED]"
@@ -80,7 +82,7 @@ def sanitize_action(action):
     if "current_value" in clean:
         clean["current_value"] = redact_text(clean.get("current_value", ""), 512)
     if "option_label" in clean:
-        clean["option_label"] = str(clean.get("option_label", ""))[:256]
+        clean["option_label"] = redact_text(str(clean.get("option_label", "")), 256)
     return clean
 
 

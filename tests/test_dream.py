@@ -378,8 +378,9 @@ def test_trace_records_candidate_catalogue_digest_and_rank(tmp_path):
     assert world.trajectory[0].candidate_digest == event["candidate_digest"]
 
 
-def _canary_pair_store(tmp_path, baseline, candidate, *, candidate_success=True):
-    store = ExperienceStore(tmp_path / "paired-canary.jsonl")
+def _canary_pair_store(tmp_path, baseline, candidate, *, candidate_success=True,
+                       name="paired-canary.jsonl"):
+    store = ExperienceStore(tmp_path / name)
     transition = [{
         "state": "S", "next_state": "D", "selected": {"id": "go", "kind": "click"},
         "candidates": [{"id": "go", "kind": "click", "label": "Go", "goal_overlap": 1}],
@@ -426,6 +427,126 @@ def test_registry_promotes_only_bound_paired_canary_evidence(tmp_path):
     assert active["digest"] == staged["digest"]
     assert active["canary"]["paired_task_families"] == 4
     assert active["canary"]["event_head_hash"] == store.head_hash()
+
+
+def test_canary_pairing_is_namespaced_by_task_family(tmp_path):
+    """Audit regression: instance_id reused across families must never pair."""
+    baseline = ExplorationPolicy()
+    candidate = ExplorationPolicy(name="candidate", version=2, model_action_limit=218)
+    store = ExperienceStore(tmp_path / "xfam.jsonl")
+    transition = _single_transition()
+    _append_run(store, "b-1", "book a flight", transition,
+                status="done", verified=True, policy=baseline,
+                extra={"instance_id": "inst-1", "task_family": "flights"})
+    _append_run(store, "c-1", "book a hotel", transition,
+                status="blocked", verified=False, policy=candidate,
+                extra={"instance_id": "inst-1", "task_family": "hotels"})
+    evidence = CanaryEvidence.from_events(store.load(), baseline.digest, candidate.digest)
+    assert evidence.paired_instances == 0
+    assert evidence.paired_task_families == 0
+
+
+def _signed_registry(tmp_path, signer, verify_keys=None, name="signed-policy.json"):
+    """Stage and promote through the real bound path under a signing key."""
+    worlds = _efficiency_world(tmp_path)
+    baseline = ExplorationPolicy()
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(worlds, baseline)
+    registry = PolicyRegistry(tmp_path / name, signer=signer, verify_keys=verify_keys)
+    registry.stage(report)
+    store = _canary_pair_store(tmp_path, baseline, report.selected, name=f"canary-{name}.jsonl")
+    active = registry.promote_from_store(store, baseline_policy_digest=baseline.digest)
+    return registry, report, active
+
+
+def test_promotion_writes_signed_attestation_and_reader_verifies(tmp_path):
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"a" * 32)
+    registry, report, active = _signed_registry(
+        tmp_path, signer, verify_keys={signer.key_id})
+    att = active["attestation"]
+    assert att["kind"] == "promotion_attestation"
+    assert att["candidate_digest"] == report.selected.digest
+    assert att["parent_digest"] == ExplorationPolicy().digest
+    assert att["key_id"] == signer.key_id and att["signature"]
+    # A fresh reader trusting the same key accepts the signed record.
+    reader = PolicyRegistry(tmp_path / "signed-policy.json", verify_keys={signer.key_id})
+    assert reader.active_policy().digest == report.selected.digest
+
+
+def test_unsigned_active_record_fails_closed_when_keys_configured(tmp_path):
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"b" * 32)
+    _signed_registry(tmp_path, signer)
+    path = tmp_path / "signed-policy.json"
+    payload = json.loads(path.read_text())
+    payload["active"].pop("attestation")  # direct local write: strip authority
+    path.write_text(json.dumps(payload))
+    reader = PolicyRegistry(path, verify_keys={signer.key_id})
+    with pytest.raises(ValueError, match="attestation"):
+        reader.active_policy()
+
+
+def test_forged_and_wrong_key_attestations_fail(tmp_path):
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"c" * 32)
+    _signed_registry(tmp_path, signer, verify_keys={signer.key_id})
+    path = tmp_path / "signed-policy.json"
+
+    payload = json.loads(path.read_text())
+    payload["active"]["attestation"]["signature"] = "0" * 128  # forged
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="attestation"):
+        PolicyRegistry(path, verify_keys={signer.key_id}).load()
+
+    attacker = EvidenceSigner(b"d" * 32)
+    _signed_registry(tmp_path, signer, verify_keys={signer.key_id}, name="k.json")
+    payload = json.loads((tmp_path / "k.json").read_text())
+    material = {k: v for k, v in payload["active"]["attestation"].items()
+                if k not in {"digest", "signature", "key_id"}}
+    attacker_registry = PolicyRegistry(tmp_path / "attacker.json", signer=attacker)
+    payload["active"]["attestation"] = attacker_registry._sign_attestation(material)
+    (tmp_path / "k.json").write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="unexpected key"):
+        PolicyRegistry(tmp_path / "k.json", verify_keys={signer.key_id}).load()
+
+
+def test_promotion_attestation_is_domain_separated_from_events(tmp_path):
+    """An attestation signature must not verify under the evidence-event frame."""
+    from jev_ultrafast.signing import EvidenceSigner, verify_signature
+
+    signer = EvidenceSigner(b"e" * 32)
+    _, _, active = _signed_registry(tmp_path, signer)
+    att = active["attestation"]
+    assert not verify_signature(att["key_id"], att["digest"], att["signature"])
+
+
+def test_rollback_preserves_signed_authority(tmp_path):
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(b"f" * 32)
+    registry, report, _ = _signed_registry(tmp_path, signer, verify_keys={signer.key_id})
+    # Second promotion: improve on top of the newly active policy, using a
+    # different world pool so a distinct winner exists.
+    worlds2 = _overlapping_distractor_world(tmp_path)
+    second = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds2, report.selected)
+    if not second.promotion.approved or second.selected.digest == report.selected.digest:
+        pytest.skip("deterministic search did not find a second distinct winner")
+    registry.stage(second)
+    store2 = _canary_pair_store(tmp_path, report.selected, second.selected,
+                                name="canary-second.jsonl")
+    registry.promote_from_store(store2, baseline_policy_digest=report.selected.digest)
+    target = registry.rollback()
+    assert target["digest"] == report.selected.digest
+    assert target["attestation"]["candidate_digest"] == report.selected.digest
+    assert target["rollback_attestation"]["kind"] == "rollback_attestation"
+    assert target["rollback_attestation"]["rollback_from_digest"] == second.selected.digest
+    # Reader still verifies both attestations after reload.
+    reader = PolicyRegistry(tmp_path / "signed-policy.json", verify_keys={signer.key_id})
+    assert reader.active_policy().digest == report.selected.digest
 
 
 def test_registry_rejects_stale_replay_parent(tmp_path):

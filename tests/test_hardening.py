@@ -92,6 +92,8 @@ def test_mutation_without_expected_guard_fails_closed(monkeypatch):
 
 
 def test_fill_lost_focus_never_inserts_text(monkeypatch):
+    """Trusted-input fill: pre-press/pre-release checks pass, then the
+    focus+insert evaluation reports focus loss — no text may be dispatched."""
     calls = []
 
     def fake_cdp(method, session_id=None, **kwargs):
@@ -116,8 +118,84 @@ def test_fill_lost_focus_never_inserts_text(monkeypatch):
             "expected": {"page_key": [1], "guard": [1]},
             "action": {"id": "e1", "kind": "fill", "node": 1},
             "text": "secret",
+            "guarantee": "trusted",
         })
     assert not any(name == "Input.insertText" for name, _ in calls)
+
+
+def test_atomic_click_mutates_inside_the_single_guarded_evaluation(monkeypatch):
+    """DOM_ATOMIC: validation and mutation share one isolated-world turn, so
+    no page script can interleave between them. No CDP input is dispatched."""
+    calls = []
+
+    def fake_cdp(method, session_id=None, **kwargs):
+        calls.append(method)
+        if method == "Runtime.evaluate":
+            return {"result": {"value": {"x": 10, "y": 10, "clicked": True}}}
+        return {}
+
+    monkeypatch.setattr(browser, "cdp", fake_cdp)
+    result = browser_operation({
+        "operation": "act",
+        "session": "s",
+        "context_id": 42,
+        "expected": {"page_key": [1], "guard": [1]},
+        "action": {"id": "e1", "kind": "click", "node": 1},
+        "guarantee": "atomic",
+    })
+    assert result == {"executed": "e1"}
+    assert calls == ["Runtime.evaluate"]  # exactly one evaluation, no input dispatch
+
+
+def test_unsupported_atomic_target_escalates_to_trusted_input(monkeypatch):
+    """An element without HTMLElement.click() provably did not mutate when it
+    returned 'unsupported', so it may escalate to the trusted-input path."""
+    calls = []
+    evaluations = 0
+
+    def fake_cdp(method, session_id=None, **kwargs):
+        nonlocal evaluations
+        calls.append(method)
+        if method == "Runtime.evaluate":
+            evaluations += 1
+            if evaluations == 1:
+                return {"result": {"value": {"error": "unsupported"}}}
+            if evaluations == 2:
+                return {"result": {"value": {"x": 5, "y": 5}}}
+            return {"result": {"value": True}}  # precheck passes twice
+        return {}
+
+    monkeypatch.setattr(browser, "cdp", fake_cdp)
+    result = browser_operation({
+        "operation": "act",
+        "session": "s",
+        "context_id": 42,
+        "expected": {"page_key": [1], "guard": [1]},
+        "action": {"id": "e1", "kind": "click", "node": 1},
+        "guarantee": "atomic",
+    })
+    assert result == {"executed": "e1"}
+    assert calls.count("Input.dispatchMouseEvent") == 2  # press + release
+
+
+def test_atomic_fill_mismatch_is_not_retried(monkeypatch):
+    calls = []
+
+    def fake_cdp(method, session_id=None, **kwargs):
+        calls.append(method)
+        return {"result": {"value": {"x": 1, "y": 1, "inserted": True, "matched": False}}}
+
+    monkeypatch.setattr(browser, "cdp", fake_cdp)
+    with pytest.raises(RuntimeError, match="landed differently"):
+        browser_operation({
+            "operation": "act",
+            "session": "s",
+            "context_id": 42,
+            "expected": {"page_key": [1], "guard": [1]},
+            "action": {"id": "e1", "kind": "fill", "node": 1},
+            "text": "secret",
+        })
+    assert calls == ["Runtime.evaluate"]  # single atomic evaluation
 
 
 def test_duplicate_select_values_keep_distinct_exact_option_indices():

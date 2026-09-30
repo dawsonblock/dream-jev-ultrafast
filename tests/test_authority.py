@@ -80,7 +80,8 @@ def test_classify_effect_structural_ctx(action, effect):
     (click("About", role="link"), "allow"),
     (click("Refundable", role="checkbox"), "allow"),
     (click("Cancel", ctx={"modal": True}), "allow"),
-    ({"kind": "fill", "label": "Email"}, "allow"),
+    ({"kind": "fill", "label": "Email"}, "require_approval"),  # contact data is a disclosure
+    ({"kind": "fill", "label": "Search"}, "allow"),
     ({"kind": "wait"}, "allow"),
 ])
 def test_authority_floor(action, level):
@@ -110,13 +111,14 @@ def test_adviser_escalates_but_never_downgrades():
 
 # --- TOCTOU: press/release revalidation ------------------------------------
 
-def _op(action, text=None):
+def _op(action, text=None, guarantee="trusted"):
     request = {
         "operation": "act",
         "session": "s",
         "context_id": 42,
         "expected": {"page_key": [1], "guard": [1]},
         "action": action,
+        "guarantee": guarantee,
     }
     if text is not None:
         request["text"] = text
@@ -270,3 +272,178 @@ def test_cli_reads_signed_store_with_rotation_flags(tmp_path):
         main(["verify", str(path)])
     with pytest.raises(ValueError, match="unexpected key"):
         main(["verify", str(path), "--verify-keys", "cd" * 32])
+
+
+# --- classifier monotonicity: no structural shortcut may bypass risk ------
+
+def test_sensitive_fill_escalates_past_form_edit():
+    """The audit's case: a credit-card fill must not be classified FORM_EDIT."""
+    action = {
+        "kind": "fill", "label": "Credit card number", "role": "textbox",
+        "ctx": {"form": True, "fields": {"money": True}},
+    }
+    result = DefaultActionPolicy().assess(action)
+    assert result.level == "require_approval"
+    assert classify_effect(action) in {Effect.FINANCIAL, Effect.DISCLOSURE}
+
+    # A benign-looking fill on a target that IS a credential field.
+    pw = {"kind": "fill", "label": "Enter", "role": "textbox",
+          "ctx": {"field": "auth"}}
+    assert classify_effect(pw) == Effect.AUTHENTICATE
+
+    # The audit's toggle case: "Share publicly" must not ride the FORM_EDIT
+    # shortcut even though the role alone would be a reversible edit.
+    toggle = {"kind": "click", "label": "Share publicly", "role": "switch"}
+    assert classify_effect(toggle) == Effect.EXTERNAL_MESSAGE
+
+
+def test_monotonic_classifier_never_returns_below_the_floor():
+    """Every candidate effect meets or exceeds the structural floor — nothing
+    in the classifier can downgrade a dangerous label or context."""
+    floor = DefaultActionPolicy().assess({"kind": "fill", "label": "City"})
+    assert floor.effect == Effect.FORM_EDIT
+    for extra in (
+        {"ctx": {"field": "money"}},   # the target itself is a payment field
+        {"ctx": {"field": "email"}},   # contact data: disclosure
+        {"ctx": {"field": "auth"}},    # credential field
+        {"label": "Share publicly"},
+        {"label": "Pay now"},
+    ):
+        action = {"kind": "fill", "label": "City", **extra}
+        assert DefaultActionPolicy().assess(action).level == "require_approval", extra
+
+
+# --- privacy: labels and option labels are external-facing text ------------
+
+def test_action_labels_and_options_are_redacted_before_model_boundary():
+    from jev_ultrafast.privacy import sanitize_action
+
+    action = {
+        "kind": "fill",
+        "label": "Card for dawson@example.com",
+        "option_label": "Card 4111 1111 1111 1111",
+        "ctx": {"field": "money"},
+    }
+    clean = sanitize_action(action)
+    assert "dawson@example.com" not in clean["label"]
+    assert "4111" not in clean["option_label"]
+    # Structural authority context survives — redaction is text-only.
+    assert clean["ctx"]["field"] == "money"
+    # And the policy still classifies the ORIGINAL action, not the redacted one.
+    assert DefaultActionPolicy().assess(action).level == "require_approval"
+
+
+# --- candidate catalogue digest binds every replay-relevant field ----------
+
+def test_catalogue_digest_binds_replay_relevant_fields():
+    from jev_ultrafast.dream import candidate_catalog_digest
+
+    base = [{
+        "id": "a", "kind": "select", "node": 3, "role": "combobox",
+        "label": "Plan", "value": "x", "current_value": "",
+        "option_index": 1, "option_label": "Standard", "checked": None,
+        "ctx": {"form": True}, "goal_overlap": 1,
+    }]
+    digest = candidate_catalog_digest(base)
+    for field, value in (
+        ("node", 999),            # duplicate_node_cap groups by node
+        ("role", "listbox"),
+        ("option_index", 2),      # select replay uses the exact index
+        ("option_label", "Premium"),
+        ("current_value", "x"),
+        ("checked", True),
+        ("ctx", {"form": False}),
+        ("goal_overlap", 0),
+        ("kind", "click"),
+    ):
+        mutated = [dict(base[0], **{field: value})]
+        assert candidate_catalog_digest(mutated) != digest, field
+
+
+# --- chain-head anchoring ---------------------------------------------------
+
+def _two_event_store(tmp_path, signer, anchor=None, name="anchored.jsonl"):
+    path = tmp_path / name
+    store = ExperienceStore(
+        path, signer=signer, verify_keys={signer.key_id},
+        anchor_path=tmp_path / "store.head" if anchor is None else anchor,
+    )
+    store.append(_minimal_event())
+    store.append({**_minimal_event(), "sequence": 2})
+    return path, store
+
+
+def test_chain_head_anchor_detects_truncated_tail(tmp_path):
+    signer = EvidenceSigner.from_hex("11" * 32)
+    path, _ = _two_event_store(tmp_path, signer)
+    # Attacker deletes the last signed event entirely.
+    data = path.read_bytes()
+    path.write_bytes(data[: data.index(b"\n") + 1])
+    reader = ExperienceStore(
+        path, verify_keys={signer.key_id}, anchor_path=tmp_path / "store.head")
+    with pytest.raises(ValueError, match="anchor"):
+        reader.load()
+
+
+def test_anchor_detects_signed_tail_disguised_as_torn_write(tmp_path):
+    """The audit's attack: replace the last SIGNED event with something that
+    looks like a crash-torn fragment. Recovery would silently drop it; the
+    anchor exposes the missing head."""
+    signer = EvidenceSigner.from_hex("22" * 32)
+    path, _ = _two_event_store(tmp_path, signer)
+    first = path.read_bytes().split(b"\n")[0]
+    path.write_bytes(first + b'\n{"event":"B')   # torn-looking tail
+    reader = ExperienceStore(
+        path, verify_keys={signer.key_id}, anchor_path=tmp_path / "store.head")
+    with pytest.raises(ValueError, match="anchor"):
+        reader.load()
+    # And a writer cannot append past the gap to silently re-anchor.
+    writer = ExperienceStore(
+        path, signer=signer, verify_keys={signer.key_id},
+        anchor_path=tmp_path / "store.head")
+    with pytest.raises(ValueError, match="anchor"):
+        writer.append({**_minimal_event(), "sequence": 3})
+
+
+def test_missing_anchor_and_forged_anchor_fail_closed(tmp_path):
+    signer = EvidenceSigner.from_hex("33" * 32)
+    path = tmp_path / "unsigned-anchor-store.jsonl"
+    store = ExperienceStore(path, signer=signer)
+    store.append(_minimal_event())
+    # Anchor configured after the fact but never written.
+    reader = ExperienceStore(
+        path, verify_keys={signer.key_id}, anchor_path=tmp_path / "missing.head")
+    with pytest.raises(ValueError, match="anchor missing"):
+        reader.load()
+
+    path2, _ = _two_event_store(tmp_path, signer, anchor=tmp_path / "s2.head")
+    anchor = json.loads((tmp_path / "s2.head").read_text())
+    anchor["sequence"] = 99  # forged checkpoint
+    (tmp_path / "s2.head").write_text(json.dumps(anchor))
+    with pytest.raises(ValueError, match="anchor"):
+        ExperienceStore(
+            path2, verify_keys={signer.key_id},
+            anchor_path=tmp_path / "s2.head").load()
+
+
+def test_consistent_anchor_passes_and_reanchor_restores(tmp_path):
+    signer = EvidenceSigner.from_hex("44" * 32)
+    path, store = _two_event_store(tmp_path, signer)
+    reader = ExperienceStore(
+        path, verify_keys={signer.key_id}, anchor_path=tmp_path / "store.head")
+    report = reader.verify()
+    assert report["anchor"]["consistent"] and report["anchor"]["signed"]
+    assert report["anchor"]["sequence"] == 2
+
+    # After confirmed truncation the operator re-anchors explicitly.
+    data = path.read_bytes()
+    path.write_bytes(data[: data.index(b"\n") + 1])
+    writer = ExperienceStore(
+        path, signer=signer, verify_keys={signer.key_id},
+        anchor_path=tmp_path / "store.head")
+    with pytest.raises(ValueError, match="anchor"):
+        writer.load()
+    writer.reanchor()
+    assert ExperienceStore(
+        path, verify_keys={signer.key_id}, anchor_path=tmp_path / "store.head"
+    ).load()[0]["event"] == "run_finished"

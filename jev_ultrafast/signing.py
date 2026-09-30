@@ -37,26 +37,33 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 SIGNING_KEY_ENV = "JEV_EVIDENCE_SIGNING_KEY"
 VERIFY_KEY_ENV = "JEV_EVIDENCE_VERIFY_KEY"
 VERIFY_KEYS_ENV = "JEV_EVIDENCE_VERIFY_KEYS"
+PROMOTION_SIGNING_KEY_ENV = "JEV_PROMOTION_SIGNING_KEY"
+PROMOTION_VERIFY_KEYS_ENV = "JEV_PROMOTION_VERIFY_KEYS"
 
 SIGNING_DOMAIN = b"jev-dream/evidence-event/v1:"
+ATTESTATION_DOMAIN = b"jev-dream/promotion-attestation/v1:"
+ANCHOR_DOMAIN = b"jev-dream/chain-head-anchor/v1:"
 
 
-def frame_digest(digest_hex: str) -> bytes:
-    """Domain-separation frame: the exact bytes an evidence signature covers."""
-    return SIGNING_DOMAIN + digest_hex.encode("ascii")
+def frame_digest(digest_hex: str, domain: bytes = SIGNING_DOMAIN) -> bytes:
+    """Domain-separation frame: the exact bytes a signature covers."""
+    return domain + digest_hex.encode("ascii")
 
 
 def _public_key_hex(private_key: Ed25519PrivateKey) -> str:
     return private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
 
 
-def verify_keys_from_env() -> set[str]:
-    """Accepted verification keys from ``JEV_EVIDENCE_VERIFY_KEY(S)``."""
+def verify_keys_from_env(
+    env_var: str = VERIFY_KEYS_ENV,
+    single_env_var: str = VERIFY_KEY_ENV,
+) -> set[str]:
+    """Accepted verification keys from the given env vars."""
     keys: set[str] = set()
-    single = os.environ.get(VERIFY_KEY_ENV, "").strip()
+    single = os.environ.get(single_env_var, "").strip()
     if single:
         keys.add(single)
-    multi = os.environ.get(VERIFY_KEYS_ENV, "").replace(",", " ")
+    multi = os.environ.get(env_var, "").replace(",", " ")
     keys.update(part for part in multi.split() if part)
     return keys
 
@@ -79,16 +86,19 @@ class EvidenceSigner:
         seed = os.environ.get(env_var, "").strip()
         return cls.from_hex(seed) if seed else None
 
-    def sign_hex(self, digest_hex: str) -> str:
+    def sign_hex(self, digest_hex: str, domain: bytes = SIGNING_DOMAIN) -> str:
         """Sign the domain-separated frame of a hex digest; returns hex."""
-        return self._key.sign(frame_digest(digest_hex)).hex()
+        return self._key.sign(frame_digest(digest_hex, domain)).hex()
 
 
-def verify_signature(public_key_hex: str, digest_hex: str, signature_hex: str) -> bool:
+def verify_signature(
+    public_key_hex: str, digest_hex: str, signature_hex: str,
+    domain: bytes = SIGNING_DOMAIN,
+) -> bool:
     """Return True when ``signature_hex`` attests to the framed ``digest_hex``."""
     try:
         key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
-        key.verify(bytes.fromhex(signature_hex), frame_digest(digest_hex))
+        key.verify(bytes.fromhex(signature_hex), frame_digest(digest_hex, domain))
         return True
     except (InvalidSignature, ValueError):
         return False

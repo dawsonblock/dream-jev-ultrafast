@@ -160,7 +160,7 @@ class Browser:
         except StalePage:
             return False
 
-    def act(self, action, page, text=None):
+    def act(self, action, page, text=None, guarantee=None):
         if not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
@@ -179,6 +179,7 @@ class Browser:
                 "action": action,
                 "expected": expected,
                 "text": text,
+                "guarantee": guarantee or "atomic",
             }
         )
         self.after_input = action if action["kind"] != "wait" else None
@@ -244,9 +245,15 @@ def browser_operation(request):
             expected = request.get("expected")
             if not expected or expected.get("guard") is None:
                 raise StalePage("Missing execution guard. Observe again.")
-            target = evaluate(
+            # Two execution guarantees: "atomic" validates and mutates inside a
+            # single isolated-world turn (no IPC gap — the strongest authority
+            # bound), while "trusted" dispatches real CDP input with pre-press
+            # and pre-release revalidation (needed for isTrusted-gated sites,
+            # non-transactional by nature).
+            guarantee = request.get("guarantee") or "atomic"
+            guarded = (
                 """((input) => {
-                  const {action,expected}=input, c=globalThis.__jevFastV2;
+                  const {action,expected,guarantee,text}=input, c=globalThis.__jevFastV2;
                   const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
                   if (!c || !same(c.pageKey(),expected.page_key)) return {error:'stale-page'};
                   const e=c.nodes.get(action.node);
@@ -273,9 +280,38 @@ def browser_operation(request):
                     e.dispatchEvent(new Event('change',{bubbles:true}));
                     return {x,y,selected_index:e.selectedIndex};
                   }
+                  if (guarantee==='atomic') {
+                    if (action.kind==='click') {
+                      if (typeof e.click !== 'function') return {error:'unsupported'};
+                      e.click();
+                      return {x,y,clicked:true};
+                    }
+                    if (action.kind==='fill') {
+                      let active=document.activeElement;
+                      if (!(active && (active===e || e.contains(active)))) {
+                        if (typeof e.focus !== 'function') return {error:'unsupported'};
+                        e.focus(); active=document.activeElement;
+                      }
+                      if (!(active && (active===e || e.contains(active)))) return {error:'focus'};
+                      try {
+                        if ('value' in e && e.setSelectionRange) e.setSelectionRange(0, String(e.value).length);
+                        else { const s=getSelection(), rg=document.createRange();
+                               rg.selectNodeContents(e); s.removeAllRanges(); s.addRange(rg); }
+                      } catch (_) {}
+                      if (!document.execCommand || !document.execCommand('insertText', false, text))
+                        return {error:'insert'};
+                      const v='value' in e ? String(e.value) : String(e.innerText||'');
+                      return {x,y,inserted:true,matched:v===text,value:v.slice(0,1024)};
+                    }
+                  }
                   return {x,y};
-                })(""" + json.dumps({"action": action, "expected": expected}) + ")"
+                })("""
             )
+            payload = {
+                "action": action, "expected": expected,
+                "guarantee": guarantee, "text": request.get("text") or "",
+            }
+            target = evaluate(guarded + json.dumps(payload) + ")")
             if not target or target.get("error"):
                 # The guarded script only mutates in its final statement, so every
                 # explicit {error: ...} return is provably pre-mutation and safe to
@@ -283,8 +319,29 @@ def browser_operation(request):
                 # evaluation (handled in evaluate()) remains non-retryable.
                 if kind == "select" and target is None:
                     raise RuntimeError("Dropdown execution returned no result; inspect before retrying.")
-                raise StalePage("Target changed, became unavailable, or is covered. Observe again.")
-            if kind != "select":
+                if guarantee == "atomic" and (target or {}).get("error") == "unsupported":
+                    # Programmatic control is unavailable; nothing was mutated.
+                    # Escalate to the trusted-input path for this element.
+                    guarantee = "trusted"
+                    payload["guarantee"] = "trusted"
+                    target = evaluate(guarded + json.dumps(payload) + ")")
+                    if not target or target.get("error"):
+                        raise StalePage("Target changed, became unavailable, or is covered. Observe again.")
+                else:
+                    raise StalePage("Target changed, became unavailable, or is covered. Observe again.")
+            elif kind != "select" and guarantee == "atomic":
+                if target.get("clicked"):
+                    return {"executed": action["id"]}
+                if target.get("inserted"):
+                    # The insert already ran — a mismatch means the mutation
+                    # did not land as authorized. This is not retryable.
+                    if not target.get("matched"):
+                        raise RuntimeError(
+                            "Text insertion landed differently than authorized; inspect before retrying."
+                        )
+                    return {"executed": action["id"]}
+                raise StalePage("Atomic execution returned no mutation result. Observe again.")
+            if kind != "select" and guarantee == "trusted":
                 x, y = target["x"], target["y"]
                 # Authority integrity: the physical input must land on the same
                 # semantic target that passed validation. Re-check page identity,

@@ -23,5 +23,10 @@ DREAM-Jev invariants:
 - Normal activation must use `promote_from_store()` and paired task-family evidence. Unbound metric promotion is an explicit compatibility escape hatch only.
 - Preserve suspension and rollback. A drifted learned policy must be able to fall back to the baseline without changing browser authority.
 - Do not remove hash-chain verification from experience stores or policy-digest verification from the registry.
+- Effect classification is monotonic: structural floors, sensitive target fields, and label signals collect and the highest authority wins; no early return may bypass escalation.
+- Canary pair identity is `(task_family, instance_id)`; cross-family instance collisions are evidence corruption, not a pair.
+- When promotion verification keys are configured, active policy records must carry a valid domain-separated attestation bound to candidate/parent digests and the qualifying evidence digests; unsigned or forged authority fails closed.
+- A configured chain-head anchor must agree with the log on every read and append; a gap is resolved only by explicit `reanchor()`, never silently.
+- Browser execution guarantees are `atomic` (single isolated-world validate+mutate turn, the default) and `trusted` (non-transactional CDP input with pre-press/pre-release revalidation); never describe trusted input as transactional.
 
 Checks: uv run ruff check ., uv run pytest, node --check jev_ultrafast/static/app.js, uv build.

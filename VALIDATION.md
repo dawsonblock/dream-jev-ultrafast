@@ -1,11 +1,11 @@
-# Validation — Jev Ultrafast v0.5.0 DREAM-Jev
+# Validation — Jev Ultrafast v0.5.1 DREAM-Jev
 
-Validation date: 2026-09-29 (updated same-day for the approval-capability, dual-catalogue, bidirectional-mutation, learned-prior, evidence-signing, and v0.5 authority-integrity passes).
+Validation date: 2026-09-29 (v0.5.0 validated same-day; v0.5.1 applies the independent-audit authority patch: monotonic classification, family-namespaced canary pairing, signed promotion attestations, chain-head anchoring, label redaction, complete catalogue digests, and explicit execution guarantees).
 
 ## Reproduced in this build environment
 
-- `uv run pytest`: **211 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
-- `uv run python scripts/check_guards.py` against a dedicated headless Chrome 154 instance (`BU_CDP_URL=http://127.0.0.1:9222`, throwaway `--user-data-dir`): **all 33 live browser guard checks passed**, including the new adversarial mid-input cases (post-observe commit swap, same-label node swap between press and release, pre-release overlay, pre-release geometry drift, mid-press page mutation, pointer-state hygiene after abort, nested-descendant interception, post-observe hidden/detached targets, and structured `ctx` propagation). Earlier validation against Chrome 152 also passed; the first v0.4.0 live run had exposed a latent defect that mocked tests could not see, which is why CI now runs this suite in a `live-guards` job on every change.
+- `uv run pytest`: **229 passed** against the project environment with `browser-harness==0.1.13` installed; browser/CDP calls in unit tests remain mocked by the tests themselves.
+- `uv run python scripts/check_guards.py` against a dedicated headless Chrome 154 instance (`BU_CDP_URL=http://127.0.0.1:9222`, throwaway `--user-data-dir`): **all 34 live browser guard checks passed**, including the adversarial mid-input cases (post-observe commit swap, same-label node swap between press and release, pre-release overlay, pre-release geometry drift, mid-press page mutation, pointer-state hygiene after abort, nested-descendant interception, post-observe hidden/detached targets, structured `ctx` propagation) and the atomic-guarantee check proving `DOM_ATOMIC` clicks dispatch no press/release window for mid-event sabotage. Earlier validation against Chrome 152 also passed; the first v0.4.0 live run had exposed a latent defect that mocked tests could not see, which is why CI now runs this suite in a `live-guards` job on every change.
 - `uv run ruff check .`: passed.
 - `uv build`: passed.
 - `python -m compileall -q jev_ultrafast tests examples scripts`: passed.
@@ -93,6 +93,17 @@ The test suite now covers the v0.3 contracts plus:
 - domain-separated signatures (`jev-dream/evidence-event/v1:<digest>`): a raw-digest Ed25519 signature is not accepted as evidence;
 - verification-key rotation: events signed under old and new keys load under the rotated key set and fail closed under a partial set;
 - new events are `jev-dream/3` / `jev-ultrafast-tcb/0.7`; signatures written before the domain-separation change will not verify under this frame.
+
+## v0.5.1 audit-patch coverage
+
+- **Monotonic effect classification**: the audit's case — `fill` "Credit card number" on a `ctx.fields.money` form — no longer short-circuits to `FORM_EDIT`; per-target `ctx.field` (auth/otp/money/file/email/tel/message) escalates fill/select edits to `AUTHENTICATE`/`FINANCIAL`/`SUBMISSION`/`DISCLOSURE`/`EXTERNAL_MESSAGE`, and high-risk labels evaluate before every structural shortcut including toggles ("Share publicly" switch → `EXTERNAL_MESSAGE`).
+- **Canary pair namespacing**: `pair_key = task_family\x00instance_id`; identical `instance_id` values across families never pair, equal pair keys with inconsistent family metadata raise, and `paired_task_families` counts namespaced families.
+- **Signed promotion attestation**: `_promote_bound` attaches a `jev-dream/promotion-attestation/v1:`-framed signature binding candidate/behavior/parent digests, replay-report/world-pool/split digests, canary evidence digest, chain head, and registry revision; `active_policy()` and registry load fail closed on missing/forged/unexpected-key attestations when verification keys are configured; a signature valid under the evidence frame does not verify under the attestation frame; rollback re-verifies the original attestation and signs a `rollback_attestation` for the transition.
+- **Chain-head anchoring**: `--anchor PATH` checkpoints the signed head after every append; reads *and* appends fail closed when the log no longer reaches the anchored head — covering both plain tail truncation and the signed-event-disguised-as-torn-fragment attack; missing anchors on non-empty stores fail closed; forged/re-keyed anchors fail closed; `reanchor()` is the explicit operator resolution.
+- **Privacy**: `sanitize_action` redacts `label` and `option_label` (email/card/secret patterns) in addition to values; structural `ctx` survives for authority classification, which still sees the original action.
+- **Catalogue digest completeness**: `candidate_catalog_digest` binds `node`, `role`, `option_index`, `option_label`, `current_value`, `checked`, and `ctx` alongside id/kind/label/value/goal_overlap — a mutation test flips each field and asserts the digest changes.
+- **Execution guarantees**: `DOM_ATOMIC` (single isolated-world validate+mutate turn, default for click/fill/select) versus `TRUSTED_INPUT_NONTRANSACTIONAL` (CDP mouse input with pre-press/pre-release checks; `unsupported` programmatic elements escalate to it only because the atomic evaluation provably did not mutate); mocked tests assert the atomic path dispatches zero `Input.*` events and a single evaluation.
+- New events are `jev-dream/3` / `jev-ultrafast-tcb/0.8`.
 
 ## Deployment gate
 

@@ -29,6 +29,11 @@ def _add_verify_args(cmd):
         action="store_true",
         help="Reject unsigned events (requires a verification key)",
     )
+    cmd.add_argument(
+        "--anchor",
+        help="Chain-head anchor file. Appends checkpoint the signed head here; "
+        "reads fail when the log no longer reaches the anchored head (tail truncation).",
+    )
 
 
 def _store(args):
@@ -37,6 +42,7 @@ def _store(args):
         verify_key=getattr(args, "verify_key", None),
         verify_keys=(getattr(args, "verify_keys", None) or "").replace(",", " ").split(),
         require_signatures=getattr(args, "require_signatures", False),
+        anchor_path=getattr(args, "anchor", None),
     )
 
 

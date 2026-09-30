@@ -21,6 +21,7 @@ class Effect(str, Enum):
     FINANCIAL = "financial"
     DELETE = "delete"
     PERMISSION_CHANGE = "permission_change"
+    DISCLOSURE = "disclosure"
     UNKNOWN_COMMIT = "unknown_commit"
 
 
@@ -40,6 +41,7 @@ _AUTHORITY = {
     Effect.FINANCIAL: "require_approval",
     Effect.DELETE: "require_approval",
     Effect.PERMISSION_CHANGE: "require_approval",
+    Effect.DISCLOSURE: "require_approval",
     Effect.UNKNOWN_COMMIT: "require_approval",
 }
 
@@ -54,7 +56,14 @@ _PURCHASE_LABELS = re.compile(
     r"\b(buy|purchase|order|checkout|add to (?:cart|basket|bag)|cart|basket|pre-?order|"
     r"subscribe|book now|reserve|pay)\b", re.I
 )
-_FINANCIAL_LABELS = re.compile(r"\b(transfer|wire|withdraw|deposit|send money|payment|invoice|billing)\b", re.I)
+_FINANCIAL_LABELS = re.compile(
+    r"\b(transfer|wire|withdraw|deposit|send money|payment|invoice|billing|credit card|"
+    r"card (?:number|ending|details)|cvv|cvc|ssn|social security|routing|iban|account number)\b", re.I
+)
+_SECRET_LABELS = re.compile(
+    r"\b(api[-_ ]?key|secret|private key|access token|auth token|passphrase|"
+    r"otp|one[- ]time code|verification code|2fa|backup codes?)\b", re.I
+)
 _DELETE_LABELS = re.compile(r"\b(delete|remove|erase|uninstall|deactivate|close account|terminate)\b", re.I)
 _MESSAGE_LABELS = re.compile(
     r"\b(send|post|comment|reply|share|publish|tweet|message|email|invite|review|rate)\b", re.I
@@ -69,52 +78,52 @@ _COMMIT_LABELS = re.compile(
 )
 
 
-def classify_effect(action) -> Effect:
-    """Deterministic effect classification from structural DOM context.
+# Authority rank used to pick the strictest applicable classification.
+_AUTHORITY_RANK = {"allow": 0, "require_approval": 1, "deny": 2}
 
-    Uses the bounded ``ctx`` flags emitted by snapshot.js plus the (already
-    sanitized) label text. Structure wins over text: a form submit stays a
-    SUBMISSION no matter what the button says, and a link stays a NAVIGATE.
-    Text patterns only escalate an ambiguous context to a stricter class.
-    """
-    kind = action.get("kind")
-    if kind in {"scroll", "wait"}:
-        return Effect.OBSERVE
-    if kind in {"fill", "select"}:
-        return Effect.FORM_EDIT
-    if kind != "click":
-        return Effect.UNKNOWN_COMMIT
+_EDIT_KINDS = {"fill", "select"}
+_TOGGLE_ROLES = {"checkbox", "radio", "switch", "option", "menuitemradio"}
+_EDITOR_ROLES = {"textbox", "combobox", "searchbox", "spinbutton"}
 
-    ctx = action.get("ctx") or {}
-    label = str(action.get("label") or "")
+# Per-target field kind (ctx.field from snapshot.js) → minimum effect for a
+# fill/select landing on it. Entering data is itself a disclosure event: page
+# JavaScript observes input events before any submit ever runs.
+_FIELD_EFFECT = {
+    "auth": Effect.AUTHENTICATE,
+    "otp": Effect.AUTHENTICATE,
+    "money": Effect.FINANCIAL,
+    "file": Effect.SUBMISSION,
+    "email": Effect.DISCLOSURE,
+    "tel": Effect.DISCLOSURE,
+    "message": Effect.EXTERNAL_MESSAGE,
+}
 
-    # Reversible state toggles are form edits; tabs are in-page navigation.
-    # A click on an editor role is just the open/focus affordance for it.
-    role = action.get("role")
-    if role in {"checkbox", "radio", "switch", "option", "menuitemradio"}:
-        return Effect.FORM_EDIT
-    if role in {"textbox", "combobox", "searchbox", "spinbutton"}:
-        return Effect.FORM_EDIT
-    if role == "tab":
-        return Effect.NAVIGATE
 
-    # Outbound channels and downloads leave the browser's trust boundary.
-    if ctx.get("messaging"):
-        return Effect.EXTERNAL_MESSAGE
-    if ctx.get("download"):
+def _submit_effect(ctx: dict) -> Effect:
+    fields = ctx.get("fields") or {}
+    if fields.get("password"):
+        return Effect.AUTHENTICATE
+    if fields.get("money"):
+        return Effect.PURCHASE
+    if fields.get("file"):
         return Effect.SUBMISSION
+    if ctx.get("method") == "get" or fields.get("search"):
+        return Effect.SEARCH
+    return Effect.SUBMISSION
 
-    # Deterministic label signals escalate ANY context — a link labelled
-    # "Delete account" or a submit labelled "Pay" is not navigation. Absence
-    # of a match never lowers the floor the structure already set. Exception:
-    # an auth-labelled link merely navigates to a sign-in page — the AUTHENTICATE
-    # boundary is the credential submission, not the route to it.
-    is_link = action.get("role") == "link" or ctx.get("external")
+
+def _label_effect(label: str, *, is_link: bool) -> Effect | None:
+    """First matching high-risk label pattern, or None.
+
+    Exception: an auth-labelled link merely navigates to a sign-in page — the
+    AUTHENTICATE boundary is the credential submission, not the route to it.
+    """
     for pattern, effect in (
         (_FINANCIAL_LABELS, Effect.FINANCIAL),
         (_PURCHASE_LABELS, Effect.PURCHASE),
         (_DELETE_LABELS, Effect.DELETE),
         (_MESSAGE_LABELS, Effect.EXTERNAL_MESSAGE),
+        (_SECRET_LABELS, Effect.DISCLOSURE),
         (_AUTH_LABELS, Effect.AUTHENTICATE),
         (_PERMISSION_LABELS, Effect.PERMISSION_CHANGE),
     ):
@@ -122,39 +131,75 @@ def classify_effect(action) -> Effect:
             continue
         if pattern.search(label):
             return effect
+    return None
 
-    if ctx.get("submit") and ctx.get("form"):
-        fields = ctx.get("fields") or {}
-        if fields.get("password"):
-            return Effect.AUTHENTICATE
-        if fields.get("money"):
-            return Effect.PURCHASE
-        if fields.get("file"):
-            return Effect.SUBMISSION
-        if ctx.get("method") == "get" or fields.get("search"):
-            return Effect.SEARCH
-        return Effect.SUBMISSION
 
-    # Links with no commit context are navigation.
-    if is_link:
-        return Effect.NAVIGATE
+def classify_effect(action) -> Effect:
+    """Deterministic effect classification from structural DOM context.
 
-    # Modal/dialog actions commit or dismiss. Dismissal is autonomous;
-    # anything else inside a modal is an unknown commit by definition.
-    if ctx.get("modal"):
-        return Effect.OBSERVE if _DISMISS_LABELS.search(label) else Effect.UNKNOWN_COMMIT
-
-    # A bare query affordance ("Go", "Search") stays autonomous; progression
-    # labels ("Continue", "Next") are treated as opaque commits.
-    if _SEARCH_LABELS.search(label):
-        return Effect.SEARCH
-    if _COMMIT_LABELS.search(label):
-        return Effect.UNKNOWN_COMMIT
-    if _BENIGN_LABELS.search(label):
+    Monotonic escalation: structural floors (kind, role, form membership) are
+    combined with field sensitivity and label signals, and the *highest*
+    authority wins. There are no early returns past the non-mutating kinds —
+    a fill into a card field or a "Allow notifications" switch cannot short-
+    circuit to FORM_EDIT before escalation runs.
+    """
+    kind = action.get("kind")
+    if kind in {"scroll", "wait"}:
         return Effect.OBSERVE
-    # A control with no form, no modal scope, no link semantics, and no
-    # recognizable affordance label is an opaque state mutation.
-    return Effect.UNKNOWN_COMMIT
+
+    ctx = action.get("ctx") or {}
+    label = str(action.get("label") or "")
+    role = action.get("role")
+    is_link = role == "link" or ctx.get("external")
+
+    candidates: list[Effect] = []
+
+    if kind in _EDIT_KINDS:
+        # Entering or changing field data is a form edit at minimum, and a
+        # disclosure/commit event when the target is sensitive.
+        candidates.append(Effect.FORM_EDIT)
+        field_effect = _FIELD_EFFECT.get(ctx.get("field"))
+        if field_effect is not None:
+            candidates.append(field_effect)
+        if ctx.get("messaging"):
+            candidates.append(Effect.EXTERNAL_MESSAGE)
+    elif kind != "click":
+        return Effect.UNKNOWN_COMMIT
+    else:
+        if role in _TOGGLE_ROLES or role in _EDITOR_ROLES:
+            candidates.append(Effect.FORM_EDIT)
+        elif role == "tab":
+            candidates.append(Effect.NAVIGATE)
+        if ctx.get("messaging"):
+            candidates.append(Effect.EXTERNAL_MESSAGE)
+        if ctx.get("download"):
+            candidates.append(Effect.SUBMISSION)
+        if ctx.get("submit") and ctx.get("form"):
+            candidates.append(_submit_effect(ctx))
+        if is_link:
+            candidates.append(Effect.NAVIGATE)
+        if ctx.get("modal"):
+            candidates.append(Effect.OBSERVE if _DISMISS_LABELS.search(label) else Effect.UNKNOWN_COMMIT)
+
+    # High-risk label signals escalate every kind — including toggles and
+    # edits, which is the point of the monotonic structure.
+    label_hit = _label_effect(label, is_link=is_link)
+    if label_hit is not None:
+        candidates.append(label_hit)
+
+    if not candidates:
+        # Bare clicks with no structural or risk signal: query affordances
+        # stay autonomous; progression labels are opaque commits.
+        if _SEARCH_LABELS.search(label):
+            candidates.append(Effect.SEARCH)
+        elif _COMMIT_LABELS.search(label):
+            candidates.append(Effect.UNKNOWN_COMMIT)
+        elif _BENIGN_LABELS.search(label):
+            candidates.append(Effect.OBSERVE)
+        else:
+            candidates.append(Effect.UNKNOWN_COMMIT)
+
+    return max(candidates, key=lambda e: _AUTHORITY_RANK[_AUTHORITY[e]])
 
 
 @dataclass(frozen=True)
