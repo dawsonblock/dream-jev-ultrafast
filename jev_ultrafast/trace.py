@@ -81,7 +81,7 @@ class DreamTraceRecorder:
                     "node": candidate.get("node"),
                     "label": clean.get("label", ""),
                     "value": clean.get("value", clean.get("current_value", "")),
-                    "goal_overlap": action_goal_overlap(candidate, goal_tokens),
+                    "goal_overlap": action_goal_overlap(candidate, goal_tokens, clean=clean),
                 })
             return entries
 

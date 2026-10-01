@@ -199,8 +199,9 @@ class ExplorationPolicy:
         if not 2 <= self.no_progress_window <= 10:
             raise ValueError("no_progress_window must be between 2 and 10")
 
-    def candidate_score(self, action: dict, goal_tokens: set[str], order: int) -> float:
-        overlap = action_goal_overlap(action, goal_tokens)
+    def candidate_score(self, action: dict, goal_tokens: set[str], order: int, overlap=None) -> float:
+        if overlap is None:
+            overlap = action_goal_overlap(action, goal_tokens)
         bonus = {
             "fill": self.fill_bonus,
             "select": self.select_bonus,

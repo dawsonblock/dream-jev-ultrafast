@@ -53,7 +53,7 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen3:8b")
 NUM_CTX = int(os.environ.get("JEV_LOCAL_NUM_CTX", "16384"))
 
 
-def ollama_chat(prompt: str, *, num_predict: int = 128) -> tuple[dict, dict]:
+def ollama_chat(prompt: str, *, num_predict: int = 192) -> tuple[dict, dict]:
     """One JSON-mode chat call. Returns (parsed_json, usage)."""
     request = urllib.request.Request(
         f"{OLLAMA_BASE}/api/chat",
@@ -63,6 +63,9 @@ def ollama_chat(prompt: str, *, num_predict: int = 128) -> tuple[dict, dict]:
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
                 "format": "json",
+                # Approval pauses can idle far past Ollama's 5m default unload;
+                # reloading an 8B model mid-run stalls the next step 10-30s.
+                "keep_alive": "15m",
                 # Hybrid-reasoning models (qwen3) must not burn the token
                 # budget on a <think> block — the shim does its own terse CoT.
                 "think": False,

@@ -48,8 +48,10 @@ def post_json(url, key, body):
         raise ValueError("Model request exceeded the configured context budget; no action executed.")
     for attempt in range(3):
         try:
-            headers = {"Authorization": f"Bearer {key}"} if key else {}
-            response = CLIENT.post(url, json=body, headers=headers)
+            headers = {"Content-Type": "application/json"}
+            if key:
+                headers["Authorization"] = f"Bearer {key}"
+            response = CLIENT.post(url, content=encoded, headers=headers)
         except httpx.HTTPError:
             raise RuntimeError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
@@ -83,10 +85,11 @@ def _goal_tokens(goal):
     return set(tokenize(goal))
 
 
-def _candidate_score(action, goal_tokens, order, exploration_policy=None):
+def _candidate_score(action, goal_tokens, order, exploration_policy=None, overlap=None):
     if exploration_policy is not None:
-        return exploration_policy.candidate_score(action, goal_tokens, order)
-    overlap = action_goal_overlap(action, goal_tokens)
+        return exploration_policy.candidate_score(action, goal_tokens, order, overlap=overlap)
+    if overlap is None:
+        overlap = action_goal_overlap(action, goal_tokens)
     kind_bonus = {"fill": 1.5, "select": 1.0, "click": 0.5}.get(action.get("kind"), 0)
     return overlap * 10 + kind_bonus - order / 100000
 
@@ -105,16 +108,24 @@ def candidate_actions(actions, goal, limit=None, exploration_policy=None):
     node_cap = int(getattr(exploration_policy, "duplicate_node_cap", 250) or 250)
     controls = [a for a in actions if a.get("kind") not in {"click", "fill", "select"}]
     tokens = _goal_tokens(goal)
+    # Overlap is computed once per action and shared by the min-overlap filter
+    # and the scorer — scoring an unfiltered catalogue would otherwise re-run
+    # the sanitize+tokenize pass inside every comparison key.
     regular = []
+    overlaps = {}
     for i, a in enumerate(actions):
         if a.get("kind") not in {"click", "fill", "select"}:
             continue
-        if min_overlap and action_goal_overlap(a, tokens) < min_overlap:
+        overlap = action_goal_overlap(a, tokens)
+        if min_overlap and overlap < min_overlap:
             continue
+        overlaps[id(a)] = overlap
         regular.append((i, a))
     ranked = sorted(
         regular,
-        key=lambda pair: _candidate_score(pair[1], tokens, pair[0], exploration_policy),
+        key=lambda pair: _candidate_score(
+            pair[1], tokens, pair[0], exploration_policy, overlap=overlaps[id(pair[1])]
+        ),
         reverse=True,
     )
     quotas = {
@@ -168,10 +179,10 @@ def action_space(actions):
             controls[action["id"].upper()] = action
             continue
         node = action["node"]
+        clean = sanitize_action(action)
         if node not in indices:
             index = str(len(elements) + 1)
             indices[node] = index
-            clean = sanitize_action(action)
             element = {k: clean[k] for k in ("role", "value", "checked", "selected", "expanded") if k in clean}
             element.update(index=index, label=clean["label"].split(" → ")[0], operations=[])
             if kind == "select":
@@ -195,7 +206,6 @@ def action_space(actions):
                 target = f"{index}:{int(option_index) + 1}"
             except (TypeError, ValueError):
                 target = f"{index}:{len(element['options']) + 1}"
-            clean = sanitize_action(action)
             element["options"].append(
                 {
                     "index": target,
@@ -208,9 +218,16 @@ def action_space(actions):
     return elements, targets, controls
 
 
-def choose(state, goal, history, backend=None, exploration_policy=None):
-    candidates, omitted_for_model = candidate_actions(state["actions"], goal, exploration_policy=exploration_policy)
-    elements, targets, controls = action_space(candidates)
+def choose(state, goal, history, backend=None, exploration_policy=None, perception=None):
+    if perception is not None:
+        # Caller (the agent loop) already reduced this exact page's actions —
+        # reuse the same candidates/action space instead of re-sanitizing.
+        candidates, omitted_for_model, elements, targets, controls = perception
+    else:
+        candidates, omitted_for_model = candidate_actions(
+            state["actions"], goal, exploration_policy=exploration_policy
+        )
+        elements, targets, controls = action_space(candidates)
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
@@ -223,16 +240,17 @@ def choose(state, goal, history, backend=None, exploration_policy=None):
         "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
     }
     for operation, candidates_for_operation in targets.items():
+        criteria = {}
+        for index, a in candidates_for_operation.items():
+            clean = sanitize_action(a)
+            criteria[index] = {
+                "element": f"[{index}] {clean['label']}",
+                "current_value": clean.get("current_value", clean.get("value", "")),
+                **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
+            }
         questions[operation.lower() + "_target"] = {
             "type": "choice",
-            "criteria": {
-                index: {
-                    "element": f"[{index}] {sanitize_action(a)['label']}",
-                    "current_value": sanitize_action(a).get("current_value", sanitize_action(a).get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
-                }
-                for index, a in candidates_for_operation.items()
-            },
+            "criteria": criteria,
             "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
     body = {
@@ -330,30 +348,42 @@ def field_text(context):
         # reasoning keys outright, so a disabled-looking object still fails.
         reasoning = {}
     started = time.perf_counter()
-    result = post_json(
-        base + "/chat/completions",
-        key,
-        {
-            "model": model,
-            "max_tokens": 1024,
-            "temperature": 0.2,
-            "response_format": {"type": "json_object"},
-            **reasoning,
-            "messages": [
-                {"role": "system", "content": TEXT_VALUE},
-                {"role": "user", "content": json.dumps(context)},
-            ],
-        },
-    )
-    try:
-        output = json.loads(result["choices"][0]["message"]["content"])
-        value = output["text"]
-        if set(output) != {"text"} or not isinstance(value, str) or not value.strip() or len(value) > 2000:
-            raise ValueError()
-    except (ValueError, KeyError, TypeError):
-        raise ValueError("Text helper returned no valid field value; nothing typed.") from None
+    # Small local models occasionally emit malformed JSON or the {"text": null}
+    # escape hatch; one retry rescues a flaky generation without ever typing
+    # an invalid value. Transport failures propagate — post_json has its own
+    # retry policy for those.
+    result, usage = None, {}
+    for _ in range(2):
+        result = post_json(
+            base + "/chat/completions",
+            key,
+            {
+                "model": model,
+                "max_tokens": 1024,
+                "temperature": 0.2,
+                "response_format": {"type": "json_object"},
+                **reasoning,
+                "messages": [
+                    {"role": "system", "content": TEXT_VALUE},
+                    {"role": "user", "content": json.dumps(context)},
+                ],
+            },
+        )
+        for k, v in (result.get("usage") or {}).items():
+            if isinstance(v, (int, float)):
+                usage[k] = usage.get(k, 0) + v
+        try:
+            output = json.loads(result["choices"][0]["message"]["content"])
+            value = output["text"]
+            if set(output) != {"text"} or not isinstance(value, str) or not value.strip() or len(value) > 2000:
+                raise ValueError()
+            break
+        except (ValueError, KeyError, TypeError):
+            result = None
+    if result is None:
+        raise ValueError("Text helper returned no valid field value; nothing typed.")
     return value, {
         "model": model,
         "latency_ms": round((time.perf_counter() - started) * 1000),
-        "usage": result.get("usage", {}),
+        "usage": usage,
     }

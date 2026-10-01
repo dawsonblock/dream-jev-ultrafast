@@ -340,9 +340,24 @@ def test_trace_candidates_only_computed_when_recording(runner, monkeypatch, tmp_
     runner.dream_recorder = DreamTraceRecorder(
         ExperienceStore(tmp_path / "trace.jsonl"), goal="Find a book",
     )
+    # A fresh observation installs a fresh actions list, so the cached
+    # perception for the old page must not leak into the new step.
+    runner.state["browser"].observe.return_value = page()
     runner.state["decision"] = decision("e3")
     runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
-    assert spy.call_count == 3  # trace catalogue + snapshot for each of the two acts
+    # One shared perception serves the recorder's offered catalogue and
+    # snapshot() — the cache keys on the observed actions list, not per consumer.
+    assert spy.call_count == 2
+
+
+def test_snapshot_annotation_does_not_mutate_shared_perception(runner):
+    runner.state["decision"] = decision("e3")
+    runner.command("act", {"fingerprint": runner.state["page"]["fingerprint"]})
+    # Inspector elements carry node ids, but the cached perception is also the
+    # model request body — annotating it in place would leak local metadata
+    # into the next choose() call.
+    cached_elements = runner._perception_cache[5]
+    assert all("node" not in element for element in cached_elements)
 
 
 def test_close_records_unfinished_run_as_aborted(tmp_path):

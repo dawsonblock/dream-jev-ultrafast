@@ -134,20 +134,47 @@ class Agent:
         if self.dream_recorder:
             self.dream_recorder.start(page, self.exploration_policy)
 
-    def snapshot(self):
+    def _perception(self):
+        """Candidate catalogue + action space for the current page, computed once.
+
+        ``predict``/``choose``, the experiment scheduler, the recorder's offered
+        catalogue, and the inspector snapshot all consume the same reduction of
+        the observed action list — re-running it per consumer re-sanitizes
+        ~250 actions several times per step. The cache key is the actions-list
+        object itself: a fresh ``observe()`` installs a new list, and keeping
+        the old list referenced here means its ``id`` can never alias.
+        """
+        page = self.state["page"]
+        policy = getattr(self, "exploration_policy", None)
+        cache = getattr(self, "_perception_cache", None)
+        if (
+            cache is not None
+            and cache[0] is page["actions"]
+            and cache[1] == self.state["goal"]
+            and cache[2] is policy
+        ):
+            return cache[3:]
         candidates, omitted = candidate_actions(
-            self.state["page"]["actions"],
-            self.state["goal"],
-            exploration_policy=getattr(self, "exploration_policy", None),
+            page["actions"], self.state["goal"], exploration_policy=policy
         )
-        elements = action_space(candidates)[0]
+        elements, targets, controls = action_space(candidates)
+        result = (candidates, omitted, elements, targets, controls)
+        self._perception_cache = (page["actions"], self.state["goal"], policy, *result)
+        return result
+
+    def snapshot(self):
+        candidates, omitted, elements, _targets, _controls = self._perception()
         ordered_nodes = []
         for action in candidates:
             node = action.get("node")
             if action.get("kind") in {"click", "fill", "select"} and node not in ordered_nodes:
                 ordered_nodes.append(node)
-        for element, node in zip(elements, ordered_nodes, strict=True):
-            element["node"] = node  # local inspector metadata; never sent to a decision backend
+        # Annotate copies — the cached elements are shared with the model
+        # request body and must never grow inspector-only keys.
+        elements = [
+            {**element, "node": node}  # local inspector metadata; never sent to a decision backend
+            for element, node in zip(elements, ordered_nodes, strict=True)
+        ]
         return {
             **{k: v for k, v in self.state.items() if k != "browser"},
             "elements": elements,
@@ -231,6 +258,7 @@ class Agent:
                 state["history"],
                 backend=getattr(self, "decision_backend", None),
                 exploration_policy=getattr(self, "exploration_policy", None),
+                perception=self._perception(),
             )
             state["decisions"].append(
                 {
@@ -358,10 +386,7 @@ class Agent:
                 trial_model = experiment.get("model")
                 rate = float(experiment.get("rate", 0.0) or 0.0)
                 if 0.0 < rate <= 1.0:
-                    offered_now, _ = candidate_actions(
-                        page["actions"], state["goal"],
-                        exploration_policy=getattr(self, "exploration_policy", None),
-                    )
+                    offered_now = self._perception()[0]
                     # The prior was trained on the trace's sanitized features;
                     # raw page actions carry no goal_overlap, so annotate it —
                     # otherwise every live proposal is scored on a zeroed
@@ -604,11 +629,7 @@ class Agent:
                 # evaluate candidates the active policy had discarded as well as
                 # ones it offered. The offered catalogue is what the model saw.
                 observed_candidates = page["actions"]
-                offered_candidates, _ = candidate_actions(
-                    page["actions"],
-                    state["goal"],
-                    exploration_policy=getattr(self, "exploration_policy", None),
-                )
+                offered_candidates = self._perception()[0]
             state["browser"].act(action, page, text=text)
             self.pending_text = None
             state["elapsed_ms"] = self._elapsed()

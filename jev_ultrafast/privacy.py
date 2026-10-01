@@ -86,13 +86,16 @@ def sanitize_action(action):
     return clean
 
 
-def action_goal_overlap(action, goal_tokens):
+def action_goal_overlap(action, goal_tokens, clean=None):
     """Goal-token overlap computed on the sanitized candidate view.
 
     Live candidate scoring and trace compaction must agree on overlap, so both
-    tokenize the sanitized action fields rather than raw page text.
+    tokenize the sanitized action fields rather than raw page text. Callers
+    that already hold ``sanitize_action(action)`` may pass it as ``clean`` to
+    skip re-redacting the same dict — common in per-candidate hot loops.
     """
-    clean = sanitize_action(action)
+    if clean is None:
+        clean = sanitize_action(action)
     searchable = " ".join(
         str(clean.get(k, "")) for k in ("label", "value", "current_value", "option_label")
     ).lower()
