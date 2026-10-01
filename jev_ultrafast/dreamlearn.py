@@ -22,6 +22,11 @@ These are Level-1/Level-2 learners in the DREAM stack:
   never evidence, never a gate input. A counterfactual "Candidate 17 would
   have succeeded" can only be tested by actually running Candidate 17; real
   executions qualify, priors merely propose.
+- Level 4 (``CounterfactualTrials``): intention-to-treat effect estimates over
+  real randomized arm assignments recorded before the authority plane. The
+  unit of analysis is the assignment, not the executed step — denied,
+  rejected, and stale trials count toward their arm — while runs that never
+  produced a measured outcome are censored rather than counted as failures.
 
 No model may fabricate a model choice or a browser outcome, and none is part
 of the trusted evidence path.
@@ -186,14 +191,38 @@ def rank_bucket(rank: int | None) -> str:
     return _bucket(rank, (5, 20, 100), _RANK_BUCKETS)
 
 
+def _run_outcome(final: dict | None) -> str:
+    """Terminal outcome class of a recorded run.
+
+    ``success`` — verifier-confirmed done. ``failure`` — a measured terminal
+    non-success: blocked, denied, budget exhaustion, or a done-claim the
+    verifier did not confirm. ``censored`` — no outcome was measured at all:
+    the run was aborted, the recording was interrupted before
+    ``run_finished``, or it ended ``claimed_done`` with no verifier ever
+    checking. Censored is *missing data*, not a negative example — an
+    operator closing a session or a browser crash says nothing about whether
+    the trajectory was working.
+    """
+    if final is None:
+        return "censored"
+    status = str(final.get("status") or "")
+    if status == "done" and final.get("verified"):
+        return "success"
+    if status in {"aborted", "claimed_done"}:
+        return "censored"
+    return "failure"
+
+
 def _transitions(events: Iterable[dict]):
-    """Yield ``(transition_event, run_policy, terminal, verified_done, run_verified)``.
+    """Yield ``(transition_event, run_policy, terminal, verified_done, outcome)``.
 
     Run context supplies the policy needed to re-derive the offered catalogue
-    (the rank coordinate the models train on), the terminal verified outcome,
-    and the run-level verified outcome that applies to *every* step of the
-    trajectory. Transitions without a run_id are still usable, just without
-    run context (both verified signals are False for them).
+    (the rank coordinate the models train on) and the run's outcome class —
+    ``success``/``failure``/``censored`` — which applies to *every* step of
+    the trajectory. Transitions without a run_id keep the historical
+    treatment: no outcome was recorded for them, so they carry ``legacy`` and
+    continue to label as non-positive observations rather than disappearing
+    from models trained on older stores.
     """
     events = list(events)
     runs: dict[str, list[dict]] = defaultdict(list)
@@ -216,17 +245,16 @@ def _transitions(events: Iterable[dict]):
         # The run's final independently verified outcome — one label for the
         # whole trajectory. Every transition in a verified run shares it, so
         # intermediate page movement can never launder a failed trajectory.
-        run_verified = bool(
-            final is not None and final.get("status") == "done" and final.get("verified")
-        )
+        outcome = _run_outcome(final)
+        run_verified = outcome == "success"
         transitions = [e for e in run_events if e.get("event") == "transition"]
         for index, event in enumerate(transitions):
             terminal = index == len(transitions) - 1 and final is not None
             verified_done = bool(terminal and run_verified)
-            yield event, policy, terminal, verified_done, run_verified
+            yield event, policy, terminal, verified_done, outcome
     for event in loose:
         if event.get("event") == "transition":
-            yield event, None, False, False, False
+            yield event, None, False, False, "legacy"
 
 
 def _selected_offered_rank(event: dict, policy: ExplorationPolicy | None) -> int | None:
@@ -258,16 +286,17 @@ def _selected_offered_rank(event: dict, policy: ExplorationPolicy | None) -> int
 def _fit_cells(events: Iterable[dict], label) -> tuple[dict, dict, int, int]:
     """Count outcomes per ``(kind, overlap_bucket, offered_rank_bucket)`` cell.
 
-    ``label(event, terminal, verified_done, run_verified)`` decides what counts
-    as a positive observation; the rank coordinate is always the
-    offered-catalogue rank so training and counterfactual replay share one
-    basis.
+    ``label(event, terminal, verified_done, outcome)`` decides what counts as
+    a positive observation — or returns ``None`` to censor the sample entirely
+    (an unmeasured outcome is missing data, not a negative example). The rank
+    coordinate is always the offered-catalogue rank so training and
+    counterfactual replay share one basis.
     """
     cell_counts: dict[tuple[str, str, str], list[int]] = {}
     kind_counts: dict[str, list[int]] = {}
     positive_total = 0
     samples = 0
-    for event, policy, terminal, verified_done, run_verified in _transitions(events):
+    for event, policy, terminal, verified_done, outcome in _transitions(events):
         selected = event.get("selected") or {}
         kind = str(selected.get("kind") or "unknown")
         selected_id = selected.get("id")
@@ -277,7 +306,10 @@ def _fit_cells(events: Iterable[dict], label) -> tuple[dict, dict, int, int]:
             0,
         )
         rank = _selected_offered_rank(event, policy)
-        positive = int(bool(label(event, terminal, verified_done, run_verified)))
+        positive = label(event, terminal, verified_done, outcome)
+        if positive is None:
+            continue
+        positive = int(bool(positive))
         cell = (kind, overlap_bucket(overlap), rank_bucket(rank))
         cell_counts.setdefault(cell, [0, 0])
         cell_counts[cell][0] += 1
@@ -310,7 +342,11 @@ class OutcomeModel:
     def fit(cls, events: Iterable[dict]) -> "OutcomeModel":
         cell_counts, kind_counts, changed_total, samples = _fit_cells(
             events,
-            lambda event, terminal, verified_done, run_verified: bool(event.get("page_changed")),
+            # ``page_changed`` is factual transition telemetry, not an outcome
+            # judgment — a step that moved the page did so whether or not the
+            # run later reached a measured outcome, so censored runs still
+            # count here.
+            lambda event, terminal, verified_done, outcome: bool(event.get("page_changed")),
         )
         return cls(
             samples=samples,
@@ -383,11 +419,16 @@ class ChoiceModel:
     - The learned target is the run's final independently verified outcome:
       every action on a trajectory that ended verifier-confirmed ``done`` is
       a positive association, and every action on a failed or unverified run
-      is a negative. This is deliberate *trajectory* credit — correlational,
-      not per-action causality — and it restores the hardened v0.6.2 labeling:
-      intermediate ``page_changed`` movement must never let a run the verifier
-      rejected teach the prior that its actions were good. Per-action causal
-      credit is the job of ``CounterfactualTrials``, which randomizes.
+      is a negative — *unless the run's outcome was never measured*. A run
+      that ends ``aborted`` (operator closed the session, browser crashed,
+      recording interrupted) or ``claimed_done`` without a verifier is
+      censored out of the fit entirely: interruption is not evidence the
+      trajectory was failing. This is deliberate *trajectory* credit —
+      correlational, not per-action causality — and it restores the hardened
+      v0.6.2 labeling: intermediate ``page_changed`` movement must never let a
+      run the verifier rejected teach the prior that its actions were good.
+      Per-action causal credit is the job of ``CounterfactualTrials``, which
+      randomizes.
     - Every prediction carries the posterior standard deviation and an
       explicit ``confident`` flag; on sparse cells the model abstains rather
       than returning a smoothed guess.
@@ -408,7 +449,7 @@ class ChoiceModel:
     cells: tuple[tuple[str, str, str, int, int], ...] = ()
     kind_totals: tuple[tuple[str, int, int], ...] = ()
     global_positive: int = 0
-    version: str = "jev-choice/3"
+    version: str = "jev-choice/4"
 
     MIN_CONFIDENT = 4
     EXPLORE_BONUS = 0.5
@@ -417,10 +458,14 @@ class ChoiceModel:
     def fit(cls, events: Iterable[dict]) -> "ChoiceModel":
         # Trajectory-success association (v0.6.2 semantics): the label is the
         # run's verified final outcome for *every* step, not the step's page
-        # change. Transitions without run context carry run_verified=False.
+        # change. Censored runs (aborted/interrupted/unverifiable) drop out
+        # instead of fitting as negatives; transitions without run context
+        # keep the legacy non-positive label.
         cell_counts, kind_counts, positive_total, samples = _fit_cells(
             events,
-            lambda event, terminal, verified_done, run_verified: run_verified,
+            lambda event, terminal, verified_done, outcome: (
+                None if outcome == "censored" else outcome == "success"
+            ),
         )
         return cls(
             samples=samples,
@@ -524,127 +569,284 @@ class ChoiceModel:
         )
 
 
+def _wilson_interval(p: float, n: float, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval on a (possibly IPW-weighted) proportion.
+
+    ``n`` is the effective sample size — the count of independent
+    observations the weight mass is worth — so wide intervals on thin support
+    are intrinsic to the estimate, not a reporting choice.
+    """
+    if n <= 0:
+        return 0.0, 1.0
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2.0 * n)) / denom
+    half = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / denom
+    return max(0.0, center - half), min(1.0, center + half)
+
+
+def _trial_context(meta: dict, transition: dict | None) -> str:
+    """The cell a trial belongs to: the *model choice's* features.
+
+    Keying on the executed action would put the two arms of one assignment in
+    different cells whenever the proposal's overlap differs from the model
+    choice's — exactly when the prior diverged for a reason. Assignment
+    events carry the pre-treatment context directly; the transition's
+    candidate list is only a fallback for older records that lack it.
+    """
+    kind = str(meta.get("model_choice_kind") or "unknown")
+    if kind == "unknown" and transition is not None:
+        kind = str((transition.get("selected") or {}).get("kind") or "unknown")
+    overlap_raw = meta.get("model_choice_overlap")
+    if overlap_raw is not None:
+        try:
+            return f"{kind}|{overlap_bucket(int(overlap_raw))}"
+        except (TypeError, ValueError):
+            pass
+    if transition is not None:
+        model_choice = next(
+            (
+                c
+                for c in transition.get("candidates") or ()
+                if c.get("id") == meta.get("model_choice_id")
+            ),
+            None,
+        )
+        if model_choice is not None:
+            return f"{kind}|{overlap_bucket(int(model_choice.get('goal_overlap', 0) or 0))}"
+    return f"{kind}|unknown"
+
+
 @dataclass(frozen=True)
 class CounterfactualTrials:
-    """Propensity-corrected outcome estimates from *executed* experiments.
+    """Intention-to-treat estimates from randomized arm *assignments*.
 
-    The observational ``ChoiceModel`` only ever sees actions the historical
-    policy selected — it cannot say what an unchosen action would have done.
-    Experiment-tagged transitions are different: the scheduler assigned the
-    arm with a recorded ``assignment_probability``, so inverse-propensity
-    weighting turns them into honest counterfactual evidence.
+    The unit of analysis is the ``experiment_assigned`` event — recorded at
+    randomization, before the authority plane — not the executed transition.
+    Assigning the candidate arm is the intervention; whatever the authority
+    plane then does with it (execute, approval-pause, operator reject, policy
+    deny) is part of the treatment being measured. An assignment that never
+    produced a transition still enters its arm's estimate, so post-
+    randomization selection cannot silently drop the losing half of a trial.
 
-    Each cell is keyed by the *context* the tension arose in — the model
-    choice's ``(kind, overlap_bucket)`` — and holds one estimate per arm:
-    ``candidate`` (the prior's proposal was executed) versus ``control``
-    (the model's own choice was executed).
+    Endpoint semantics per assignment:
 
-    The primary endpoint is the run's final independently verified outcome:
-    since at most one trial is assigned per run, ``p_success`` answers the
-    actual experimental question — did assigning the proposal help the run
-    the verifier judged? A mid-run page change is secondary telemetry only
-    (``p_page_changed``); crediting it as progress let a trial whose run
-    ultimately failed report the exact opposite of reality.
+    - ``success`` — the run finished verifier-confirmed ``done``.
+    - ``failure`` — the run reached a measured terminal failure, including a
+      policy denial or an operator rejection that ended the run. Under ITT
+      that is a legitimate outcome of *assigning* the arm inside the real
+      authority system, not censoring.
+    - ``censored`` — the run produced no measured outcome at all (``aborted``,
+      interrupted recording, unverifiable claim). Censored assignments are
+      counted and reported but excluded from the endpoint estimate: an
+      unrelated infrastructure interruption is not evidence about the arm.
+      A trial whose execution is truly informative-but-blocked shows up as a
+      ``failure``, so the estimand is "effect of being assigned this arm",
+      not "effect of the arm executing" (which would need a compliance-aware
+      design this deliberately does not pretend to be).
+
+    ``p_page_changed`` remains secondary telemetry over *executed* trials —
+    page movement is only defined for assignments that reached the browser —
+    and is never a treatment effect.
+
+    Context cells key on the model choice's ``(kind, overlap_bucket)``, the
+    pre-randomization tension point, so both arms of one divergence share a
+    cell. A legacy transition carrying an ``experiment`` block but no
+    ``experiment_assigned`` event (pre-0.11 pools) is the only assignment
+    evidence available for that run and is analyzed as such; pools with
+    assignment events never take that path.
 
     Estimates annotate reports only; a promising candidate arm still has to
     qualify through the replay + bound-canary path like everything else.
     """
 
-    # (context_key, arm, trials, weighted_success, weighted_page, w_sum, w_sq)
-    cells: tuple[tuple[str, str, int, float, float, float, float], ...] = ()
-    version: str = "jev-trials/2"
+    # (context, arm, assigned, analyzed, executed, censored,
+    #  w_success, w_sum, w_sq, w_page, w_exec_sum)
+    cells: tuple[tuple[str, str, int, int, int, int, float, float, float, float, float], ...] = ()
+    version: str = "jev-trials/3"
 
-    MIN_ESS = 4.0
+    MIN_ESS = 8.0
 
     @classmethod
     def fit(cls, events: Iterable[dict]) -> "CounterfactualTrials":
+        events = list(events)
+        runs: dict[str, list[dict]] = defaultdict(list)
+        loose: list[dict] = []
+        for event in events:
+            if event.get("run_id"):
+                runs[event["run_id"]].append(event)
+            else:
+                loose.append(event)
         acc: dict[tuple[str, str], list[float]] = {}
-        for event, _policy, _terminal, _verified_done, run_verified in _transitions(events):
-            meta = event.get("experiment")
-            if not isinstance(meta, dict):
-                continue
+
+        def record(meta: dict, outcome: str, page_changed, transition):
+            """Fold one arm assignment into its context cell.
+
+            ``page_changed`` is the executed step's telemetry (None when the
+            trial never reached the browser); ``outcome`` is the run's class —
+            censored assignments are tallied but carry no endpoint weight.
+            """
             arm = str(meta.get("arm") or "")
-            propensity = meta.get("assignment_probability")
-            if arm not in {"candidate", "control"}:
-                continue
             try:
-                propensity = float(propensity)
+                propensity = float(meta.get("assignment_probability"))
             except (TypeError, ValueError):
-                continue
-            if not 0.0 < propensity <= 1.0:
-                continue
-            selected = event.get("selected") or {}
-            # The context is the *model choice's* features — where the tension
-            # arose — not the executed action's. Keying on ``selected`` would
-            # put the two arms of one assignment in different cells whenever
-            # the proposal's overlap differs from the model choice's, which is
-            # exactly when the prior diverged for a reason.
-            model_choice = next(
-                (
-                    c
-                    for c in event.get("candidates") or ()
-                    if c.get("id") == meta.get("model_choice_id")
-                ),
-                None,
+                return
+            if arm not in {"candidate", "control"} or not 0.0 < propensity <= 1.0:
+                return
+            cell = acc.setdefault(
+                (_trial_context(meta, transition), arm),
+                [0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0],
             )
-            overlap = (
-                overlap_bucket(int(model_choice.get("goal_overlap", 0) or 0))
-                if model_choice is not None
-                else "unknown"
-            )
-            context = (
-                f"{str(meta.get('model_choice_kind') or selected.get('kind') or 'unknown')}"
-                f"|{overlap}"
-            )
+            cell[0] += 1  # assigned
             weight = 1.0 / propensity
-            cell = acc.setdefault((context, arm), [0, 0.0, 0.0, 0.0, 0.0])
-            cell[0] += 1
-            # Primary endpoint: the run's final verified outcome. Secondary
-            # telemetry: whether the trial step itself moved the page.
-            cell[1] += float(run_verified) * weight
-            cell[2] += float(bool(event.get("page_changed"))) * weight
-            cell[3] += weight
-            cell[4] += weight * weight
+            if page_changed is not None:
+                cell[2] += 1  # executed
+                cell[7] += float(bool(page_changed)) * weight
+                cell[8] += weight
+            if outcome == "censored":
+                cell[3] += 1
+                return
+            cell[1] += 1  # analyzed (ITT denominator)
+            cell[4] += float(outcome == "success") * weight
+            cell[5] += weight
+            cell[6] += weight * weight
+
+        for run_id, run_events in runs.items():
+            run_events.sort(key=lambda e: (e.get("sequence", 0), e.get("recorded_at_ms", 0)))
+            final = next(
+                (e for e in reversed(run_events) if e.get("event") == "run_finished"), None
+            )
+            outcome = _run_outcome(final)
+            assignments = [
+                e
+                for e in run_events
+                if e.get("event") == "experiment_assigned" and isinstance(e.get("experiment"), dict)
+            ]
+            trial_steps = [
+                e
+                for e in run_events
+                if e.get("event") == "transition" and isinstance(e.get("experiment"), dict)
+            ]
+            if assignments:
+                for assigned_event in assignments:
+                    meta = assigned_event["experiment"]
+                    step = cls._execution_step(meta, trial_steps)
+                    record(
+                        meta,
+                        outcome,
+                        step.get("page_changed") if step is not None else None,
+                        step,
+                    )
+            else:
+                # Pre-assignment evidence (pools older than jev-ultrafast-
+                # tcb/0.11): an experiment-tagged transition is the only
+                # assignment record that exists — analyzed as an assignment
+                # observed at execution time.
+                for step in trial_steps:
+                    record(step["experiment"], outcome, step.get("page_changed"), step)
+        for event in loose:
+            # No run means no measurable outcome — the assignment is real but
+            # censored by construction.
+            if event.get("event") == "experiment_assigned" and isinstance(
+                event.get("experiment"), dict
+            ):
+                record(event["experiment"], "censored", None, None)
+            elif event.get("event") == "transition" and isinstance(event.get("experiment"), dict):
+                record(event["experiment"], "censored", event.get("page_changed"), event)
         return cls(
             cells=tuple(
                 sorted(
-                    (context, arm, n, wsuccess, wpage, wsum, wsq)
-                    for (context, arm), (n, wsuccess, wpage, wsum, wsq) in acc.items()
+                    (context, arm, *counts)
+                    for (context, arm), counts in acc.items()
                 )
             )
         )
 
-    def estimate(self, context: str | None = None) -> dict:
-        """Self-normalized IPW estimates per context and arm.
+    @staticmethod
+    def _execution_step(meta: dict, trial_steps: list[dict]) -> dict | None:
+        """The transition that executed this assignment, if one exists.
 
-        ``ess`` is the effective sample size — the count of independent
-        observations the weights are worth — so a few high-weight trials
-        cannot masquerade as a confident estimate.
+        At most one trial is assigned per run so at most one step matches;
+        ``experiment_id``/arm/proposal identity are used when present, falling
+        back to the run's single tagged transition.
+        """
+        if not trial_steps:
+            return None
+        experiment_id = meta.get("experiment_id")
+        if experiment_id is not None:
+            match = next(
+                (
+                    t
+                    for t in trial_steps
+                    if (t.get("experiment") or {}).get("experiment_id") == experiment_id
+                ),
+                None,
+            )
+            if match is not None:
+                return match
+        proposal_id = meta.get("proposal_id")
+        match = next(
+            (
+                t
+                for t in trial_steps
+                if (t.get("experiment") or {}).get("proposal_id") == proposal_id
+                and (t.get("experiment") or {}).get("model_choice_id")
+                == meta.get("model_choice_id")
+            ),
+            None,
+        )
+        return match if match is not None else (trial_steps[0] if len(trial_steps) == 1 else None)
+
+    def estimate(self, context: str | None = None) -> dict:
+        """Self-normalized IPW intention-to-treat estimates per context/arm.
+
+        ``p_success`` is the weighted share of non-censored assignments whose
+        run ended verifier-confirmed done — the effect of *being assigned*
+        the arm. ``trials`` is the analyzed (non-censored) count; ``assigned``
+        includes censored ones. ``ess`` is the effective sample size of the
+        analyzed pool — the count of independent observations the weights are
+        worth — and ``p_success_ci``/``delta_ci`` are Wilson/normal intervals
+        on that effective support, so thin evidence cannot masquerade as a
+        confident estimate.
         """
         arms: dict[str, dict] = {}
-        for ctx, arm, n, wsuccess, wpage, wsum, wsq in self.cells:
+        for ctx, arm, assigned, analyzed, executed, censored, ws, wsum, wsq, wpage, wexec in self.cells:
             if context is not None and ctx != context:
                 continue
             entry = arms.setdefault(ctx, {})
             ess = (wsum * wsum / wsq) if wsq else 0.0
+            p_success = (ws / wsum) if wsum else 0.0
             entry[arm] = {
-                # Primary endpoint: verified run success. ``p_page_changed``
-                # is secondary telemetry — never a treatment effect.
-                "p_success": (wsuccess / wsum) if wsum else 0.0,
-                "p_page_changed": (wpage / wsum) if wsum else 0.0,
-                "trials": n,
+                # Primary endpoint: verified run success under ITT.
+                # ``p_page_changed`` is executed-trial telemetry — never a
+                # treatment effect.
+                "p_success": p_success,
+                "p_success_ci": list(_wilson_interval(p_success, ess)),
+                "p_page_changed": (wpage / wexec) if wexec else None,
+                "assigned": assigned,
+                "trials": analyzed,
+                "executed": executed,
+                "censored": censored,
                 "ess": ess,
-                "reliable": ess >= self.MIN_ESS,
+                # Epsilon slack: IPW weights make an exactly-at-threshold
+                # effective size land a hair below it in floating point.
+                "reliable": ess >= self.MIN_ESS - 1e-9,
             }
         for entry in arms.values():
             if "candidate" in entry and "control" in entry:
-                entry["delta"] = (
-                    entry["candidate"]["p_success"] - entry["control"]["p_success"]
-                )
+                candidate, control = entry["candidate"], entry["control"]
+                delta = candidate["p_success"] - control["p_success"]
+                entry["delta"] = delta
+                if candidate["ess"] and control["ess"]:
+                    pc, pk = candidate["p_success"], control["p_success"]
+                    se = math.sqrt(
+                        pc * (1.0 - pc) / candidate["ess"]
+                        + pk * (1.0 - pk) / control["ess"]
+                    )
+                    entry["delta_ci"] = [delta - 1.96 * se, delta + 1.96 * se]
+                else:
+                    entry["delta_ci"] = None
                 # The contrast is only as trustworthy as its weaker arm.
-                entry["delta_reliable"] = (
-                    entry["candidate"]["reliable"] and entry["control"]["reliable"]
-                )
+                entry["delta_reliable"] = candidate["reliable"] and control["reliable"]
         return arms
 
     @property
@@ -661,9 +863,9 @@ class CounterfactualTrials:
         if unknown:
             raise ValueError(f"Unknown counterfactual-trials keys: {sorted(unknown)}")
         cells = tuple(tuple(c) for c in payload.get("cells", ()))
-        if any(len(c) != 7 for c in cells):
+        if any(len(c) != 11 for c in cells):
             raise ValueError("Unsupported counterfactual-trials cell arity")
         return cls(
             cells=cells,
-            version=payload.get("version", "jev-trials/1"),
+            version=payload.get("version", "jev-trials/3"),
         )

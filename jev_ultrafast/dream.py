@@ -46,7 +46,12 @@ SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", "jev-dream/3", SCHEMA_VERSION
 # adds experiment_assigned events recorded at randomization time, before the
 # authority plane — pools that predate it lack the boundary between a trial
 # that executed and a trial that was assigned but vetoed.
-TCB_VERSION = "jev-ultrafast-tcb/0.11"
+# 0.12 makes stamped experiment plans immutable and bound — digest, task key,
+# state, model choice, offered catalogue, and policy behavior are verified at
+# execution — and enriches experiment_assigned with the pre-treatment context
+# (choice/proposal overlap and offered ranks, task identity) the
+# intention-to-treat estimator groups on.
+TCB_VERSION = "jev-ultrafast-tcb/0.12"
 SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.3",
     "jev-ultrafast-tcb/0.4",
@@ -56,6 +61,7 @@ SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.8",
     "jev-ultrafast-tcb/0.9",
     "jev-ultrafast-tcb/0.10",
+    "jev-ultrafast-tcb/0.11",
     TCB_VERSION,
 }
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
@@ -142,6 +148,22 @@ def candidate_catalog_digest(candidates: Iterable[dict]) -> str:
             "goal_overlap": max(0, int(candidate.get("goal_overlap", 0))),
         })
     return _stable_hash(json.dumps(compact, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
+EXPERIMENT_PLAN_SCHEMA = "jev-experiment-plan/1"
+
+
+def experiment_plan_digest(plan: dict) -> str:
+    """Canonical content digest of a stamped experiment plan.
+
+    The digest covers every field of the plan — hypothesis, provenance, and
+    the bindings revalidated at execution (task key, state fingerprint, model
+    choice, offered catalogue, policy behavior) — so a stamped plan is an
+    immutable artifact: any post-hoc edit invalidates the digest instead of
+    silently reinterpreting the plan.
+    """
+    material = {k: v for k, v in plan.items() if k != "digest"}
+    return _stable_hash(json.dumps(material, sort_keys=True, separators=(",", ":")))
 
 
 @dataclass(frozen=True)
@@ -1016,9 +1038,14 @@ class ReplaySimulator:
                     if collect_proposals and divergent:
                         # An experiment candidate: the state, the action the
                         # recorded policy actually took, and the action the
-                        # prior would substitute. Executing it for real — under
-                        # the same authority plane — is how a counterfactual
-                        # hypothesis becomes signed evidence.
+                        # prior would substitute — plus the bindings a live
+                        # agent revalidates before executing the plan: the
+                        # task, the model-choice the hypothesis is conditioned
+                        # on, the offered catalogue it diverged inside, and
+                        # the policy/model identities that generated it.
+                        # Executing it for real — under the same authority
+                        # plane — is how a counterfactual hypothesis becomes
+                        # signed evidence.
                         summary["experiment_proposals"].append({
                             "world": world.key,
                             "task_key": world.task_key,
@@ -1033,6 +1060,17 @@ class ReplaySimulator:
                                 "propensity": transition.selected_propensity,
                             },
                             "proposal": proposal,
+                            "proposal_offered_rank": next(
+                                (
+                                    i
+                                    for i, item in enumerate(offered)
+                                    if item.get("id") == proposal["id"]
+                                ),
+                                None,
+                            ),
+                            "offered_catalogue_digest": candidate_catalog_digest(offered),
+                            "policy_behavior_digest": policy.behavior_digest,
+                            "choice_model_digest": choice_model.digest,
                             "selected_prior": {
                                 "p_progress": prediction["p_progress"],
                                 "uncertainty": prediction["uncertainty"],
@@ -1429,6 +1467,8 @@ class DreamReport:
     outcome_model_digest: str | None = None
     choice_model_digest: str | None = None
     experiment_proposals: tuple[dict, ...] = ()
+    trials_digest: str | None = None
+    trial_estimates: dict | None = None
 
     def to_dict(self):
         return {
@@ -1458,6 +1498,11 @@ class DreamReport:
             "outcome_model_digest": self.outcome_model_digest,
             "choice_model_digest": self.choice_model_digest,
             "experiment_proposals": list(self.experiment_proposals),
+            # Randomized-trial estimates are annotation, never gate input:
+            # the ITT arm estimates exist so an operator (or a future learned
+            # layer) can see what assigned experiments measured.
+            "trials_digest": self.trials_digest,
+            "trial_estimates": self.trial_estimates,
             "tcb_version": TCB_VERSION,
         }
 
@@ -1494,6 +1539,7 @@ class DreamImprover:
         cost_model=None,
         outcome_model=None,
         choice_model=None,
+        trials=None,
     ) -> DreamReport:
         worlds = list(worlds)
         splits = split_worlds(worlds)
@@ -1682,10 +1728,16 @@ class DreamImprover:
             collected.sort(key=lambda p: (-p["expected_delta"], p["world"], p["step"]))
             stamped = []
             for proposal in collected[:24]:
-                item = dict(proposal)
-                item["digest"] = _stable_hash(
-                    json.dumps(item, sort_keys=True, separators=(",", ":"))
-                )
+                # A stamped plan is an immutable ExperimentPlan: the digest
+                # binds the hypothesis *and* the bindings the agent
+                # revalidates live (task, state, model choice, offered
+                # catalogue, policy behavior, originating model, world pool
+                # and evidence head). A plan whose bindings no longer hold is
+                # stale and must be discarded, never reinterpreted.
+                item = {"schema": EXPERIMENT_PLAN_SCHEMA, **proposal}
+                item["world_pool_digest"] = pool_digest
+                item["evidence_head_hash"] = evidence_head_hash
+                item["digest"] = experiment_plan_digest(item)
                 stamped.append(item)
             experiment_proposals = tuple(stamped)
 
@@ -1707,6 +1759,11 @@ class DreamImprover:
             choice_model_digest=(
                 choice_model.digest if choice_model is not None and choice_model.samples else None
             ),
+            # Randomized assignments are the only causal evidence the store
+            # holds — surface the fitted estimates so they annotate the report
+            # instead of staying a diagnostic object nobody reads.
+            trials_digest=trials.digest if trials is not None else None,
+            trial_estimates=trials.estimate() if trials is not None else None,
         )
 
 

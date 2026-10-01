@@ -23,8 +23,17 @@ Usage:
 Configuration:
 
     JEV_LOCAL_PORT   listen port (default 9000)
+    JEV_LOCAL_TOKEN  optional shared secret; when set, requests must carry
+                     ``Authorization: Bearer <token>`` (point the agent at it
+                     with ``JEV_DECISION_API_KEY``)
     OLLAMA_BASE      Ollama server (default http://127.0.0.1:11434)
     OLLAMA_MODEL     model tag (default qwen3:8b)
+
+The service holds no browser authority, but it can spend real local compute —
+an arbitrary web page could otherwise POST to the loopback port from the
+user's browser and run up Ollama inference. Requests therefore must present a
+loopback Host header, carry no cross-site Origin, use the decision endpoint
+path, and hold the optional shared token when configured.
 
 The protocol: the agent POSTs {model, state, questions} where each question is
 {type: "choice", criteria: {key: description}, instructions}; the backend must
@@ -42,6 +51,7 @@ import sys
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 from jev_ultrafast.privacy import tokenize
 
@@ -277,8 +287,39 @@ def decide(body: dict) -> dict:
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    ALLOWED_PATHS = {"/v1/systemone"}
+
+    def _loopback_peer(self) -> bool:
+        """Loopback-only request gate.
+
+        Same posture as the demo inspector: the Host header must name the
+        loopback listener at its actual bound port, a browser-issued
+        cross-site POST carries an Origin that is never the shim itself, and
+        when ``JEV_LOCAL_TOKEN`` is set the request must bear it — the agent
+        sends it as the decision API key.
+        """
+        token = os.environ.get("JEV_LOCAL_TOKEN")
+        bound_port = self.server.server_address[1]
+        hostname, _, port = (self.headers.get("Host") or "").rpartition(":")
+        host_ok = hostname.lower() in {"127.0.0.1", "localhost", "[::1]"} and port == str(
+            bound_port
+        )
+        origin_ok = self.headers.get("Origin") in (
+            None,
+            f"http://127.0.0.1:{bound_port}",
+            f"http://localhost:{bound_port}",
+        )
+        token_ok = not token or self.headers.get("Authorization") == f"Bearer {token}"
+        return host_ok and origin_ok and token_ok
+
+    def do_GET(self):
+        self._send(404, {"error": "Not found"})
 
     def do_POST(self):
+        if not self._loopback_peer():
+            return self._send(403, {"error": "Loopback decision requests only"})
+        if urlparse(self.path).path not in self.ALLOWED_PATHS:
+            return self._send(404, {"error": "Not found"})
         try:
             length = int(self.headers.get("Content-Length", "0"))
             # Decision bodies carry the candidate catalogue (~256 KB ceiling

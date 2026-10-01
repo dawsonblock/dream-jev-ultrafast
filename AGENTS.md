@@ -29,5 +29,7 @@ DREAM-Jev invariants:
 - When promotion verification keys are configured, active policy records must carry a valid domain-separated attestation bound to candidate/parent digests and the qualifying evidence digests; unsigned or forged authority fails closed.
 - A configured chain-head anchor must agree with the log on every read and append; a gap is resolved only by explicit `reanchor()`, never silently.
 - Browser execution guarantees are `atomic` (single isolated-world validate+mutate turn, the default) and `trusted` (non-transactional CDP input with pre-press/pre-release revalidation); never describe trusted input as transactional.
+- Stamped experiment plans (`jev-experiment-plan/1`) are immutable: their digest binds task, state, model choice, offered catalogue, policy behavior, and originating model. A plan whose bindings no longer hold is stale — discard it; never rebase or reinterpret it.
+- Trial analysis is intention-to-treat over recorded `experiment_assigned` events: an assigned-but-unexecuted arm still counts under its run's real outcome. Aborted/interrupted/unverifiable runs are censored — missing data, never negative examples — while measured failures remain negative.
 
 Checks: uv run ruff check ., uv run pytest, node --check jev_ultrafast/static/app.js, uv build.

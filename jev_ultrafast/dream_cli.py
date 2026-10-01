@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from .dream import DreamImprover, ExperienceStore, ExplorationPolicy, PolicyRegistry, ReplayWorld
-from .dreamlearn import ChoiceModel, CostModel, OutcomeModel
+from .dreamlearn import ChoiceModel, CostModel, CounterfactualTrials, OutcomeModel
 
 COMMANDS = {
     "improve", "verify", "promote", "status", "rollback", "health",
@@ -224,6 +224,11 @@ def main(argv=None):
     cost_model = CostModel.fit(events) if args.cost_model else None
     outcome_model = OutcomeModel.fit(events) if args.outcome_model else None
     choice_model = ChoiceModel.fit(events) if args.choice_model else None
+    # Randomized arm assignments are causal evidence, not observational trace
+    # — fit them separately and always, so the report carries what the
+    # experiment layer actually measured rather than mixing trial transitions
+    # into the correlational priors alone.
+    trials = CounterfactualTrials.fit(events)
     report = DreamImprover().improve(
         worlds,
         baseline,
@@ -231,6 +236,7 @@ def main(argv=None):
         cost_model=cost_model,
         outcome_model=outcome_model,
         choice_model=choice_model,
+        trials=trials,
     )
     output = Path(args.report)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -253,6 +259,8 @@ def main(argv=None):
         "evidence_head_hash": report.evidence_head_hash,
         "live_canary_required": report.live_canary_required,
         "experiment_proposals": len(report.experiment_proposals),
+        "trial_contexts": len(report.trial_estimates or {}),
+        "trials_digest": report.trials_digest,
         "staged": bool(staged),
         "report": str(output),
     })

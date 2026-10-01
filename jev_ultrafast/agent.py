@@ -11,12 +11,19 @@ import time
 from pathlib import Path
 
 from .browser import Browser, StalePage
-from .dream import ExperienceStore, ExplorationPolicy, PolicyRegistry, candidate_catalog_digest
+from .dream import (
+    ExperienceStore,
+    ExplorationPolicy,
+    PolicyRegistry,
+    candidate_catalog_digest,
+    experiment_plan_digest,
+    task_key,
+)
 from .model import action_space, candidate_actions, choose, field_context, field_text
 from .policy import DefaultActionPolicy, assess_payload
-from .privacy import action_goal_overlap, tokenize
+from .privacy import action_goal_overlap, redact_text, tokenize
 from .questions import MAX_STEPS
-from .trace import DreamTraceRecorder
+from .trace import DreamTraceRecorder, compact_candidate
 
 TERMINAL_STATUSES = {"claimed_done", "done", "blocked"}
 
@@ -79,6 +86,10 @@ class Agent:
             if experiment.get("model") is None and not proposals:
                 raise ValueError("experiment requires a fitted model or stamped proposals")
         self.experiment = experiment
+        # Task identity for experiment-plan binding and assignment records —
+        # normalized exactly as the trace recorder stores them.
+        self.task_family = str(task_family).strip()[:256] if task_family else None
+        self.instance_id = str(instance_id).strip()[:256] if instance_id else None
         if isinstance(dream_store, (str, Path)):
             dream_store = ExperienceStore(dream_store)
         self.dream_recorder = (
@@ -213,6 +224,59 @@ class Agent:
         if not isinstance(result, dict) or type(result.get("passed")) is not bool:
             raise ValueError("Verifier must return bool or a dict containing passed: bool")
         return result
+
+    def _match_stamped_plan(self, proposals, *, page, offered_now, model_choice_id, goal_tokens):
+        """Match a stamped DreamReport experiment plan against the live step.
+
+        Returns ``(plan, stale_reasons)``. A stamped plan is an immutable
+        hypothesis — "when the model picks A in this state under this policy,
+        try B" — so every binding recorded at stamping time must still hold:
+        the plan digest verifies over its own content, the task key matches
+        this run's goal, the state fingerprint matches, the live model choice
+        equals the recorded historical choice the hypothesis was conditioned
+        on, the proposal is still in the offered catalogue, and the offered
+        catalogue and policy behavior digests still hold. A plan that claims
+        this state but fails any binding is *stale*: it is discarded, never
+        reinterpreted, and its staleness suppresses an ad-hoc substitution for
+        the same step — the experiment that runs must be the one that was
+        stamped, or none.
+        """
+        stale: list[str] = []
+        policy = getattr(self, "exploration_policy", None)
+        live_policy_digest = getattr(policy, "behavior_digest", None)
+        live_task_key = task_key(self.state["goal"])
+        offered_ids = {a["id"] for a in offered_now}
+        live_offered_digest = candidate_catalog_digest(
+            [compact_candidate(candidate, goal_tokens) for candidate in offered_now]
+        )
+        trial_model = (getattr(self, "experiment", None) or {}).get("model")
+        for plan in proposals:
+            if not isinstance(plan, dict) or plan.get("state") != page.get("fingerprint"):
+                continue
+            reasons = []
+            if plan.get("digest") != experiment_plan_digest(plan):
+                reasons.append("digest")
+            if not plan.get("task_key") or plan.get("task_key") != live_task_key:
+                reasons.append("task_key")
+            if (plan.get("historical") or {}).get("id") != model_choice_id:
+                reasons.append("model_choice")
+            proposal = plan.get("proposal")
+            if not isinstance(proposal, dict) or proposal.get("id") not in offered_ids:
+                reasons.append("proposal_not_offered")
+            if plan.get("offered_catalogue_digest") != live_offered_digest:
+                reasons.append("offered_catalogue")
+            if plan.get("policy_behavior_digest") != live_policy_digest:
+                reasons.append("policy_behavior")
+            if (
+                plan.get("choice_model_digest") is not None
+                and trial_model is not None
+                and getattr(trial_model, "digest", None) != plan["choice_model_digest"]
+            ):
+                reasons.append("choice_model")
+            if not reasons:
+                return plan, []
+            stale.extend(reasons)
+        return None, sorted(set(stale))
 
     def command(self, name, body=None):
         body = body or {}
@@ -390,27 +454,42 @@ class Agent:
                     # The prior was trained on the trace's sanitized features;
                     # raw page actions carry no goal_overlap, so annotate it —
                     # otherwise every live proposal is scored on a zeroed
-                    # overlap the model never saw in training.
-                    goal_tokens = set(tokenize(state["goal"]))
+                    # overlap the model never saw in training. The token basis
+                    # is the redacted goal, matching what the recorder stored.
+                    goal_tokens = set(tokenize(redact_text(state["goal"], 4096)))
                     offered_now = [
                         {**c, "goal_overlap": action_goal_overlap(c, goal_tokens)}
                         for c in offered_now
                     ]
-                    # A stamped DreamReport experiment proposal is matched to
-                    # this state by fingerprint; otherwise the live model
-                    # chooses from the same bounded catalogue.
-                    stamped = next(
-                        (
-                            p for p in experiment.get("proposals") or ()
-                            if isinstance(p, dict)
-                            and p.get("state") == page.get("fingerprint")
-                        ),
-                        None,
+                    # A stamped DreamReport experiment plan is immutable: it
+                    # executes only when every stamped binding still verifies
+                    # (digest, task, state, model choice, offered catalogue,
+                    # policy behavior). A state-matching plan that fails is
+                    # stale — discarded, and it suppresses an ad-hoc
+                    # substitution for this step rather than silently running
+                    # a different hypothesis under its identity. States no
+                    # plan claims fall through to the live prior, if provided.
+                    stamped, stale_reasons = self._match_stamped_plan(
+                        experiment.get("proposals") or (),
+                        page=page,
+                        offered_now=offered_now,
+                        model_choice_id=selected,
+                        goal_tokens=goal_tokens,
                     )
+                    if stale_reasons and getattr(self, "dream_recorder", None):
+                        self.dream_recorder.event(
+                            "experiment_plan_stale",
+                            state=page.get("fingerprint"),
+                            reasons=stale_reasons,
+                        )
                     proposal = (
                         dict(stamped.get("proposal") or {})
                         if stamped is not None
-                        else (trial_model.choose(offered_now) if trial_model is not None else None)
+                        else (
+                            None
+                            if stale_reasons
+                            else (trial_model.choose(offered_now) if trial_model is not None else None)
+                        )
                     )
                     # Hard boundary: a proposal is eligible only if it is one of
                     # the actions the exploration policy actually offered the
@@ -429,6 +508,10 @@ class Agent:
                         arm = "candidate" if roll < rate else "control"
                         selected_rank = next(
                             (i for i, a in enumerate(offered_now) if a["id"] == selected),
+                            None,
+                        )
+                        proposal_rank = next(
+                            (i for i, a in enumerate(offered_now) if a["id"] == proposal["id"]),
                             None,
                         )
                         expected_delta = None
@@ -465,17 +548,38 @@ class Agent:
                         # Immutable assignment: everything a later audit needs
                         # to re-derive what was proposed and why is frozen here
                         # — the offered catalogue, the policy behavior digest,
-                        # the model's identity, and the prior's own predicted
-                        # delta and uncertainty.
+                        # the model's identity, the prior's own predicted delta
+                        # and uncertainty, and the pre-treatment context the
+                        # intention-to-treat estimator groups on (task
+                        # identity, each side's overlap and offered rank). The
+                        # assignment must be self-contained: an assigned-but-
+                        # never-executed trial leaves no transition to recover
+                        # this context from.
                         experiment_meta = {
+                            "state": page.get("fingerprint"),
                             "arm": arm,
                             "assignment_probability": (
                                 rate if arm == "candidate" else 1.0 - rate
                             ),
                             "proposal_id": proposal["id"],
                             "proposal_kind": proposal.get("kind"),
+                            "proposal_overlap": (
+                                offered_now[proposal_rank].get("goal_overlap", 0)
+                                if proposal_rank is not None
+                                else None
+                            ),
+                            "proposal_offered_rank": proposal_rank,
                             "model_choice_id": selected,
                             "model_choice_kind": action.get("kind"),
+                            "model_choice_overlap": (
+                                offered_now[selected_rank].get("goal_overlap", 0)
+                                if selected_rank is not None
+                                else None
+                            ),
+                            "model_choice_offered_rank": selected_rank,
+                            "task_key": task_key(state["goal"]),
+                            "task_family": getattr(self, "task_family", None),
+                            "instance_id": getattr(self, "instance_id", None),
                             "proposal_digest": proposal_digest,
                             "stamped_digest": stamped.get("digest") if stamped else None,
                             "choice_model_digest": (
@@ -484,7 +588,12 @@ class Agent:
                             "policy_behavior_digest": (
                                 policy_digest if isinstance(policy_digest, str) else None
                             ),
-                            "offered_catalogue_digest": candidate_catalog_digest(offered_now),
+                            "offered_catalogue_digest": candidate_catalog_digest(
+                                [
+                                    compact_candidate(candidate, goal_tokens)
+                                    for candidate in offered_now
+                                ]
+                            ),
                             "proposal_p_progress": proposal.get("p_progress"),
                             "proposal_uncertainty": proposal.get("uncertainty"),
                             "expected_delta": expected_delta,

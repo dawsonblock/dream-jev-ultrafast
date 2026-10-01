@@ -802,38 +802,68 @@ def test_choice_model_page_churn_on_failed_runs_is_not_progress():
     assert pred["p_progress"] < 0.05
 
 
-def _trial_run(run_id, arm, *, success=True, page=True, propensity=0.5, kind="click",
-               model_kind="click", overlap=1, model_overlap=0, status=None, verified=None):
-    """One randomized trial as a complete run: the executed arm's transition
-    plus the run_finished outcome the trial endpoint is drawn from. The model
-    choice stays in the candidate catalogue (it was an offered action), so
-    both arms of a divergence share its context cell."""
-    proposal_id = f"p{run_id}"
-    model_id = f"m{run_id}"
-    transition = {
-        **_transition(
-            selected=proposal_id if arm == "candidate" else model_id,
-            page_changed=page,
-            candidates=[
-                {"id": proposal_id, "kind": kind, "label": "Go", "goal_overlap": overlap},
-                {"id": model_id, "kind": model_kind, "label": "M", "goal_overlap": model_overlap},
-            ],
-        ),
-        "experiment": {
-            "arm": arm,
-            "assignment_probability": propensity,
-            "proposal_id": proposal_id,
-            "proposal_kind": kind,
-            "model_choice_id": model_id,
-            "model_choice_kind": model_kind,
-        },
+def _trial_meta(run_id, arm, *, propensity=0.5, kind="click", model_kind="click",
+                overlap=1, model_overlap=0):
+    """The experiment record exactly as the agent stamps it at assignment
+    time — arm, propensity, and the pre-treatment context of both sides."""
+    return {
+        "experiment_id": f"x{run_id}",
+        "arm": arm,
+        "assignment_probability": propensity,
+        "proposal_id": f"p{run_id}",
+        "proposal_kind": kind,
+        "proposal_overlap": overlap,
+        "proposal_offered_rank": 0,
+        "model_choice_id": f"m{run_id}",
+        "model_choice_kind": model_kind,
+        "model_choice_overlap": model_overlap,
+        "model_choice_offered_rank": 1,
+        "task_key": "t",
     }
-    return _run_events(
+
+
+def _trial_run(run_id, arm, *, success=True, page=True, propensity=0.5, kind="click",
+               model_kind="click", overlap=1, model_overlap=0, status=None, verified=None,
+               executed=True):
+    """One randomized trial as a complete run: the ``experiment_assigned``
+    record written at randomization, the executed arm's transition (absent
+    when the trial was denied or vetoed before execution), and the
+    run_finished outcome the trial endpoint is drawn from. The model choice
+    stays in the candidate catalogue (it was an offered action), so both arms
+    of a divergence share its context cell."""
+    meta = _trial_meta(
+        run_id, arm, propensity=propensity, kind=kind, model_kind=model_kind,
+        overlap=overlap, model_overlap=model_overlap,
+    )
+    proposal_id, model_id = meta["proposal_id"], meta["model_choice_id"]
+    transitions = []
+    if executed:
+        transitions.append({
+            **_transition(
+                selected=proposal_id if arm == "candidate" else model_id,
+                page_changed=page,
+                candidates=[
+                    {"id": proposal_id, "kind": kind, "label": "Go", "goal_overlap": overlap},
+                    {"id": model_id, "kind": model_kind, "label": "M", "goal_overlap": model_overlap},
+                ],
+            ),
+            "experiment": meta,
+        })
+    events = _run_events(
         run_id,
-        [transition],
+        transitions,
         status=status or ("done" if success else "blocked"),
         verified=success if verified is None else verified,
     )
+    # The assignment lands at randomization — before authority, approval, and
+    # any transition — tagged with the same run and task.
+    assignment = {
+        "event": "experiment_assigned",
+        "run_id": run_id,
+        "task_key": "t",
+        "experiment": meta,
+    }
+    return events[:1] + [assignment] + events[1:]
 
 
 def test_counterfactual_trials_ipw_estimates():
@@ -842,22 +872,29 @@ def test_counterfactual_trials_ipw_estimates():
     from jev_ultrafast.dreamlearn import CounterfactualTrials
 
     events = []
-    for i in range(4):
-        events += _trial_run(f"c{i}", "candidate", success=i < 3, propensity=0.25)
-        events += _trial_run(f"k{i}", "control", success=i == 0, propensity=0.75)
+    for i in range(8):
+        events += _trial_run(f"c{i}", "candidate", success=i < 6, propensity=0.25)
+        events += _trial_run(f"k{i}", "control", success=i < 2, propensity=0.75)
     trials = CounterfactualTrials.fit(events)
     estimates = trials.estimate()
     # Context keys on the model choice's features (overlap 0), not the
     # executed arm's — otherwise the two arms would land in different cells.
     assert set(estimates) == {"click|0"}
     arms = estimates["click|0"]
-    assert arms["candidate"]["trials"] == 4
+    assert arms["candidate"]["assigned"] == arms["candidate"]["trials"] == 8
+    assert arms["candidate"]["executed"] == 8
+    assert arms["candidate"]["censored"] == 0
     assert abs(arms["candidate"]["p_success"] - 0.75) < 1e-9
-    assert arms["control"]["trials"] == 4
+    assert arms["control"]["trials"] == 8
     assert abs(arms["control"]["p_success"] - 0.25) < 1e-9
     assert abs(arms["delta"] - 0.5) < 1e-9
     assert arms["delta_reliable"] is True
     assert arms["candidate"]["reliable"] and arms["control"]["reliable"]
+    # Uncertainty intervals bracket the point estimate on effective support.
+    for arm in ("candidate", "control"):
+        lo, hi = arms[arm]["p_success_ci"]
+        assert lo <= arms[arm]["p_success"] <= hi
+    assert arms["delta_ci"][0] <= arms["delta"] <= arms["delta_ci"][1]
 
 
 def test_counterfactual_trials_require_recorded_propensity():
@@ -868,6 +905,8 @@ def test_counterfactual_trials_require_recorded_propensity():
     bad = []
     for prop in (None, 0.0, 1.5, "nan"):
         run = _trial_run("x", "candidate")
+        # Index 1 is the experiment_assigned event — the record the estimator
+        # actually reads. Corrupting its propensity must void the assignment.
         run[1]["experiment"]["assignment_probability"] = prop
         bad += run
     # Non-experiment transitions never enter trial estimates either.
@@ -895,6 +934,7 @@ def test_counterfactual_trials_endpoint_is_run_outcome_not_page_change():
     assert arms["candidate"]["p_page_changed"] > 0.99
     assert arms["control"]["p_page_changed"] < 0.01
     assert arms["delta"] < -0.9
+    assert arms["delta_reliable"] is False  # 4 trials/arm is below MIN_ESS
 
 
 def test_counterfactual_trials_partial_success_counts_verified_share():
@@ -908,9 +948,11 @@ def test_counterfactual_trials_partial_success_counts_verified_share():
     )
     estimates = CounterfactualTrials.fit(events).estimate()
     arm = estimates["click|0"]["candidate"]
-    assert arm["trials"] == 2
+    assert arm["assigned"] == arm["trials"] == arm["executed"] == 2
+    assert arm["censored"] == 0
     assert abs(arm["p_success"] - 0.5) < 1e-9  # one verified success of two
     assert arm["p_page_changed"] > 0.99  # both steps moved the page
+    assert arm["reliable"] is False  # two effective samples is not evidence
 
 
 def test_counterfactual_trials_context_is_arm_independent():
@@ -926,6 +968,82 @@ def test_counterfactual_trials_context_is_arm_independent():
     entry = estimates["click|0"]
     assert set(entry["candidate"]) and set(entry["control"])
     assert "delta" in entry
+
+
+def test_counterfactual_trials_itt_counts_unexecuted_assignments():
+    """The audit's post-randomization-selection repro: candidate-armed trials
+    whose assignment is rejected or denied before a transition must still
+    count — as candidate-arm assignments, with the run's real outcome — not
+    vanish from the estimator because nothing executed."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    events = []
+    for i in range(8):
+        # Assigned candidate → authority stopped it → run still finished
+        # (blocked) with no transition ever recorded for the trial.
+        events += _trial_run(f"c{i}", "candidate", executed=False, success=False)
+        events += _trial_run(f"k{i}", "control", success=True)
+    arms = CounterfactualTrials.fit(events).estimate()["click|0"]
+    candidate = arms["candidate"]
+    assert candidate["assigned"] == 8
+    assert candidate["executed"] == 0  # no transition — yet still analyzed
+    assert candidate["trials"] == 8
+    assert candidate["p_success"] < 0.01  # every assigned-candidate run failed
+    assert candidate["p_page_changed"] is None  # no step ever moved a page
+    assert arms["control"]["p_success"] > 0.99
+    assert arms["delta"] < -0.9
+    assert arms["delta_reliable"] is True
+
+
+def test_counterfactual_trials_censor_unmeasured_runs():
+    """Aborted/interrupted runs are censored — counted as assigned but not as
+    failures — in both the primary endpoint and the analyzed denominator."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    events = (
+        # Aborted: operator closed the session — no outcome measured.
+        _trial_run("a", "candidate", status="aborted", verified=False)
+        # Interrupted: the store holds no run_finished at all.
+        + _trial_run("t", "candidate")[:-1]
+        # A real measured failure for contrast.
+        + _trial_run("f", "candidate", success=False)
+    )
+    arm = CounterfactualTrials.fit(events).estimate()["click|0"]["candidate"]
+    assert arm["assigned"] == 3
+    assert arm["censored"] == 2
+    assert arm["trials"] == 1  # only the measured failure is analyzed
+    assert arm["p_success"] < 0.01
+
+
+def test_counterfactual_trials_legacy_transition_only_pool():
+    """Pre-0.11 pools have no experiment_assigned events; a transition's
+    experiment block is the only assignment record — analyzed as one."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    events = [
+        event
+        for event in _trial_run("x", "candidate", success=False)
+        if event["event"] != "experiment_assigned"
+    ]
+    arm = CounterfactualTrials.fit(events).estimate()["click|0"]["candidate"]
+    assert arm["assigned"] == arm["trials"] == arm["executed"] == 1
+    assert arm["p_success"] < 0.01
+
+
+def test_counterfactual_trials_unreliable_below_effective_support():
+    """A precise-looking delta on thin effective support must not claim
+    reliability — the interval is wide and the flag is honest."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    events = []
+    for i in range(4):
+        events += _trial_run(f"c{i}", "candidate", success=i < 3)
+        events += _trial_run(f"k{i}", "control", success=i < 1)
+    arms = CounterfactualTrials.fit(events).estimate()["click|0"]
+    assert abs(arms["delta"] - 0.5) < 1e-9
+    assert arms["candidate"]["ess"] < CounterfactualTrials.MIN_ESS
+    assert arms["delta_reliable"] is False
+    assert arms["delta_ci"][1] - arms["delta_ci"][0] > 0.5  # honestly wide
 
 
 def test_report_collects_experiment_proposals(tmp_path):
@@ -946,7 +1064,19 @@ def test_report_collects_experiment_proposals(tmp_path):
         assert proposal["proposal"]["id"] != proposal["historical"]["id"]
         assert proposal["digest"]
         assert proposal["expected_delta"] > -1.0
+        # A stamped plan is a bound ExperimentPlan: schema, task, world,
+        # offered catalogue, policy, and originating model are all recorded.
+        assert proposal["schema"] == "jev-experiment-plan/1"
+        for binding in (
+            "task_key", "family_key", "world", "state", "offered_catalogue_digest",
+            "policy_behavior_digest", "choice_model_digest", "world_pool_digest",
+            "proposal_offered_rank",
+        ):
+            assert proposal.get(binding) is not None, binding
+        assert proposal["choice_model_digest"] == model.digest
     # Digest binds the proposal material — stable and content-derived.
+    from jev_ultrafast.dream import experiment_plan_digest
+    assert proposals[0]["digest"] == experiment_plan_digest(proposals[0])
     assert proposals[0]["digest"] == hashlib.sha256(
         json.dumps(
             {k: v for k, v in proposals[0].items() if k != "digest"},
@@ -957,6 +1087,59 @@ def test_report_collects_experiment_proposals(tmp_path):
         [json.loads(line) for line in store.read_text().splitlines() if line.strip()]
     )
     assert replay_worlds  # proposals stay annotation; replay is unchanged
+
+
+def test_report_surfaces_trial_estimates_without_gating(tmp_path):
+    """CounterfactualTrials annotate the report with what the randomized layer
+    measured — assignment counts, censoring, intervals — and never enter the
+    promotion path."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    store = tmp_path / "events.jsonl"
+    worlds = _divergent_worlds(store)
+    events = [json.loads(line) for line in store.read_text().splitlines() if line.strip()]
+    events += _trial_run("t1", "candidate", success=True)
+    trials = CounterfactualTrials.fit(events)
+    with_trials = DreamImprover(gate=PromotionGate(min_coverage=0.0)).improve(
+        worlds, ExplorationPolicy(), trials=trials)
+    without = DreamImprover(gate=PromotionGate(min_coverage=0.0)).improve(
+        worlds, ExplorationPolicy())
+    assert with_trials.trials_digest == trials.digest
+    estimates = with_trials.trial_estimates
+    assert estimates["click|0"]["candidate"]["assigned"] == 1
+    assert estimates["click|0"]["candidate"]["executed"] == 1
+    # Trial estimates are annotation only — identical promotion outcome.
+    assert with_trials.promotion.approved == without.promotion.approved
+    assert with_trials.selected.digest == without.selected.digest
+    assert without.trials_digest is None and without.trial_estimates is None
+
+
+def test_choice_model_censors_unmeasured_runs():
+    """An aborted run's actions were never measured — censoring drops them
+    from the outcome-label fit instead of teaching the prior they failed."""
+    events = []
+    for i in range(4):
+        events += _run_events(f"ok{i}", [_transition(selected="a")],
+                              status="done", verified=True)
+    events += _run_events("dead", [_transition(selected="a"), _transition(selected="b")],
+                          status="aborted", verified=False)
+    torn = _run_events("torn", [_transition(selected="a")])[:-1]  # no finish
+    model = ChoiceModel.fit(events + torn)
+    # 4 verified positives; the aborted and torn runs contribute nothing.
+    assert model.samples == 4
+    assert model.global_positive == 4
+
+
+def test_choice_model_measured_failures_still_fit_negatively():
+    """Blocked (measured) failure keeps the v0.6.2 negative labeling — only
+    *unmeasured* outcomes censor."""
+    events = (
+        _run_events("ok", [_transition(selected="a")], status="done", verified=True)
+        + _run_events("bad", [_transition(selected="a")], status="blocked", verified=False)
+    )
+    model = ChoiceModel.fit(events)
+    assert model.samples == 2
+    assert model.global_positive == 1
 
 
 def _divergent_worlds(store_path):

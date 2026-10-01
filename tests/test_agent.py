@@ -840,25 +840,69 @@ def test_experiment_assignment_is_recorded_before_authority(runner, tmp_path):
     assert CanaryMetrics.from_events(events, ExplorationPolicy().digest).tasks == 0
 
 
+def _stamped_plan(runner, *, proposal_id="e3", model_choice_id="e1", **overrides):
+    """A *valid* stamped experiment plan for the runner's live step — digest
+    and every execution binding computed the way DreamImprover stamps them."""
+    from jev_ultrafast.dream import (
+        candidate_catalog_digest,
+        experiment_plan_digest,
+        task_key,
+    )
+    from jev_ultrafast.privacy import redact_text, tokenize
+    from jev_ultrafast.trace import compact_candidate
+
+    goal = runner.state["goal"]
+    goal_tokens = set(tokenize(redact_text(goal, 4096)))
+    offered = runner._perception()[0]
+    policy = getattr(runner, "exploration_policy", None)
+    plan = {
+        "schema": "jev-experiment-plan/1",
+        "world": "w0",
+        "task_key": task_key(goal),
+        "family_key": "family",
+        "step": 0,
+        "state": runner.state["page"]["fingerprint"],
+        "historical": {
+            "id": model_choice_id,
+            "kind": "fill",
+            "goal_overlap": 1,
+            "offered_rank": 0,
+        },
+        "proposal": {
+            "id": proposal_id,
+            "kind": "click",
+            "p_progress": 0.9,
+            "uncertainty": 0.1,
+        },
+        "proposal_offered_rank": next(
+            i for i, candidate in enumerate(offered) if candidate["id"] == proposal_id
+        ),
+        "offered_catalogue_digest": candidate_catalog_digest(
+            [compact_candidate(candidate, goal_tokens) for candidate in offered]
+        ),
+        "policy_behavior_digest": getattr(policy, "behavior_digest", None),
+        "choice_model_digest": None,
+        "world_pool_digest": "0" * 64,
+        "expected_delta": 0.4,
+    }
+    plan.update(overrides)
+    plan["digest"] = experiment_plan_digest(plan)
+    return plan
+
+
 def test_experiment_stamped_proposal_executes_the_plan(runner, tmp_path):
     """experiment={"proposals": [...]} consumes the stamped DreamReport plan
-    itself — matched to the live state by fingerprint — rather than re-asking
-    a live model."""
+    itself — digest and every binding verified — rather than re-asking a live
+    model."""
     from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
     from jev_ultrafast.trace import DreamTraceRecorder
 
     store = ExperienceStore(tmp_path / "exp.jsonl")
     runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
     runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    runner.exploration_policy = ExplorationPolicy()
     p = runner.state["page"]
-    stamped = {
-        "state": p["fingerprint"],
-        "step": 0,
-        "proposal": {"id": "e3", "kind": "click", "p_progress": 0.9, "uncertainty": 0.1},
-        "historical": {"id": "e1"},
-        "expected_delta": 0.4,
-        "digest": "ab" * 32,
-    }
+    stamped = _stamped_plan(runner)
     runner.experiment = {"proposals": [stamped], "rate": 1.0}
     runner.state["decision"] = decision("e1")
     runner.state["status"] = "predicted"
@@ -871,6 +915,137 @@ def test_experiment_stamped_proposal_executes_the_plan(runner, tmp_path):
     assert assigned["experiment"]["experiment_id"] == stamped["digest"][:16]
     assert assigned["experiment"]["expected_delta"] == 0.4
     assert trial["experiment"]["stamped_digest"] == stamped["digest"]
+
+
+def _experiment_runner(runner, tmp_path, plan, monkeypatch):
+    """Wire a runner for stamped-plan tests: recorder, policy, experiment —
+    and a stubbed text helper so the model's own fill can execute when a
+    stale plan correctly suppresses the substitution."""
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    if getattr(runner, "exploration_policy", None) is None:
+        runner.exploration_policy = ExplorationPolicy()
+    monkeypatch.setattr(
+        loop, "field_text", Mock(return_value=("book", {"model": "t", "latency_ms": 1}))
+    )
+    runner.experiment = {"proposals": [plan], "rate": 1.0}
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+    return store
+
+
+def test_experiment_stamped_plan_rejects_tampered_proposal(runner, tmp_path, monkeypatch):
+    """The audit's repro: mutate the proposal after stamping without
+    re-digesting → the digest check fails and the plan is discarded, never
+    reinterpreted. The model's own choice executes; no trial is assigned."""
+    p = runner.state["page"]
+    plan = _stamped_plan(runner)
+    plan["proposal"] = {"id": "e2", "kind": "click"}  # post-digest tamper
+    store = _experiment_runner(runner, tmp_path, plan, monkeypatch)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
+    events = store.load()
+    stale = next(e for e in events if e["event"] == "experiment_plan_stale")
+    assert "digest" in stale["reasons"]
+    assert not any(e["event"] == "experiment_assigned" for e in events)
+
+
+def test_experiment_stamped_plan_binds_task_and_state(runner, tmp_path, monkeypatch):
+    """A plan stamped for a different goal is stale here — the page
+    fingerprint alone must never qualify it (same page, different task)."""
+    p = runner.state["page"]
+    plan = _stamped_plan(runner, task_key="deadbeef")
+    store = _experiment_runner(runner, tmp_path, plan, monkeypatch)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
+    events = store.load()
+    stale = next(e for e in events if e["event"] == "experiment_plan_stale")
+    assert "task_key" in stale["reasons"]
+
+
+def test_experiment_stamped_plan_binds_model_choice(runner, tmp_path, monkeypatch):
+    """The hypothesis is 'when the model picks A, try B'. If the live model
+    picks something else, the conditioned-on premise never held — stale."""
+    p = runner.state["page"]
+    plan = _stamped_plan(runner, model_choice_id="e2")  # model will pick e1
+    store = _experiment_runner(runner, tmp_path, plan, monkeypatch)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
+    events = store.load()
+    stale = next(e for e in events if e["event"] == "experiment_plan_stale")
+    assert "model_choice" in stale["reasons"]
+
+
+def test_experiment_stamped_plan_binds_policy_and_catalogue(runner, tmp_path, monkeypatch):
+    """A plan minted under a different policy/offered catalogue is stale — the
+    proposal may still be offered, but the experiment that was designed is
+    not the one being run."""
+    from jev_ultrafast.dream import ExplorationPolicy
+
+    p = runner.state["page"]
+    # Stamped under different policy behavior than the live one — same offered
+    # catalogue (no_progress_window doesn't filter candidates), different
+    # behavior digest.
+    runner.exploration_policy = ExplorationPolicy(no_progress_window=10)
+    plan = _stamped_plan(runner)
+    runner.exploration_policy = ExplorationPolicy()  # live policy differs
+    store = _experiment_runner(runner, tmp_path, plan, monkeypatch)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
+    stale = next(e for e in store.load() if e["event"] == "experiment_plan_stale")
+    assert "policy_behavior" in stale["reasons"]
+
+
+def test_experiment_stale_plan_suppresses_live_fallback(runner, tmp_path, monkeypatch):
+    """A stamped plan that claims this state but fails validation suppresses
+    the ad-hoc live-model substitution for the step — the experiment that
+    runs is the stamped one or none."""
+    p = runner.state["page"]
+    plan = _stamped_plan(runner, task_key="deadbeef")
+    store = _experiment_runner(runner, tmp_path, plan, monkeypatch)
+    live = Mock()
+    live.choose = Mock(return_value={"id": "e3", "kind": "click"})
+    runner.experiment = {"proposals": [plan], "model": live, "rate": 1.0}
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
+    live.choose.assert_not_called()
+    assert not any(e["event"] == "experiment_assigned" for e in store.load())
+
+
+def test_experiment_assignment_meta_carries_itt_context(runner, tmp_path):
+    """The assignment event is self-contained: the pre-treatment context the
+    intention-to-treat estimator needs survives even when nothing executes."""
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    runner.task_family = "search"
+    runner.instance_id = "inst-7"
+    proposal_model = Mock()
+    proposal_model.choose = Mock(return_value={"id": "e3", "kind": "click"})
+    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+    p = runner.state["page"]
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    meta = next(e for e in store.load() if e["event"] == "experiment_assigned")["experiment"]
+    for field in (
+        "task_key", "task_family", "instance_id", "state",
+        "model_choice_id", "model_choice_kind", "model_choice_overlap",
+        "model_choice_offered_rank", "proposal_id", "proposal_kind",
+        "proposal_overlap", "proposal_offered_rank", "assignment_probability",
+        "experiment_id",
+    ):
+        assert field in meta, field
+    assert meta["task_family"] == "search"
+    assert meta["instance_id"] == "inst-7"
+    assert meta["model_choice_id"] == "e1" and meta["proposal_id"] == "e3"
 
 
 def test_experiment_proposals_config_validated_in_init(monkeypatch):

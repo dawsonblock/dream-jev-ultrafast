@@ -9,6 +9,25 @@ from .privacy import action_goal_overlap, redact_text, sanitize_action, sanitize
 _RESERVED_EVENT_KEYS = {"run_id", "task_key", "sequence"}
 
 
+def compact_candidate(candidate: dict, goal_tokens) -> dict:
+    """The candidate projection recorded as replay evidence.
+
+    Live execution and offline replay must derive identical compact entries,
+    so both the transition recorder and the experiment-plan binder project
+    through this one function — a stamped plan's offered-catalogue digest only
+    verifies when the live catalogue matches the recorded one.
+    """
+    clean = sanitize_action(candidate)
+    return {
+        "id": candidate.get("id"),
+        "kind": candidate.get("kind"),
+        "node": candidate.get("node"),
+        "label": clean.get("label", ""),
+        "value": clean.get("value", clean.get("current_value", "")),
+        "goal_overlap": action_goal_overlap(candidate, goal_tokens, clean=clean),
+    }
+
+
 class DreamTraceRecorder:
     def __init__(
         self,
@@ -71,22 +90,12 @@ class DreamTraceRecorder:
         selected = sanitize_action(action)
         goal_tokens = set(tokenize(self.goal))
 
-        def compact(actions):
-            entries = []
-            for candidate in actions:
-                clean = sanitize_action(candidate)
-                entries.append({
-                    "id": candidate.get("id"),
-                    "kind": candidate.get("kind"),
-                    "node": candidate.get("node"),
-                    "label": clean.get("label", ""),
-                    "value": clean.get("value", clean.get("current_value", "")),
-                    "goal_overlap": action_goal_overlap(candidate, goal_tokens, clean=clean),
-                })
-            return entries
-
-        compact_candidates = compact(candidates)
-        compact_offered = compact(offered) if offered is not None else None
+        compact_candidates = [compact_candidate(candidate, goal_tokens) for candidate in candidates]
+        compact_offered = (
+            [compact_candidate(candidate, goal_tokens) for candidate in offered]
+            if offered is not None
+            else None
+        )
         # The two rank coordinates are different evidence: the observed rank is
         # the action's position in the pre-policy catalogue, the offered rank
         # its position in what the model was actually shown. Learned models
