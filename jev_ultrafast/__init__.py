@@ -16,7 +16,13 @@ from .dream import (
     ReplaySimulator,
     ReplayWorld,
 )
-from .dreamlearn import ChoiceModel, CostModel, CounterfactualTrials, OutcomeModel
+from .dreamlearn import (
+    ChoiceModel,
+    CostModel,
+    CounterfactualTrials,
+    OutcomeModel,
+    TrialChoiceModel,
+)
 from .model import DecisionBackend, SystemOneBackend
 from .policy import (
     DefaultActionPolicy,
@@ -28,7 +34,7 @@ from .policy import (
 )
 from .signing import EvidenceSigner
 
-__version__ = "0.8.2"
+__version__ = "0.8.3"
 
 __all__ = [
     "Agent",
@@ -57,5 +63,6 @@ __all__ = [
     "OutcomeModel",
     "ChoiceModel",
     "CounterfactualTrials",
+    "TrialChoiceModel",
     "EvidenceSigner",
 ]

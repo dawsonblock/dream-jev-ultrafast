@@ -1036,7 +1036,7 @@ def test_experiment_assignment_meta_carries_itt_context(runner, tmp_path):
     runner.command("act", {"fingerprint": p["fingerprint"]})
     meta = next(e for e in store.load() if e["event"] == "experiment_assigned")["experiment"]
     for field in (
-        "task_key", "task_family", "instance_id", "state",
+        "task_key", "task_family", "site", "instance_id", "state",
         "model_choice_id", "model_choice_kind", "model_choice_overlap",
         "model_choice_offered_rank", "proposal_id", "proposal_kind",
         "proposal_overlap", "proposal_offered_rank", "assignment_probability",
@@ -1044,6 +1044,7 @@ def test_experiment_assignment_meta_carries_itt_context(runner, tmp_path):
     ):
         assert field in meta, field
     assert meta["task_family"] == "search"
+    assert meta["site"] == "example.test"
     assert meta["instance_id"] == "inst-7"
     assert meta["model_choice_id"] == "e1" and meta["proposal_id"] == "e3"
 

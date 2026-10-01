@@ -9,6 +9,7 @@ import json
 import random
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .browser import Browser, StalePage
 from .dream import (
@@ -21,11 +22,35 @@ from .dream import (
 )
 from .model import action_space, candidate_actions, choose, field_context, field_text
 from .policy import DefaultActionPolicy, assess_payload
-from .privacy import action_goal_overlap, redact_text, tokenize
+from .privacy import action_goal_overlap, redact_text, sanitize_url, tokenize
 from .questions import MAX_STEPS
 from .trace import DreamTraceRecorder, compact_candidate
 
 TERMINAL_STATUSES = {"claimed_done", "done", "blocked"}
+
+
+def _page_site(page: dict) -> str | None:
+    """The run's site stratum — the sanitized host of the observed page URL."""
+    try:
+        return urlsplit(sanitize_url(page.get("url") or "")).hostname or None
+    except ValueError:
+        return None
+
+
+def _model_call(fn, *args, **kwargs):
+    """Call a learned-model method with only the kwargs it declares.
+
+    ``experiment.model`` may be any fitted prior — ChoiceModel, the causal
+    TrialChoiceModel, or an operator-provided object — so context kwargs the
+    callee does not declare are dropped rather than TypeErroring.
+    """
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return fn(*args, **kwargs)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return fn(*args, **kwargs)
+    return fn(*args, **{k: v for k, v in kwargs.items() if k in params})
 
 
 class Agent:
@@ -488,7 +513,28 @@ class Agent:
                         else (
                             None
                             if stale_reasons
-                            else (trial_model.choose(offered_now) if trial_model is not None else None)
+                            else (
+                                _model_call(
+                                    trial_model.choose,
+                                    offered_now,
+                                    model_choice={
+                                        "id": selected,
+                                        "kind": action.get("kind"),
+                                        "goal_overlap": next(
+                                            (
+                                                c.get("goal_overlap")
+                                                for c in offered_now
+                                                if c.get("id") == selected
+                                            ),
+                                            None,
+                                        ),
+                                    },
+                                    task_family=getattr(self, "task_family", None),
+                                    site=_page_site(page),
+                                )
+                                if trial_model is not None
+                                else None
+                            )
                         )
                     )
                     # Hard boundary: a proposal is eligible only if it is one of
@@ -517,11 +563,17 @@ class Agent:
                         expected_delta = None
                         if stamped is not None:
                             expected_delta = stamped.get("expected_delta")
+                        elif proposal.get("expected_delta") is not None:
+                            # A causal-prior proposal carries its measured
+                            # effect directly.
+                            expected_delta = proposal["expected_delta"]
                         elif selected_rank is not None and callable(getattr(trial_model, "predict", None)):
-                            baseline_pred = trial_model.predict(
+                            baseline_pred = _model_call(
+                                trial_model.predict,
                                 kind=action.get("kind"),
                                 goal_overlap=offered_now[selected_rank].get("goal_overlap", 0),
                                 rank=selected_rank,
+                                task_family=getattr(self, "task_family", None),
                             )
                             if (
                                 isinstance(baseline_pred, dict)
@@ -579,6 +631,7 @@ class Agent:
                             "model_choice_offered_rank": selected_rank,
                             "task_key": task_key(state["goal"]),
                             "task_family": getattr(self, "task_family", None),
+                            "site": _page_site(page),
                             "instance_id": getattr(self, "instance_id", None),
                             "proposal_digest": proposal_digest,
                             "stamped_digest": stamped.get("digest") if stamped else None,

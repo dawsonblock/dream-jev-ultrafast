@@ -16,7 +16,9 @@ Read README.md before editing. Keep the loop small: page -> indexed elements -> 
 DREAM-Jev invariants:
 - Recursive improvement may change only validated `ExplorationPolicy` data. Never self-modify browser execution, approval, privacy, verifier, replay scoring, evidence validation, or promotion code.
 - Replay is empirical. A proposed policy may filter a recorded candidate catalogue, but must not fabricate a different model choice or browser outcome.
-- Learned models (`CostModel`, `OutcomeModel`, `ChoiceModel`) annotate and prioritize only. A counterfactual choice proposal is a hypothesis — never an outcome, never evidence, never a gate input. Anything a learned model prefers must still qualify through real executions and bound live canaries.
+- Learned models (`CostModel`, `OutcomeModel`, `ChoiceModel`, `TrialChoiceModel`) annotate and prioritize only. A counterfactual choice proposal is a hypothesis — never an outcome, never evidence, never a gate input. Anything a learned model prefers must still qualify through real executions and bound live canaries.
+- `TrialChoiceModel` is the causal channel: it reads only randomized `experiment_assigned` evidence through `CounterfactualTrials`, never the observational trace. Keep the observational and causal priors separate — never mix trial transitions into `ChoiceModel` fits.
+- Learning context is hierarchical: task-family/site strata answer before pooled estimates, and a thin specific stratum may defer to a reliable broader one — never pool unrelated task families into one cell as if they were interchangeable.
 - Keep runs as separate replay worlds. Keep all runs for one task key in the same train/validation/holdout partition.
 - Replay approval is provisional. A changed policy must be staged and separately pass bound live-canary evidence before activation.
 - Experience-store appends must remain cross-process serialized; never weaken the hash-chain or candidate-catalogue digest checks.

@@ -935,6 +935,7 @@ class ReplaySimulator:
         cost_model=None,
         outcome_model=None,
         choice_model=None,
+        trial_model=None,
         collect_proposals: bool = False,
     ) -> ReplayResult:
         estimated = bool(cost_model is not None and getattr(cost_model, "reliable", False))
@@ -946,6 +947,7 @@ class ReplaySimulator:
                 cost_model=cost_model if estimated else None,
                 outcome_model=outcome_model,
                 choice_model=choice_model,
+                trial_model=trial_model,
                 collect_proposals=collect_proposals,
             )
             for world in self.worlds
@@ -961,6 +963,7 @@ class ReplaySimulator:
         cost_model=None,
         outcome_model=None,
         choice_model=None,
+        trial_model=None,
         collect_proposals: bool = False,
     ):
         summary = self._empty_world(world)
@@ -1007,7 +1010,7 @@ class ReplaySimulator:
                 )
                 summary["predicted_change"] += prediction["p_page_changed"]
                 summary["prediction_samples"] += prediction["n"]
-            if choice_model is not None:
+            if choice_model is not None or trial_model is not None:
                 # The candidate policy's recomputed offered rank — the rank the
                 # recorded action would have had under *this* policy's offered
                 # catalogue — so the signal is policy-dependent. Counterfactual
@@ -1020,19 +1023,61 @@ class ReplaySimulator:
                     ),
                     None,
                 )
-                prediction = choice_model.predict(
-                    kind=transition.selected_kind,
-                    goal_overlap=selected_overlap,
-                    rank=offered_rank,
-                )
-                summary["choice_predicted_change"] += prediction["p_progress"]
-                summary["choice_uncertainty"] += prediction["uncertainty"]
-                summary["choice_confident"] += int(prediction["confident"])
-                proposal = choice_model.choose(offered)
+                prediction = None
+                if choice_model is not None:
+                    prediction = choice_model.predict(
+                        kind=transition.selected_kind,
+                        goal_overlap=selected_overlap,
+                        rank=offered_rank,
+                        task_family=world.family_key,
+                    )
+                    summary["choice_predicted_change"] += prediction["p_progress"]
+                    summary["choice_uncertainty"] += prediction["uncertainty"]
+                    summary["choice_confident"] += int(prediction["confident"])
+                # The causal prior speaks first: a candidate arm with a
+                # reliable positive measured effect is a hypothesis already
+                # supported by randomized evidence. The observational prior
+                # proposes only what trials have not refuted — a reliably
+                # non-positive divergence is settled, not re-tested.
+                proposal = None
+                proposal_source = None
+                if trial_model is not None:
+                    proposal = trial_model.choose(
+                        offered,
+                        model_choice={
+                            "id": transition.selected_id,
+                            "kind": transition.selected_kind,
+                            "goal_overlap": selected_overlap,
+                        },
+                        task_family=world.family_key,
+                    )
+                    if proposal is not None:
+                        proposal_source = trial_model
+                if proposal is None and choice_model is not None:
+                    proposal = choice_model.choose(offered, task_family=world.family_key)
+                    if proposal is not None:
+                        proposal_overlap = next(
+                            (
+                                int(c.get("goal_overlap", 0) or 0)
+                                for c in offered
+                                if c.get("id") == proposal["id"]
+                            ),
+                            0,
+                        )
+                        if trial_model is not None and trial_model.refuted(
+                            kind=str(proposal.get("kind") or "unknown"),
+                            goal_overlap=proposal_overlap,
+                            model_kind=transition.selected_kind,
+                            model_overlap=selected_overlap,
+                            task_family=world.family_key,
+                        ):
+                            proposal = None
+                        else:
+                            proposal_source = choice_model
                 if proposal is not None:
-                    summary["choice_proposed_change"] += proposal["p_progress"]
-                    summary["choice_proposal_uncertainty"] += proposal["uncertainty"]
-                    summary["choice_proposal_confident"] += int(proposal["confident"])
+                    summary["choice_proposed_change"] += proposal.get("p_progress") or 0.0
+                    summary["choice_proposal_uncertainty"] += proposal.get("uncertainty") or 0.0
+                    summary["choice_proposal_confident"] += int(bool(proposal.get("confident")))
                     divergent = proposal["id"] != transition.selected_id
                     summary["choice_divergences"] += int(divergent)
                     if collect_proposals and divergent:
@@ -1046,6 +1091,13 @@ class ReplaySimulator:
                         # Executing it for real — under the same authority
                         # plane — is how a counterfactual hypothesis becomes
                         # signed evidence.
+                        expected_delta = proposal.get("expected_delta")
+                        if expected_delta is None:
+                            expected_delta = (
+                                proposal["p_progress"] - prediction["p_progress"]
+                                if prediction is not None
+                                else 0.0
+                            )
                         summary["experiment_proposals"].append({
                             "world": world.key,
                             "task_key": world.task_key,
@@ -1070,13 +1122,20 @@ class ReplaySimulator:
                             ),
                             "offered_catalogue_digest": candidate_catalog_digest(offered),
                             "policy_behavior_digest": policy.behavior_digest,
-                            "choice_model_digest": choice_model.digest,
-                            "selected_prior": {
-                                "p_progress": prediction["p_progress"],
-                                "uncertainty": prediction["uncertainty"],
-                                "confident": prediction["confident"],
-                            },
-                            "expected_delta": proposal["p_progress"] - prediction["p_progress"],
+                            # The digest of whichever prior generated this
+                            # hypothesis — observational ChoiceModel or causal
+                            # TrialChoiceModel — bound into the stamped plan.
+                            "choice_model_digest": getattr(proposal_source, "digest", None),
+                            "selected_prior": (
+                                {
+                                    "p_progress": prediction["p_progress"],
+                                    "uncertainty": prediction["uncertainty"],
+                                    "confident": prediction["confident"],
+                                }
+                                if prediction is not None
+                                else None
+                            ),
+                            "expected_delta": expected_delta,
                         })
             if transition.selected_kind != "wait" and not transition.page_changed:
                 no_progress += 1
@@ -1466,6 +1525,7 @@ class DreamReport:
     cost_model_digest: str | None = None
     outcome_model_digest: str | None = None
     choice_model_digest: str | None = None
+    trial_model_digest: str | None = None
     experiment_proposals: tuple[dict, ...] = ()
     trials_digest: str | None = None
     trial_estimates: dict | None = None
@@ -1497,6 +1557,9 @@ class DreamReport:
             "cost_model_digest": self.cost_model_digest,
             "outcome_model_digest": self.outcome_model_digest,
             "choice_model_digest": self.choice_model_digest,
+            # Digest of the causal prior (TrialChoiceModel) that generated any
+            # trial-backed proposals — distinct from the observational prior.
+            "trial_model_digest": self.trial_model_digest,
             "experiment_proposals": list(self.experiment_proposals),
             # Randomized-trial estimates are annotation, never gate input:
             # the ITT arm estimates exist so an operator (or a future learned
@@ -1539,6 +1602,7 @@ class DreamImprover:
         cost_model=None,
         outcome_model=None,
         choice_model=None,
+        trial_model=None,
         trials=None,
     ) -> DreamReport:
         worlds = list(worlds)
@@ -1576,6 +1640,7 @@ class DreamImprover:
                 sim.evaluate(
                     base, cost_model=cost_model, outcome_model=outcome_model,
                     choice_model=choice_model,
+                    trial_model=trial_model,
                     # Experiment proposals come from the baseline evaluation:
                     # they are "what the prior would test differently under the
                     # currently deployed behavior", not candidate-policy notes.
@@ -1610,7 +1675,7 @@ class DreamImprover:
                 name: (
                     sim.evaluate(
                         policy, cost_model=cost_model, outcome_model=outcome_model,
-                        choice_model=choice_model,
+                        choice_model=choice_model, trial_model=trial_model,
                     ) if sim else None
                 )
                 for name, sim in simulators.items()
@@ -1717,7 +1782,9 @@ class DreamImprover:
             )
 
         experiment_proposals = ()
-        if choice_model is not None and base_results["train"] is not None:
+        if (choice_model is not None or trial_model is not None) and base_results[
+            "train"
+        ] is not None:
             collected = [
                 proposal
                 for summary in base_results["train"].per_world
@@ -1758,6 +1825,11 @@ class DreamImprover:
             ),
             choice_model_digest=(
                 choice_model.digest if choice_model is not None and choice_model.samples else None
+            ),
+            trial_model_digest=(
+                trial_model.digest
+                if trial_model is not None and getattr(trial_model, "trials", None) is not None
+                else None
             ),
             # Randomized assignments are the only causal evidence the store
             # holds — surface the fitted estimates so they annotate the report

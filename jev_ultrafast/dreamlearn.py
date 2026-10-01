@@ -214,7 +214,7 @@ def _run_outcome(final: dict | None) -> str:
 
 
 def _transitions(events: Iterable[dict]):
-    """Yield ``(transition_event, run_policy, terminal, verified_done, outcome)``.
+    """Yield ``(transition_event, run_policy, terminal, verified_done, outcome, family)``.
 
     Run context supplies the policy needed to re-derive the offered catalogue
     (the rank coordinate the models train on) and the run's outcome class —
@@ -247,14 +247,15 @@ def _transitions(events: Iterable[dict]):
         # intermediate page movement can never launder a failed trajectory.
         outcome = _run_outcome(final)
         run_verified = outcome == "success"
+        family = str(start.get("task_family") or "").strip().lower() if start else ""
         transitions = [e for e in run_events if e.get("event") == "transition"]
         for index, event in enumerate(transitions):
             terminal = index == len(transitions) - 1 and final is not None
             verified_done = bool(terminal and run_verified)
-            yield event, policy, terminal, verified_done, outcome
+            yield event, policy, terminal, verified_done, outcome, family
     for event in loose:
         if event.get("event") == "transition":
-            yield event, None, False, False, "legacy"
+            yield event, None, False, False, "legacy", ""
 
 
 def _selected_offered_rank(event: dict, policy: ExplorationPolicy | None) -> int | None:
@@ -283,7 +284,7 @@ def _selected_offered_rank(event: dict, policy: ExplorationPolicy | None) -> int
     return None
 
 
-def _fit_cells(events: Iterable[dict], label) -> tuple[dict, dict, int, int]:
+def _fit_cells(events: Iterable[dict], label) -> tuple[dict, dict, dict, int, int]:
     """Count outcomes per ``(kind, overlap_bucket, offered_rank_bucket)`` cell.
 
     ``label(event, terminal, verified_done, outcome)`` decides what counts as
@@ -291,12 +292,18 @@ def _fit_cells(events: Iterable[dict], label) -> tuple[dict, dict, int, int]:
     (an unmeasured outcome is missing data, not a negative example). The rank
     coordinate is always the offered-catalogue rank so training and
     counterfactual replay share one basis.
+
+    Also returns ``family_counts``: the same (kind, overlap, rank) counts
+    stratified by the run's ``task_family``, so prediction can prefer the
+    family-specific stratum before backing off to the pooled cell —
+    unrelated tasks no longer share one tiny posterior.
     """
     cell_counts: dict[tuple[str, str, str], list[int]] = {}
+    family_counts: dict[tuple[str, str, str, str], list[int]] = {}
     kind_counts: dict[str, list[int]] = {}
     positive_total = 0
     samples = 0
-    for event, policy, terminal, verified_done, outcome in _transitions(events):
+    for event, policy, terminal, verified_done, outcome, family in _transitions(events):
         selected = event.get("selected") or {}
         kind = str(selected.get("kind") or "unknown")
         selected_id = selected.get("id")
@@ -314,12 +321,17 @@ def _fit_cells(events: Iterable[dict], label) -> tuple[dict, dict, int, int]:
         cell_counts.setdefault(cell, [0, 0])
         cell_counts[cell][0] += 1
         cell_counts[cell][1] += positive
+        if family:
+            fcell = (family,) + cell
+            family_counts.setdefault(fcell, [0, 0])
+            family_counts[fcell][0] += 1
+            family_counts[fcell][1] += positive
         kind_counts.setdefault(kind, [0, 0])
         kind_counts[kind][0] += 1
         kind_counts[kind][1] += positive
         positive_total += positive
         samples += 1
-    return cell_counts, kind_counts, positive_total, samples
+    return cell_counts, family_counts, kind_counts, positive_total, samples
 
 
 @dataclass(frozen=True)
@@ -340,7 +352,7 @@ class OutcomeModel:
 
     @classmethod
     def fit(cls, events: Iterable[dict]) -> "OutcomeModel":
-        cell_counts, kind_counts, changed_total, samples = _fit_cells(
+        cell_counts, _family_counts, kind_counts, changed_total, samples = _fit_cells(
             events,
             # ``page_changed`` is factual transition telemetry, not an outcome
             # judgment — a step that moved the page did so whether or not the
@@ -447,9 +459,13 @@ class ChoiceModel:
 
     samples: int = 0
     cells: tuple[tuple[str, str, str, int, int], ...] = ()
+    # ``(task_family, kind, overlap_bucket, rank_bucket, n, positives)`` — the
+    # family-specific stratum consulted before the pooled cell, so a prior
+    # learned on "book a flight" stops contaminating "pay an invoice".
+    family_cells: tuple[tuple[str, str, str, str, int, int], ...] = ()
     kind_totals: tuple[tuple[str, int, int], ...] = ()
     global_positive: int = 0
-    version: str = "jev-choice/4"
+    version: str = "jev-choice/5"
 
     MIN_CONFIDENT = 4
     EXPLORE_BONUS = 0.5
@@ -461,16 +477,25 @@ class ChoiceModel:
         # change. Censored runs (aborted/interrupted/unverifiable) drop out
         # instead of fitting as negatives; transitions without run context
         # keep the legacy non-positive label.
-        cell_counts, kind_counts, positive_total, samples = _fit_cells(
+        cell_counts, family_counts, kind_counts, positive_total, samples = _fit_cells(
             events,
             lambda event, terminal, verified_done, outcome: (
-                None if outcome == "censored" else outcome == "success"
+                # An experiment-tagged transition was chosen by the trial
+                # scheduler, not by the policy under study — fitting it as an
+                # ordinary choice would mix randomized evidence into the
+                # correlational prior. It belongs to CounterfactualTrials.
+                None
+                if outcome == "censored" or event.get("experiment")
+                else outcome == "success"
             ),
         )
         return cls(
             samples=samples,
             cells=tuple(
                 sorted((*cell, n, changed) for cell, (n, changed) in cell_counts.items())
+            ),
+            family_cells=tuple(
+                sorted((*cell, n, changed) for cell, (n, changed) in family_counts.items())
             ),
             kind_totals=tuple(
                 sorted((kind, n, changed) for kind, (n, changed) in kind_counts.items())
@@ -484,8 +509,29 @@ class ChoiceModel:
         mean = (changed + 1) / (n + 2)
         return mean, math.sqrt(mean * (1 - mean) / (n + 3))
 
-    def predict(self, *, kind: str, goal_overlap: int = 0, rank: int | None = None) -> dict:
+    def predict(
+        self,
+        *,
+        kind: str,
+        goal_overlap: int = 0,
+        rank: int | None = None,
+        task_family: str | None = None,
+    ) -> dict:
         cell_key = (str(kind), overlap_bucket(goal_overlap), rank_bucket(rank))
+        family = str(task_family or "").strip().lower()
+        if family:
+            # Hierarchical backoff: the task-family stratum wins when it has
+            # enough support of its own, otherwise the pooled cell answers.
+            for f, k, o, r, n, changed in self.family_cells:
+                if (f, k, o, r) == (family,) + cell_key and n >= self.MIN_CONFIDENT:
+                    p, std = self._posterior(n, changed)
+                    return {
+                        "p_progress": p,
+                        "n": n,
+                        "uncertainty": std,
+                        "level": "family",
+                        "confident": True,
+                    }
         for k, o, r, n, changed in self.cells:
             if (k, o, r) == cell_key:
                 p, std = self._posterior(n, changed)
@@ -517,7 +563,7 @@ class ChoiceModel:
             "confident": False,
         }
 
-    def choose(self, candidates: Iterable[dict]) -> dict | None:
+    def choose(self, candidates: Iterable[dict], *, task_family: str | None = None) -> dict | None:
         """The offered candidate this prior prefers under uncertainty.
 
         Score = posterior mean + ``EXPLORE_BONUS`` * posterior std, so sparse
@@ -532,6 +578,7 @@ class ChoiceModel:
                 kind=str(candidate.get("kind") or "unknown"),
                 goal_overlap=int(candidate.get("goal_overlap", 0) or 0),
                 rank=rank,
+                task_family=task_family,
             )
             score = prediction["p_progress"] + self.EXPLORE_BONUS * prediction["uncertainty"]
             if best is None or score > best[0]:
@@ -563,6 +610,7 @@ class ChoiceModel:
         return cls(
             samples=payload.get("samples", 0),
             cells=tuple(tuple(c) for c in payload.get("cells", ())),
+            family_cells=tuple(tuple(f) for f in payload.get("family_cells", ())),
             kind_totals=tuple(tuple(k) for k in payload.get("kind_totals", ())),
             global_positive=payload.get("global_positive", 0),
             version=payload.get("version", "jev-choice/1"),
@@ -584,36 +632,74 @@ def _wilson_interval(p: float, n: float, z: float = 1.96) -> tuple[float, float]
     return max(0.0, center - half), min(1.0, center + half)
 
 
-def _trial_context(meta: dict, transition: dict | None) -> str:
-    """The cell a trial belongs to: the *model choice's* features.
+def _overlap_of(meta_key: str, cand_id_key: str, meta: dict, transition: dict | None) -> str:
+    """Overlap bucket for a context member, from the assignment record first.
 
-    Keying on the executed action would put the two arms of one assignment in
-    different cells whenever the proposal's overlap differs from the model
-    choice's — exactly when the prior diverged for a reason. Assignment
-    events carry the pre-treatment context directly; the transition's
-    candidate list is only a fallback for older records that lack it.
+    Assignment meta carries the pre-treatment overlap directly; for records
+    that lack it, resolve the candidate's recorded ``goal_overlap`` from the
+    executed transition's catalogue by id.
     """
-    kind = str(meta.get("model_choice_kind") or "unknown")
-    if kind == "unknown" and transition is not None:
-        kind = str((transition.get("selected") or {}).get("kind") or "unknown")
-    overlap_raw = meta.get("model_choice_overlap")
-    if overlap_raw is not None:
+    raw = meta.get(meta_key)
+    if raw is not None:
         try:
-            return f"{kind}|{overlap_bucket(int(overlap_raw))}"
+            return overlap_bucket(int(raw))
         except (TypeError, ValueError):
             pass
     if transition is not None:
-        model_choice = next(
+        cand = next(
             (
                 c
                 for c in transition.get("candidates") or ()
-                if c.get("id") == meta.get("model_choice_id")
+                if c.get("id") == meta.get(cand_id_key)
             ),
             None,
         )
-        if model_choice is not None:
-            return f"{kind}|{overlap_bucket(int(model_choice.get('goal_overlap', 0) or 0))}"
-    return f"{kind}|unknown"
+        if cand is not None:
+            try:
+                return overlap_bucket(int(cand.get("goal_overlap", 0) or 0))
+            except (TypeError, ValueError):
+                pass
+    return "unknown"
+
+
+def _trial_context(meta: dict, transition: dict | None) -> tuple[str, str, str, str, str]:
+    """The cell a trial belongs to: ``(scope, mc_kind, mc_ov, p_kind, p_ov)``.
+
+    ``scope`` is the task stratum — ``f:<task_family>``, ``s:<site>`` when no
+    family was recorded, or ``*`` pooled — so estimates from unrelated tasks
+    stop sharing one tiny posterior. The remaining coordinates key on the
+    *pre-treatment divergence*: the model choice's kind/overlap and the
+    proposal's kind/overlap. Keying on the executed action would put the two
+    arms of one assignment in different cells whenever the proposal's overlap
+    differs from the model choice's — exactly when the prior diverged for a
+    reason. Assignment events carry the context directly; the transition's
+    candidate list is only a fallback for older records that lack it.
+    """
+    family = str(meta.get("task_family") or "").strip().lower()
+    site = str(meta.get("site") or "").strip().lower()
+    scope = f"f:{family}" if family else (f"s:{site}" if site else "*")
+    kind = str(meta.get("model_choice_kind") or "unknown")
+    if kind == "unknown" and transition is not None:
+        kind = str((transition.get("selected") or {}).get("kind") or "unknown")
+    p_kind = str(meta.get("proposal_kind") or "unknown")
+    if p_kind == "unknown" and transition is not None:
+        p_cand = next(
+            (
+                c
+                for c in transition.get("candidates") or ()
+                if c.get("id") == meta.get("proposal_id")
+            ),
+            None,
+        )
+        if p_cand is not None:
+            p_kind = str(p_cand.get("kind") or "unknown")
+    return (
+        scope,
+        kind,
+        _overlap_of("model_choice_overlap", "model_choice_id", meta, transition),
+        p_kind,
+        _overlap_of("proposal_overlap", "proposal_id", meta, transition),
+    )
 
 
 @dataclass(frozen=True)
@@ -659,10 +745,13 @@ class CounterfactualTrials:
     qualify through the replay + bound-canary path like everything else.
     """
 
-    # (context, arm, assigned, analyzed, executed, censored,
-    #  w_success, w_sum, w_sq, w_page, w_exec_sum)
-    cells: tuple[tuple[str, str, int, int, int, int, float, float, float, float, float], ...] = ()
-    version: str = "jev-trials/3"
+    # (scope, mc_kind, mc_ov, p_kind, p_ov, arm, assigned, analyzed, executed,
+    #  censored, w_success, w_sum, w_sq, w_page, w_exec_sum)
+    cells: tuple[
+        tuple[str, str, str, str, str, str, int, int, int, int, float, float, float, float, float],
+        ...,
+    ] = ()
+    version: str = "jev-trials/4"
 
     MIN_ESS = 8.0
 
@@ -693,7 +782,7 @@ class CounterfactualTrials:
             if arm not in {"candidate", "control"} or not 0.0 < propensity <= 1.0:
                 return
             cell = acc.setdefault(
-                (_trial_context(meta, transition), arm),
+                (*_trial_context(meta, transition), arm),
                 [0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0],
             )
             cell[0] += 1  # assigned
@@ -755,8 +844,8 @@ class CounterfactualTrials:
         return cls(
             cells=tuple(
                 sorted(
-                    (context, arm, *counts)
-                    for (context, arm), counts in acc.items()
+                    (*key[:5], key[5], *counts)
+                    for key, counts in acc.items()
                 )
             )
         )
@@ -809,51 +898,126 @@ class CounterfactualTrials:
         masquerade as a confident estimate.
         """
         arms: dict[str, dict] = {}
-        for ctx, arm, assigned, analyzed, executed, censored, ws, wsum, wsq, wpage, wexec in self.cells:
-            if context is not None and ctx != context:
+        grouped: dict[tuple, dict[str, list]] = {}
+        for scope, mk, mov, pk, pov, arm, *counts in self.cells:
+            ctx = (scope, mk, mov, pk, pov)
+            if context is not None and "|".join(ctx) != context:
                 continue
-            entry = arms.setdefault(ctx, {})
-            ess = (wsum * wsum / wsq) if wsq else 0.0
-            p_success = (ws / wsum) if wsum else 0.0
-            entry[arm] = {
-                # Primary endpoint: verified run success under ITT.
-                # ``p_page_changed`` is executed-trial telemetry — never a
-                # treatment effect.
-                "p_success": p_success,
-                "p_success_ci": list(_wilson_interval(p_success, ess)),
-                "p_page_changed": (wpage / wexec) if wexec else None,
-                "assigned": assigned,
-                "trials": analyzed,
-                "executed": executed,
-                "censored": censored,
-                "ess": ess,
-                # Epsilon slack: IPW weights make an exactly-at-threshold
-                # effective size land a hair below it in floating point.
-                "reliable": ess >= self.MIN_ESS - 1e-9,
-            }
-        for entry in arms.values():
-            if "candidate" in entry and "control" in entry:
-                candidate, control = entry["candidate"], entry["control"]
-                delta = candidate["p_success"] - control["p_success"]
-                entry["delta"] = delta
-                if candidate["ess"] and control["ess"]:
-                    # Newcombe-Wilson interval on the difference, built from
-                    # the per-arm Wilson bounds. The naive normal-approx SE
-                    # collapses to zero when either arm sits at the 0/1
-                    # boundary — exactly the extreme evidence where a
-                    # degenerate interval would claim false precision.
-                    pc, pk = candidate["p_success"], control["p_success"]
-                    lc, uc = candidate["p_success_ci"]
-                    lk, uk = control["p_success_ci"]
-                    entry["delta_ci"] = [
-                        delta - math.sqrt((pc - lc) ** 2 + (uk - pk) ** 2),
-                        delta + math.sqrt((uc - pc) ** 2 + (pk - lk) ** 2),
-                    ]
-                else:
-                    entry["delta_ci"] = None
-                # The contrast is only as trustworthy as its weaker arm.
-                entry["delta_reliable"] = candidate["reliable"] and control["reliable"]
+            bucket = grouped.setdefault(ctx, {})
+            slot = bucket.setdefault(arm, [0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            for i, v in enumerate(counts):
+                slot[i] += v
+        for ctx, bucket in grouped.items():
+            arms["|".join(ctx)] = self._contrast(bucket)
         return arms
+
+    @staticmethod
+    def _arm_entry(counts: list) -> dict:
+        """Per-arm report from sufficient statistics
+        ``[assigned, analyzed, executed, censored, ws, wsum, wsq, wpage, wexec]``."""
+        assigned, analyzed, executed, censored, ws, wsum, wsq, wpage, wexec = counts
+        ess = (wsum * wsum / wsq) if wsq else 0.0
+        p_success = (ws / wsum) if wsum else 0.0
+        return {
+            # Primary endpoint: verified run success under ITT.
+            # ``p_page_changed`` is executed-trial telemetry — never a
+            # treatment effect.
+            "p_success": p_success,
+            "p_success_ci": list(_wilson_interval(p_success, ess)),
+            "p_page_changed": (wpage / wexec) if wexec else None,
+            "assigned": assigned,
+            "trials": analyzed,
+            "executed": executed,
+            "censored": censored,
+            "ess": ess,
+            # Epsilon slack: IPW weights make an exactly-at-threshold
+            # effective size land a hair below it in floating point.
+            "reliable": ess >= CounterfactualTrials.MIN_ESS - 1e-9,
+        }
+
+    @classmethod
+    def _contrast(cls, bucket: dict[str, list]) -> dict:
+        """Per-arm estimates plus the candidate−control contrast."""
+        entry = {arm: cls._arm_entry(counts) for arm, counts in bucket.items()}
+        if "candidate" in entry and "control" in entry:
+            candidate, control = entry["candidate"], entry["control"]
+            delta = candidate["p_success"] - control["p_success"]
+            entry["delta"] = delta
+            if candidate["ess"] and control["ess"]:
+                # Newcombe-Wilson interval on the difference, built from
+                # the per-arm Wilson bounds. The naive normal-approx SE
+                # collapses to zero when either arm sits at the 0/1
+                # boundary — exactly the extreme evidence where a
+                # degenerate interval would claim false precision.
+                pc, pk = candidate["p_success"], control["p_success"]
+                lc, uc = candidate["p_success_ci"]
+                lk, uk = control["p_success_ci"]
+                entry["delta_ci"] = [
+                    delta - math.sqrt((pc - lc) ** 2 + (uk - pk) ** 2),
+                    delta + math.sqrt((uc - pc) ** 2 + (pk - lk) ** 2),
+                ]
+            else:
+                entry["delta_ci"] = None
+            # The contrast is only as trustworthy as its weaker arm.
+            entry["delta_reliable"] = candidate["reliable"] and control["reliable"]
+        return entry
+
+    def resolve(
+        self,
+        *,
+        task_family: str | None = None,
+        site: str | None = None,
+        model_kind: str = "unknown",
+        model_overlap=None,
+        proposal_kind: str = "unknown",
+        proposal_overlap=None,
+    ) -> dict | None:
+        """The best-supported effect estimate for one divergence hypothesis.
+
+        Cells keep each assignment under its own scope, so strata merge by
+        summing sufficient statistics — the pooled estimate stays honestly
+        IPW-weighted. Resolution walks ``f:<family>`` → ``s:<site>`` →
+        pooled-over-all-scopes and returns the first stratum whose contrast
+        meets the reliability floor; a thin specific stratum does not shadow
+        a reliable broader one (a 2-assignment family cell cannot hide a
+        50-assignment pooled refutation). When no stratum is reliable the
+        most specific estimate that exists is returned — still flagged
+        ``delta_reliable: false`` — so reporting sees the best-supported data
+        rather than nothing. ``level`` names which stratum answered.
+        """
+        try:
+            mov = overlap_bucket(int(model_overlap)) if model_overlap is not None else "unknown"
+        except (TypeError, ValueError):
+            mov = "unknown"
+        try:
+            pov = overlap_bucket(int(proposal_overlap)) if proposal_overlap is not None else "unknown"
+        except (TypeError, ValueError):
+            pov = "unknown"
+        sig = (str(model_kind or "unknown"), mov, str(proposal_kind or "unknown"), pov)
+        scopes: list[tuple[str, str | None]] = []
+        family = str(task_family or "").strip().lower()
+        host = str(site or "").strip().lower()
+        if family:
+            scopes.append(("family", f"f:{family}"))
+        if host:
+            scopes.append(("site", f"s:{host}"))
+        scopes.append(("pooled", None))
+        fallback = None
+        for level, scope in scopes:
+            bucket: dict[str, list] = {}
+            for cell in self.cells:
+                if (scope is None or cell[0] == scope) and tuple(cell[1:5]) == sig:
+                    slot = bucket.setdefault(cell[5], [0, 0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                    for i, v in enumerate(cell[6:]):
+                        slot[i] += v
+            if not bucket:
+                continue
+            contrast = {**self._contrast(bucket), "level": level}
+            if contrast.get("delta_reliable"):
+                return contrast
+            if fallback is None:
+                fallback = contrast
+        return fallback
 
     @property
     def digest(self) -> str:
@@ -869,9 +1033,164 @@ class CounterfactualTrials:
         if unknown:
             raise ValueError(f"Unknown counterfactual-trials keys: {sorted(unknown)}")
         cells = tuple(tuple(c) for c in payload.get("cells", ()))
-        if any(len(c) != 11 for c in cells):
+        if any(len(c) != 15 for c in cells):
             raise ValueError("Unsupported counterfactual-trials cell arity")
         return cls(
             cells=cells,
-            version=payload.get("version", "jev-trials/3"),
+            version=payload.get("version", "jev-trials/4"),
+        )
+
+
+@dataclass(frozen=True)
+class TrialChoiceModel:
+    """A decision prior built ONLY from randomized arm assignments.
+
+    ``ChoiceModel`` learns what the recorded policy's own choices tended to
+    lead to — correlational trajectory credit over observational traces.
+    This model is the causal channel: it consumes the randomized
+    ``experiment_assigned``/``run_finished`` evidence through
+    ``CounterfactualTrials`` and reports the intention-to-treat effect of
+    *assigning* a divergence — "when the model picks A-type here, assigning
+    B-type changed verified success by delta" — with scope backoff so a
+    task-family stratum wins when it has its own support and unrelated tasks
+    stop pooling into one tiny posterior.
+
+    Same advisory contract as the other learned layers: proposals are
+    hypotheses, never evidence, never gate input. A candidate with a
+    reliable non-positive delta is *refuted* — the proposal layer uses that
+    to stop re-stamping an experiment the randomized evidence already
+    settled, which is what makes the loop self-improving rather than
+    self-repeating.
+    """
+
+    trials: CounterfactualTrials = CounterfactualTrials()
+    version: str = "jev-causal/1"
+
+    @classmethod
+    def fit(cls, events: Iterable[dict]) -> "TrialChoiceModel":
+        return cls(trials=CounterfactualTrials.fit(events))
+
+    def _estimate(
+        self,
+        *,
+        proposal_kind: str,
+        proposal_overlap=None,
+        model_kind: str = "unknown",
+        model_overlap=None,
+        task_family: str | None = None,
+        site: str | None = None,
+    ) -> dict | None:
+        return self.trials.resolve(
+            task_family=task_family,
+            site=site,
+            model_kind=model_kind,
+            model_overlap=model_overlap,
+            proposal_kind=proposal_kind,
+            proposal_overlap=proposal_overlap,
+        )
+
+    def choose(
+        self,
+        candidates: Iterable[dict],
+        *,
+        model_choice: dict | None = None,
+        task_family: str | None = None,
+        site: str | None = None,
+    ) -> dict | None:
+        """The offered candidate with the best reliable measured effect.
+
+        ``model_choice`` supplies the divergence premise — the action the
+        decision model actually picked — because a trial only measures
+        "assigning B when the model would have picked A". With no premise or
+        no reliable positive delta for any offered candidate, abstain: a
+        causal prior without evidence proposes nothing.
+        """
+        if not model_choice:
+            return None
+        mc_kind = str(model_choice.get("kind") or "unknown")
+        mc_overlap = model_choice.get("goal_overlap")
+        best = None
+        for candidate in candidates:
+            if candidate.get("id") == model_choice.get("id"):
+                continue
+            estimate = self._estimate(
+                proposal_kind=str(candidate.get("kind") or "unknown"),
+                proposal_overlap=candidate.get("goal_overlap"),
+                model_kind=mc_kind,
+                model_overlap=mc_overlap,
+                task_family=task_family,
+                site=site,
+            )
+            if (
+                estimate is None
+                or not estimate.get("delta_reliable")
+                or estimate["delta"] <= 0
+            ):
+                continue
+            # Among reliable positive deltas, prefer the strongest point
+            # estimate — uncertainty is already gated by delta_reliable.
+            if best is None or estimate["delta"] > best[0]:
+                best = (estimate["delta"], candidate, estimate)
+        if best is None:
+            return None
+        delta, candidate, estimate = best
+        control_p = estimate["control"]["p_success"]
+        ci = estimate.get("delta_ci") or [delta, delta]
+        return {
+            "id": candidate.get("id"),
+            "kind": candidate.get("kind"),
+            # The candidate's implied success probability — control-arm rate
+            # plus the measured effect — so downstream ``expected_delta``
+            # arithmetic stays probability-shaped.
+            "p_progress": min(max(control_p + delta, 0.0), 1.0),
+            "uncertainty": (ci[1] - ci[0]) / 2.0,
+            "confident": True,
+            "expected_delta": delta,
+            "trial_level": estimate["level"],
+            "delta_ci": ci,
+        }
+
+    def refuted(
+        self,
+        *,
+        kind: str,
+        goal_overlap=None,
+        model_kind: str = "unknown",
+        model_overlap=None,
+        task_family: str | None = None,
+        site: str | None = None,
+    ) -> bool:
+        """True when randomized evidence already settled this divergence as
+        non-positive at a reliable stratum — the hypothesis was tested and
+        failed, so the proposal layer should not stamp it again."""
+        estimate = self._estimate(
+            proposal_kind=kind,
+            proposal_overlap=goal_overlap,
+            model_kind=model_kind,
+            model_overlap=model_overlap,
+            task_family=task_family,
+            site=site,
+        )
+        return bool(
+            estimate is not None
+            and estimate.get("delta_reliable")
+            and estimate["delta"] <= 0
+        )
+
+    @property
+    def digest(self) -> str:
+        return _stable_hash(json.dumps(asdict(self), sort_keys=True, separators=(",", ":")))
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict) -> "TrialChoiceModel":
+        allowed = set(cls.__dataclass_fields__)
+        unknown = set(payload) - allowed
+        if unknown:
+            raise ValueError(f"Unknown trial-choice model keys: {sorted(unknown)}")
+        return cls(
+            trials=CounterfactualTrials.from_dict(payload.get("trials") or {}),
+            version=payload.get("version", "jev-causal/1"),
         )

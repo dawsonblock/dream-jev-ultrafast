@@ -12,7 +12,13 @@ import sys
 from pathlib import Path
 
 from .dream import DreamImprover, ExperienceStore, ExplorationPolicy, PolicyRegistry, ReplayWorld
-from .dreamlearn import ChoiceModel, CostModel, CounterfactualTrials, OutcomeModel
+from .dreamlearn import (
+    ChoiceModel,
+    CostModel,
+    CounterfactualTrials,
+    OutcomeModel,
+    TrialChoiceModel,
+)
 
 COMMANDS = {
     "improve", "verify", "promote", "status", "rollback", "health",
@@ -227,7 +233,9 @@ def main(argv=None):
     # Randomized arm assignments are causal evidence, not observational trace
     # — fit them separately and always, so the report carries what the
     # experiment layer actually measured rather than mixing trial transitions
-    # into the correlational priors alone.
+    # into the correlational priors alone. TrialChoiceModel is the causal
+    # proposal channel: reliable positive deltas outrank the observational
+    # prior, and reliably refuted divergences stop being re-proposed.
     trials = CounterfactualTrials.fit(events)
     report = DreamImprover().improve(
         worlds,
@@ -236,6 +244,7 @@ def main(argv=None):
         cost_model=cost_model,
         outcome_model=outcome_model,
         choice_model=choice_model,
+        trial_model=TrialChoiceModel(trials=trials),
         trials=trials,
     )
     output = Path(args.report)
@@ -261,6 +270,7 @@ def main(argv=None):
         "experiment_proposals": len(report.experiment_proposals),
         "trial_contexts": len(report.trial_estimates or {}),
         "trials_digest": report.trials_digest,
+        "trial_model_digest": report.trial_model_digest,
         "staged": bool(staged),
         "report": str(output),
     })

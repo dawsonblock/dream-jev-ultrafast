@@ -14,7 +14,15 @@ from jev_ultrafast.dream import (
     mutate_policies,
     task_key,
 )
-from jev_ultrafast.dreamlearn import ChoiceModel, CostModel, OutcomeModel, overlap_bucket, rank_bucket
+from jev_ultrafast.dreamlearn import (
+    ChoiceModel,
+    CostModel,
+    CounterfactualTrials,
+    OutcomeModel,
+    TrialChoiceModel,
+    overlap_bucket,
+    rank_bucket,
+)
 from jev_ultrafast.model import candidate_actions
 from jev_ultrafast.privacy import action_goal_overlap
 from jev_ultrafast.signing import EvidenceSigner, verify_signature
@@ -72,7 +80,8 @@ def _transition(selected="sel", offered=40, tokens=400, latency_ms=120, page_cha
     }
 
 
-def _run_events(run_id, transitions, *, status="done", verified=True, task_key="t", policy=None):
+def _run_events(run_id, transitions, *, status="done", verified=True, task_key="t", policy=None,
+                task_family=None):
     """Wrap bare transition dicts as one run with a terminal outcome.
 
     Trajectory-success labeling keys positives off the run's verified finish,
@@ -80,9 +89,12 @@ def _run_events(run_id, transitions, *, status="done", verified=True, task_key="
     loose transitions carry no outcome and fit as negatives.
     """
     policy = policy or ExplorationPolicy()
+    started = {"event": "run_started", "run_id": run_id, "task_key": task_key, "goal": "g",
+               "policy": policy.to_dict(), "policy_digest": policy.digest}
+    if task_family is not None:
+        started["task_family"] = task_family
     events = [
-        {"event": "run_started", "run_id": run_id, "task_key": task_key, "goal": "g",
-         "policy": policy.to_dict(), "policy_digest": policy.digest},
+        started,
         *[{**t, "run_id": run_id, "task_key": task_key} for t in transitions],
         {"event": "run_finished", "run_id": run_id, "task_key": task_key,
          "status": status, "verified": verified},
@@ -803,10 +815,10 @@ def test_choice_model_page_churn_on_failed_runs_is_not_progress():
 
 
 def _trial_meta(run_id, arm, *, propensity=0.5, kind="click", model_kind="click",
-                overlap=1, model_overlap=0):
+                overlap=1, model_overlap=0, task_family=None, site=None):
     """The experiment record exactly as the agent stamps it at assignment
     time — arm, propensity, and the pre-treatment context of both sides."""
-    return {
+    meta = {
         "experiment_id": f"x{run_id}",
         "arm": arm,
         "assignment_probability": propensity,
@@ -820,11 +832,16 @@ def _trial_meta(run_id, arm, *, propensity=0.5, kind="click", model_kind="click"
         "model_choice_offered_rank": 1,
         "task_key": "t",
     }
+    if task_family is not None:
+        meta["task_family"] = task_family
+    if site is not None:
+        meta["site"] = site
+    return meta
 
 
 def _trial_run(run_id, arm, *, success=True, page=True, propensity=0.5, kind="click",
                model_kind="click", overlap=1, model_overlap=0, status=None, verified=None,
-               executed=True):
+               executed=True, task_family=None, site=None):
     """One randomized trial as a complete run: the ``experiment_assigned``
     record written at randomization, the executed arm's transition (absent
     when the trial was denied or vetoed before execution), and the
@@ -834,6 +851,7 @@ def _trial_run(run_id, arm, *, success=True, page=True, propensity=0.5, kind="cl
     meta = _trial_meta(
         run_id, arm, propensity=propensity, kind=kind, model_kind=model_kind,
         overlap=overlap, model_overlap=model_overlap,
+        task_family=task_family, site=site,
     )
     proposal_id, model_id = meta["proposal_id"], meta["model_choice_id"]
     transitions = []
@@ -879,8 +897,8 @@ def test_counterfactual_trials_ipw_estimates():
     estimates = trials.estimate()
     # Context keys on the model choice's features (overlap 0), not the
     # executed arm's — otherwise the two arms would land in different cells.
-    assert set(estimates) == {"click|0"}
-    arms = estimates["click|0"]
+    assert set(estimates) == {"*|click|0|click|1"}
+    arms = estimates["*|click|0|click|1"]
     assert arms["candidate"]["assigned"] == arms["candidate"]["trials"] == 8
     assert arms["candidate"]["executed"] == 8
     assert arms["candidate"]["censored"] == 0
@@ -928,7 +946,7 @@ def test_counterfactual_trials_endpoint_is_run_outcome_not_page_change():
     for i in range(4):
         events += _trial_run(f"c{i}", "candidate", success=False, page=True)
         events += _trial_run(f"k{i}", "control", success=True, page=False)
-    arms = CounterfactualTrials.fit(events).estimate()["click|0"]
+    arms = CounterfactualTrials.fit(events).estimate()["*|click|0|click|1"]
     assert arms["candidate"]["p_success"] < 0.01
     assert arms["control"]["p_success"] > 0.99
     assert arms["candidate"]["p_page_changed"] > 0.99
@@ -947,7 +965,7 @@ def test_counterfactual_trials_partial_success_counts_verified_share():
         + _trial_run("r2", "candidate", success=True, page=True)
     )
     estimates = CounterfactualTrials.fit(events).estimate()
-    arm = estimates["click|0"]["candidate"]
+    arm = estimates["*|click|0|click|1"]["candidate"]
     assert arm["assigned"] == arm["trials"] == arm["executed"] == 2
     assert arm["censored"] == 0
     assert abs(arm["p_success"] - 0.5) < 1e-9  # one verified success of two
@@ -964,8 +982,8 @@ def test_counterfactual_trials_context_is_arm_independent():
     # model's overlap-0 choice. Both arms must land in the model choice's cell.
     events = _trial_run("x", "candidate") + _trial_run("y", "control")
     estimates = CounterfactualTrials.fit(events).estimate()
-    assert set(estimates) == {"click|0"}
-    entry = estimates["click|0"]
+    assert set(estimates) == {"*|click|0|click|1"}
+    entry = estimates["*|click|0|click|1"]
     assert set(entry["candidate"]) and set(entry["control"])
     assert "delta" in entry
 
@@ -983,7 +1001,7 @@ def test_counterfactual_trials_itt_counts_unexecuted_assignments():
         # (blocked) with no transition ever recorded for the trial.
         events += _trial_run(f"c{i}", "candidate", executed=False, success=False)
         events += _trial_run(f"k{i}", "control", success=True)
-    arms = CounterfactualTrials.fit(events).estimate()["click|0"]
+    arms = CounterfactualTrials.fit(events).estimate()["*|click|0|click|1"]
     candidate = arms["candidate"]
     assert candidate["assigned"] == 8
     assert candidate["executed"] == 0  # no transition — yet still analyzed
@@ -1008,7 +1026,7 @@ def test_counterfactual_trials_censor_unmeasured_runs():
         # A real measured failure for contrast.
         + _trial_run("f", "candidate", success=False)
     )
-    arm = CounterfactualTrials.fit(events).estimate()["click|0"]["candidate"]
+    arm = CounterfactualTrials.fit(events).estimate()["*|click|0|click|1"]["candidate"]
     assert arm["assigned"] == 3
     assert arm["censored"] == 2
     assert arm["trials"] == 1  # only the measured failure is analyzed
@@ -1025,7 +1043,7 @@ def test_counterfactual_trials_legacy_transition_only_pool():
         for event in _trial_run("x", "candidate", success=False)
         if event["event"] != "experiment_assigned"
     ]
-    arm = CounterfactualTrials.fit(events).estimate()["click|0"]["candidate"]
+    arm = CounterfactualTrials.fit(events).estimate()["*|click|0|click|1"]["candidate"]
     assert arm["assigned"] == arm["trials"] == arm["executed"] == 1
     assert arm["p_success"] < 0.01
 
@@ -1039,7 +1057,7 @@ def test_counterfactual_trials_unreliable_below_effective_support():
     for i in range(4):
         events += _trial_run(f"c{i}", "candidate", success=i < 3)
         events += _trial_run(f"k{i}", "control", success=i < 1)
-    arms = CounterfactualTrials.fit(events).estimate()["click|0"]
+    arms = CounterfactualTrials.fit(events).estimate()["*|click|0|click|1"]
     assert abs(arms["delta"] - 0.5) < 1e-9
     assert arms["candidate"]["ess"] < CounterfactualTrials.MIN_ESS
     assert arms["delta_reliable"] is False
@@ -1106,8 +1124,8 @@ def test_report_surfaces_trial_estimates_without_gating(tmp_path):
         worlds, ExplorationPolicy())
     assert with_trials.trials_digest == trials.digest
     estimates = with_trials.trial_estimates
-    assert estimates["click|0"]["candidate"]["assigned"] == 1
-    assert estimates["click|0"]["candidate"]["executed"] == 1
+    assert estimates["*|click|0|click|1"]["candidate"]["assigned"] == 1
+    assert estimates["*|click|0|click|1"]["candidate"]["executed"] == 1
     # Trial estimates are annotation only — identical promotion outcome.
     assert with_trials.promotion.approved == without.promotion.approved
     assert with_trials.selected.digest == without.selected.digest
@@ -1175,3 +1193,266 @@ def _divergent_worlds(store_path):
     store_path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
     from jev_ultrafast.dream import ReplayWorld
     return ReplayWorld.from_events(events)
+
+
+# ------------------------------------------- hierarchical ChoiceModel
+
+
+def test_choice_model_family_stratum_isolates_unrelated_tasks():
+    """Same (kind, overlap, rank) coordinate under two task families learns
+    separate posteriors — booking flights and paying invoices no longer
+    share one tiny cell."""
+    transition = _transition(
+        selected="s",
+        candidates=[{"id": "s", "kind": "click", "label": "X", "goal_overlap": 1}],
+    )
+    events = []
+    for i in range(5):
+        events += _run_events(f"fa{i}", [transition], task_family="flights")
+        events += _run_events(
+            f"fb{i}", [transition], status="blocked", verified=False,
+            task_family="banking")
+    model = ChoiceModel.fit(events)
+    flight = model.predict(kind="click", goal_overlap=1, rank=0, task_family="flights")
+    bank = model.predict(kind="click", goal_overlap=1, rank=0, task_family="banking")
+    assert flight["level"] == "family" and bank["level"] == "family"
+    assert flight["p_progress"] > 0.7
+    assert bank["p_progress"] < 0.3
+
+
+def test_choice_model_family_backoff_to_pooled_cell():
+    """A family stratum below the confidence floor falls back to the pooled
+    cell — thin specific evidence never shadows real pooled support."""
+    transition = _transition(
+        selected="s",
+        candidates=[{"id": "s", "kind": "click", "label": "X", "goal_overlap": 1}],
+    )
+    events = []
+    for i in range(6):
+        events += _run_events(f"g{i}", [transition], task_family="flights")
+    events += _run_events(
+        "b0", [transition], status="blocked", verified=False, task_family="banking")
+    model = ChoiceModel.fit(events)
+    pred = model.predict(kind="click", goal_overlap=1, rank=0, task_family="banking")
+    assert pred["level"] == "cell"
+    assert pred["n"] == 7 and pred["p_progress"] > 0.7
+    # A context-free prediction keeps the legacy pooled behavior.
+    assert model.predict(kind="click", goal_overlap=1, rank=0)["level"] == "cell"
+
+
+def test_choice_model_excludes_experiment_transitions():
+    """An experiment-tagged transition was scheduled by the trial layer, not
+    chosen by the recorded policy — fitting it would launder randomized
+    evidence into the correlational prior."""
+    events = []
+    for i in range(4):
+        events += _run_events(f"ok{i}", [_transition(selected="a")])
+    events += _trial_run("t1", "candidate", success=False)
+    model = ChoiceModel.fit(events)
+    assert model.samples == 4
+    assert model.global_positive == 4
+
+
+# -------------------------------------------- hierarchical trial scope
+
+
+def test_trials_scope_stratifies_family_site_global():
+    """The 5-field context keeps scopes separate: f:<family> wins over
+    s:<site>, and an unscoped assignment pools under ``*``."""
+    events = (
+        _trial_run("a", "candidate", task_family="flights")
+        + _trial_run("b", "candidate", site="example.com")
+        + _trial_run("c", "candidate")
+    )
+    trials = CounterfactualTrials.fit(events)
+    assert {cell[0] for cell in trials.cells} == {"f:flights", "s:example.com", "*"}
+    estimates = trials.estimate()
+    assert set(estimates) == {
+        "f:flights|click|0|click|1",
+        "s:example.com|click|0|click|1",
+        "*|click|0|click|1",
+    }
+
+
+def test_trials_resolve_family_stratum_wins_when_reliable():
+    """Adequate family support beats pooled — the specific estimate is the
+    honest answer for that task family."""
+    events = []
+    for i in range(8):
+        events += _trial_run(f"fc{i}", "candidate", success=True, task_family="flights")
+        events += _trial_run(f"fk{i}", "control", success=False, task_family="flights")
+    resolved = CounterfactualTrials.fit(events).resolve(
+        task_family="flights", model_kind="click", model_overlap=0,
+        proposal_kind="click", proposal_overlap=1)
+    assert resolved["level"] == "family"
+    assert resolved["delta"] > 0.9 and resolved["delta_reliable"]
+
+
+def test_trials_resolve_thin_scope_falls_through_to_pooled():
+    """A 2-assignment family stratum cannot hide a 24-assignment pooled
+    refutation — resolution keeps walking until a stratum is reliable."""
+    events = []
+    for i in range(2):
+        events += _trial_run(f"fc{i}", "candidate", success=True, task_family="flights")
+        events += _trial_run(f"fk{i}", "control", success=False, task_family="flights")
+    for i in range(10):
+        events += _trial_run(f"c{i}", "candidate", success=False, task_family="banking")
+        events += _trial_run(f"k{i}", "control", success=True, task_family="banking")
+    resolved = CounterfactualTrials.fit(events).resolve(
+        task_family="flights", model_kind="click", model_overlap=0,
+        proposal_kind="click", proposal_overlap=1)
+    assert resolved["level"] == "pooled"
+    assert resolved["delta_reliable"] and resolved["delta"] < 0
+
+
+def test_trials_resolve_sparse_returns_unreliable_specific_estimate():
+    """When no stratum meets the floor the most specific estimate is still
+    reported — flagged unreliable rather than hidden."""
+    events = (
+        _trial_run("a", "candidate", success=True, task_family="flights")
+        + _trial_run("b", "control", success=True, task_family="flights")
+    )
+    resolved = CounterfactualTrials.fit(events).resolve(
+        task_family="flights", model_kind="click", model_overlap=0,
+        proposal_kind="click", proposal_overlap=1)
+    assert resolved["level"] == "family"
+    assert resolved["delta_reliable"] is False
+    # A hypothesis that was never tried resolves to nothing.
+    assert CounterfactualTrials.fit([]).resolve(task_family="x") is None
+
+
+def test_counterfactual_trials_rejects_legacy_cell_arity():
+    """/4 cells are 15 fields — an older 11-field serialization fails closed
+    instead of silently misaligning counts."""
+    with pytest.raises(ValueError):
+        CounterfactualTrials.from_dict({"cells": [tuple("" for _ in range(11))]})
+
+
+# ------------------------------------------------------ causal prior
+
+
+def test_trial_choice_model_proposes_reliable_positive_delta():
+    """The causal prior proposes the offered candidate whose arm measured a
+    reliable positive ITT effect — a hypothesis randomized evidence already
+    supports."""
+    events = []
+    for i in range(8):
+        events += _trial_run(f"c{i}", "candidate", success=True)
+        events += _trial_run(f"k{i}", "control", success=False)
+    model = TrialChoiceModel.fit(events)
+    proposal = model.choose(
+        [
+            {"id": "m", "kind": "click", "goal_overlap": 0},
+            {"id": "p", "kind": "click", "goal_overlap": 1},
+        ],
+        model_choice={"id": "m", "kind": "click", "goal_overlap": 0},
+    )
+    assert proposal["id"] == "p"
+    assert proposal["expected_delta"] > 0.9
+    assert proposal["confident"] is True
+    assert proposal["trial_level"] == "pooled"
+
+
+def test_trial_choice_model_abstains_without_evidence():
+    """No premise, or no reliable positive delta, means no proposal — a
+    causal prior without evidence proposes nothing."""
+    model = TrialChoiceModel.fit([])
+    assert model.choose(
+        [{"id": "p", "kind": "click", "goal_overlap": 1}],
+        model_choice={"id": "m", "kind": "click", "goal_overlap": 0},
+    ) is None
+    events = _trial_run("a", "candidate") + _trial_run("b", "control")
+    assert TrialChoiceModel.fit(events).choose(
+        [{"id": "p", "kind": "click", "goal_overlap": 1}]
+    ) is None
+
+
+def test_trial_choice_model_refuted_blocks_settled_divergences():
+    """A reliable non-positive delta means the hypothesis was tested and
+    failed; unreliable evidence refutes nothing."""
+    events = []
+    for i in range(8):
+        events += _trial_run(f"c{i}", "candidate", success=False)
+        events += _trial_run(f"k{i}", "control", success=True)
+    model = TrialChoiceModel.fit(events)
+    assert model.refuted(
+        kind="click", goal_overlap=1, model_kind="click", model_overlap=0) is True
+    thin = TrialChoiceModel.fit(
+        _trial_run("a", "candidate", success=False)
+        + _trial_run("b", "control", success=True)
+    )
+    assert thin.refuted(
+        kind="click", goal_overlap=1, model_kind="click", model_overlap=0) is False
+
+
+def test_trial_choice_model_family_scope_isolates_effects():
+    """The same divergence can be supported under one family and refuted
+    under another — family-scoped estimates keep those truths separate."""
+    events = []
+    for i in range(8):
+        events += _trial_run(f"fc{i}", "candidate", success=True, task_family="flights")
+        events += _trial_run(f"fk{i}", "control", success=False, task_family="flights")
+        events += _trial_run(f"bc{i}", "candidate", success=False, task_family="banking")
+        events += _trial_run(f"bk{i}", "control", success=True, task_family="banking")
+    model = TrialChoiceModel.fit(events)
+    assert model.refuted(
+        kind="click", goal_overlap=1, model_kind="click", model_overlap=0,
+        task_family="banking") is True
+    assert model.refuted(
+        kind="click", goal_overlap=1, model_kind="click", model_overlap=0,
+        task_family="flights") is False
+    offered = [
+        {"id": "m", "kind": "click", "goal_overlap": 0},
+        {"id": "p", "kind": "click", "goal_overlap": 1},
+    ]
+    proposal = model.choose(
+        offered,
+        model_choice={"id": "m", "kind": "click", "goal_overlap": 0},
+        task_family="flights",
+    )
+    assert proposal is not None and proposal["id"] == "p"
+    assert proposal["trial_level"] == "family"
+    assert model.choose(
+        offered,
+        model_choice={"id": "m", "kind": "click", "goal_overlap": 0},
+        task_family="banking",
+    ) is None
+
+
+def test_trial_choice_model_serialization_roundtrip():
+    events = _trial_run("a", "candidate") + _trial_run("b", "control")
+    model = TrialChoiceModel.fit(events)
+    clone = TrialChoiceModel.from_dict(model.to_dict())
+    assert clone.digest == model.digest
+    assert clone.version == "jev-causal/1"
+
+
+def test_improve_suppresses_trial_refuted_proposals(tmp_path):
+    """End to end: the observational prior proposes a divergence the
+    randomized evidence already settled — improve() must not stamp a plan
+    asking the same question again."""
+    store = tmp_path / "events.jsonl"
+    worlds = _divergent_worlds(store)
+    events = [json.loads(line) for line in store.read_text().splitlines() if line.strip()]
+    choice_model = ChoiceModel.fit(events)
+    # The observational divergence is low(overlap 0) -> high(overlap 3).
+    # Randomized trials measured it and the candidate arm kept losing.
+    for i in range(8):
+        events += _trial_run(f"c{i}", "candidate", success=False, overlap=3)
+        events += _trial_run(f"k{i}", "control", success=True, overlap=3)
+    trials = CounterfactualTrials.fit(events)
+    trial_model = TrialChoiceModel(trials=trials)
+    report = DreamImprover(gate=PromotionGate(min_coverage=0.0)).improve(
+        worlds, ExplorationPolicy(),
+        choice_model=choice_model, trial_model=trial_model, trials=trials)
+    assert report.trial_model_digest == trial_model.digest
+    # The refuted divergence produced no stamped experiment plan.
+    assert report.experiment_proposals == ()
+    # And the causal prior is what the live agent would bind against: a plan
+    # stamped under this digest executes only when the same model answers.
+    plain = DreamImprover(gate=PromotionGate(min_coverage=0.0)).improve(
+        worlds, ExplorationPolicy(), choice_model=choice_model)
+    assert plain.trial_model_digest is None
+    # The guard is causal suppression, not an empty pipeline: without the
+    # trial prior the same replay does stamp the divergence.
+    assert plain.experiment_proposals != ()
