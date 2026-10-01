@@ -804,9 +804,9 @@ class CounterfactualTrials:
         the arm. ``trials`` is the analyzed (non-censored) count; ``assigned``
         includes censored ones. ``ess`` is the effective sample size of the
         analyzed pool — the count of independent observations the weights are
-        worth — and ``p_success_ci``/``delta_ci`` are Wilson/normal intervals
-        on that effective support, so thin evidence cannot masquerade as a
-        confident estimate.
+        worth — and ``p_success_ci``/``delta_ci`` are Wilson/Newcombe-Wilson
+        intervals on that effective support, so thin evidence cannot
+        masquerade as a confident estimate.
         """
         arms: dict[str, dict] = {}
         for ctx, arm, assigned, analyzed, executed, censored, ws, wsum, wsq, wpage, wexec in self.cells:
@@ -837,12 +837,18 @@ class CounterfactualTrials:
                 delta = candidate["p_success"] - control["p_success"]
                 entry["delta"] = delta
                 if candidate["ess"] and control["ess"]:
+                    # Newcombe-Wilson interval on the difference, built from
+                    # the per-arm Wilson bounds. The naive normal-approx SE
+                    # collapses to zero when either arm sits at the 0/1
+                    # boundary — exactly the extreme evidence where a
+                    # degenerate interval would claim false precision.
                     pc, pk = candidate["p_success"], control["p_success"]
-                    se = math.sqrt(
-                        pc * (1.0 - pc) / candidate["ess"]
-                        + pk * (1.0 - pk) / control["ess"]
-                    )
-                    entry["delta_ci"] = [delta - 1.96 * se, delta + 1.96 * se]
+                    lc, uc = candidate["p_success_ci"]
+                    lk, uk = control["p_success_ci"]
+                    entry["delta_ci"] = [
+                        delta - math.sqrt((pc - lc) ** 2 + (uk - pk) ** 2),
+                        delta + math.sqrt((uc - pc) ** 2 + (pk - lk) ** 2),
+                    ]
                 else:
                     entry["delta_ci"] = None
                 # The contrast is only as trustworthy as its weaker arm.

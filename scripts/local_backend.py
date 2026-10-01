@@ -45,6 +45,7 @@ target question for the operation the model actually chose.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import sys
@@ -309,7 +310,9 @@ class Handler(BaseHTTPRequestHandler):
             f"http://127.0.0.1:{bound_port}",
             f"http://localhost:{bound_port}",
         )
-        token_ok = not token or self.headers.get("Authorization") == f"Bearer {token}"
+        token_ok = not token or hmac.compare_digest(
+            self.headers.get("Authorization") or "", f"Bearer {token}"
+        )
         return host_ok and origin_ok and token_ok
 
     def do_GET(self):
@@ -323,9 +326,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             # Decision bodies carry the candidate catalogue (~256 KB ceiling
-            # upstream) — bound the read, never block on a negative length.
+            # upstream) — bound the read, never block on a negative length,
+            # and never let an under-sending peer hold the handler thread.
             if not 0 < length <= 4 * 1024 * 1024:
                 raise ValueError("Invalid request size")
+            self.request.settimeout(30)
             body = json.loads(self.rfile.read(length))
             if not isinstance(body, dict):
                 raise ValueError("Request body must be a JSON object")
