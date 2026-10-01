@@ -15,7 +15,7 @@ import httpx
 from .privacy import action_goal_overlap, redact_text, sanitize_action, sanitize_page, tokenize
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
-CLIENT = httpx.Client(http2=True, timeout=25)
+CLIENT = httpx.Client(http2=True, timeout=float(os.environ.get("JEV_MODEL_TIMEOUT", "25")))
 MODEL_ACTION_LIMIT = 250
 MODEL_BODY_LIMIT = 256 * 1024
 
@@ -186,7 +186,15 @@ def action_space(actions):
             element["operations"].append(operation)
         target = index
         if kind == "select":
-            target = f"{index}:{len(element['options']) + 1}"
+            # Key the option by its stable DOM option_index, not its position
+            # in the filtered list — the currently-selected option is excluded
+            # from observations, so positional keys re-map the same target id
+            # to a different option every time the value changes.
+            option_index = action.get("option_index")
+            try:
+                target = f"{index}:{int(option_index) + 1}"
+            except (TypeError, ValueError):
+                target = f"{index}:{len(element['options']) + 1}"
             clean = sanitize_action(action)
             element["options"].append(
                 {
@@ -317,7 +325,10 @@ def field_text(context):
     model = os.environ.get("TEXT_MODEL", "deepseek-chat")
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
-        reasoning = {"reasoning": {"enabled": False}}
+        # Omit the field entirely — "none" means send no reasoning hint.
+        # Strict OpenAI-compatible servers (e.g. Ollama /v1) reject unknown
+        # reasoning keys outright, so a disabled-looking object still fails.
+        reasoning = {}
     started = time.perf_counter()
     result = post_json(
         base + "/chat/completions",
@@ -325,6 +336,7 @@ def field_text(context):
         {
             "model": model,
             "max_tokens": 1024,
+            "temperature": 0.2,
             "response_format": {"type": "json_object"},
             **reasoning,
             "messages": [

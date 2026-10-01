@@ -1,10 +1,10 @@
-# Validation — Jev Ultrafast v0.8.0 DREAM-Jev
+# Validation — Jev Ultrafast v0.8.1 DREAM-Jev
 
-Validation date: 2026-09-29, updated for the v0.7.1 hardening pass and the v0.8.0 audit-correction pass (v0.5.1 applied the independent-audit authority patch; v0.6.0 added the `ChoiceModel` counterfactual layer; v0.7.0 added real randomized counterfactual trials; v0.7.1 fixed trial-approval resume and registry lineage; v0.8.0 restores the v0.6.2 hardening this line had dropped — trajectory-success labeling, honest propensity fields, the registry head anchor, pre-authority assignment recording, and the run-level trial endpoint — and wires stamped `experiment_proposals` into the agent).
+Validation date: 2026-09-30, updated for the v0.7.1 hardening pass, the v0.8.0 audit-correction pass, and the v0.8.1 stability patch (v0.5.1 applied the independent-audit authority patch; v0.6.0 added the `ChoiceModel` counterfactual layer; v0.7.0 added real randomized counterfactual trials; v0.7.1 fixed trial-approval resume and registry lineage; v0.8.0 restores the v0.6.2 hardening this line had dropped — trajectory-success labeling, honest propensity fields, the registry head anchor, pre-authority assignment recording, and the run-level trial endpoint — and wires stamped `experiment_proposals` into the agent; v0.8.1 fixes select-option target-key stability, OpenAI-compatible server compatibility for the text helper, and adds a local Ollama decision backend for key-free runs).
 
 ## Reproduced in this build environment
 
-- `uv run pytest`: **288 passed** against the project environment; browser/CDP calls in unit tests remain mocked by the tests themselves.
+- `uv run pytest`: **289 passed** against the project environment; browser/CDP calls in unit tests remain mocked by the tests themselves.
 - `uv run python scripts/check_guards.py` against a dedicated headless Chrome 154 instance (`BU_CDP_URL=http://127.0.0.1:9222`, throwaway `--user-data-dir`): **all 34 live browser guard checks passed**, including the adversarial mid-input cases (post-observe commit swap, same-label node swap between press and release, pre-release overlay, pre-release geometry drift, mid-press page mutation, pointer-state hygiene after abort, nested-descendant interception, post-observe hidden/detached targets, structured `ctx` propagation) and the atomic-guarantee check proving `DOM_ATOMIC` clicks dispatch no press/release window for mid-event sabotage. Earlier validation against Chrome 152 also passed; the first v0.4.0 live run had exposed a latent defect that mocked tests could not see, which is why CI now runs this suite in a `live-guards` job on every change.
 - `uv run ruff check .`: passed.
 - `uv build`: passed.
@@ -157,6 +157,12 @@ The v0.7 experiment path is kept but re-hardened against the audit findings; sev
 - **Approval UI shows the payload**: `pending_approval.payload_preview` carries the exact generated text so the operator approves the value the digest binds, and the demo status line renders it.
 - **Release integrity**: `MANIFEST.sha256` is regenerated and CI verifies it (`sha256sum -c MANIFEST.sha256`), closing the stale-manifest gap.
 - New transitions are `jev-ultrafast-tcb/0.11`: pools that predate assignment-event semantics never silently mix with trial evidence.
+
+## v0.8.1 stability patch
+
+- **Select target keys are now stable identities**: option sub-targets previously numbered positionally over the filtered option list, and the snapshot omits the currently-selected option — so the same `N:M` key silently re-mapped to a different option after every selection, which produced an observe→select→observe toggle loop. Keys now encode the DOM `option_index`; `test_select_target_keys_are_stable_across_selection_change` covers it.
+- **Text helper compatibility**: `TEXT_MODEL_REASONING=none` now omits the reasoning field entirely instead of sending `{"reasoning": {"enabled": false}}` — strict OpenAI-compatible servers (Ollama `/v1`) reject the key outright. Field generation also pins `temperature: 0.2` for consistency, and the shared model client honors `JEV_MODEL_TIMEOUT` (default 25s) since local inference legitimately exceeds it.
+- **Local decision backend**: `scripts/local_backend.py` serves the finite-choice decision protocol on loopback backed by an Ollama model (default `qwen3:8b`), enabling fully key-free runs — decisions, text, and browser all local. Grounded operation prompts preview what each operation would act on, satisfied controls are surfaced via current-value/goal-token overlap, and the shim fails honestly rather than fabricating a choice when the model's answer is invalid. Verified end-to-end against the bundled fixture: real Chrome execution with all authority-plane checks intact.
 
 ## Deployment gate
 

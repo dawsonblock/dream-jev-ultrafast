@@ -207,8 +207,34 @@ def test_duplicate_select_values_keep_distinct_exact_option_indices():
     ]
     elements, targets, _ = model.action_space(actions)
     assert [o["option_index"] for o in elements[0]["options"]] == [1, 2]
-    assert targets["SELECT"]["1:1"]["option_index"] == 1
-    assert targets["SELECT"]["1:2"]["option_index"] == 2
+    assert targets["SELECT"]["1:2"]["option_index"] == 1
+    assert targets["SELECT"]["1:3"]["option_index"] == 2
+
+
+def test_select_target_keys_are_stable_across_selection_change():
+    # The snapshot omits the currently-selected option, so positional keys
+    # re-map after every selection: "6:1" meant Design, then All stays, then
+    # Design — the model toggled the same key between different options
+    # forever. Keys must encode the DOM option_index instead.
+    before = [
+        {"id": "e1", "kind": "select", "node": 6, "role": "combobox", "label": "Cat → Design",
+         "value": "design", "current_value": "All", "option_index": 1, "option_label": "Design"},
+        {"id": "e2", "kind": "select", "node": 6, "role": "combobox", "label": "Cat → Nature",
+         "value": "nature", "current_value": "All", "option_index": 2, "option_label": "Nature"},
+    ]
+    # After Design is selected, the DOM omits it from the offered options —
+    # All stays (index 0) is now the first entry but must keep its own key.
+    after = [
+        {"id": "e3", "kind": "select", "node": 6, "role": "combobox", "label": "Cat → All",
+         "value": "all", "current_value": "Design", "option_index": 0, "option_label": "All"},
+        {"id": "e4", "kind": "select", "node": 6, "role": "combobox", "label": "Cat → Nature",
+         "value": "nature", "current_value": "Design", "option_index": 2, "option_label": "Nature"},
+    ]
+    _, targets_before, _ = model.action_space(before)
+    _, targets_after, _ = model.action_space(after)
+    assert targets_before["SELECT"]["1:2"]["option_index"] == 1  # Design before
+    assert targets_after["SELECT"]["1:1"]["option_index"] == 0   # All after
+    assert targets_after["SELECT"]["1:3"]["option_index"] == 2   # Nature keeps its key
 
 
 def test_large_dropdown_cannot_evict_other_operation_types():

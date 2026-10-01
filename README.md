@@ -87,6 +87,8 @@ Chrome connects through [Browser Harness](https://github.com/browser-use/browser
 
 `TEXT_MODEL_API_KEY` is an OpenRouter key in the example configuration. The current example uses `inception/mercury-2.5` with reasoning disabled. Gemini, GLM, and DeepSeek can also use the OpenAI-compatible text helper. The finite-choice backend can be redirected with `JEV_DECISION_BASE_URL`, `JEV_DECISION_API_KEY`, and `JEV_DECISION_MODEL`, or replaced in-process through the `decision_backend=` argument.
 
+**Fully local runs** need no API keys at all: install [Ollama](https://ollama.com), `ollama pull qwen3:8b`, `ollama serve`, then `OLLAMA_MODEL=qwen3:8b uv run python scripts/local_backend.py` — a loopback finite-choice shim that answers the decision protocol with a small local model. Set `JEV_DECISION_BASE_URL=http://127.0.0.1:9000/v1/systemone` plus `JEV_MODEL_TIMEOUT=240` (local inference is slower than the 25s default), `TEXT_MODEL_BASE_URL=http://127.0.0.1:11434/v1`, `TEXT_MODEL=qwen3:8b`, and `TEXT_MODEL_REASONING=none` (Ollama rejects reasoning fields). An 8B model won't plan like a frontier model, but every trace it produces is real DREAM experience — the replay/experiment layer exists precisely to improve a weak policy from its own outcomes.
+
 `JEV_MODEL_PRIVACY=basic` is the default. It bounds serialized strings and redacts incidental email addresses, card/account-like long numbers, API-secret patterns, common credential query parameters (API keys, access/refresh/ID tokens, client secrets, session and CSRF values), and values from obviously sensitive fields before page observations are sent to a model. This is a useful reduction layer, not a complete DLP system.
 
 ## Use the library
