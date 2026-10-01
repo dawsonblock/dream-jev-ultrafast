@@ -19,6 +19,16 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+class BrowserError(RuntimeError):
+    """The browser connection or CDP session itself failed.
+
+    Distinct from ``StalePage`` (a recoverable re-perception) and from page
+    script errors: a run that dies here never reached a measured outcome, and
+    the censoring taxonomy records it as ``browser_crash`` rather than
+    pretending it was a task failure.
+    """
+
+
 class Browser:
     def __init__(self, url):
         self.target = None
@@ -44,8 +54,14 @@ class Browser:
 
     def call(self, method, **params):
         if not self.session:
-            raise RuntimeError("Browser session is closed")
-        return cdp(method, session_id=self.session, **params)
+            raise BrowserError("Browser session is closed")
+        try:
+            return cdp(method, session_id=self.session, **params)
+        except (RuntimeError, OSError, ConnectionError) as exc:
+            # Normalize transport-level failures to BrowserError so the run's
+            # termination reason is honest (browser_crash, not agent_exception)
+            # while every existing RuntimeError handler keeps working.
+            raise BrowserError(str(exc)) from exc
 
     def _runtime_evaluate(self, expression, *, context_id=None, await_promise=False):
         params = {"expression": expression, "returnByValue": True}

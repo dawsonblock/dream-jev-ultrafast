@@ -321,6 +321,61 @@ uv run jev-dream rollback --registry REGISTRY [--digest SHA256]
 uv run jev-dream registry-reanchor --registry REGISTRY --registry-anchor PATH
 ```
 
+## The causal decision-learning plane (v0.9.0)
+
+v0.8.3 built the randomized channel; v0.9.0 makes it *epistemically correct*. The loop is unchanged in authority — predictions may suggest, only empirical results authorize — but the causal layer no longer confuses "we have samples" with "we know the intervention helps":
+
+```text
+normal decision model
+        │
+        ▼
+   model chooses A
+        │
+        ├────────── observational ChoiceModel (source: "observational")
+        │
+        └────────── causal TrialChoiceModel (source: "randomized")
+                          │
+                          ▼
+                 ExperimentPlan A vs B
+              (bound, family-bound, optionally signed)
+                          │
+                   random assignment
+                   /              \
+             control A         candidate B
+                   \              /
+                    REAL browser
+                         │
+                  authority plane (unchanged)
+                         │
+                independent verifier
+                         │
+                         ▼
+                 final trial outcome
+                         │
+        ┌────────────────┼────────────────┐
+        ▼                ▼                ▼
+    success          failure          censored + reason
+        │                                 (operator_cancel, timeout, …)
+        ▼
+   causal estimator
+        │
+   hierarchical context (family+site → site → family → pooled)
+        │                (treatment signature backoff: phase → rank → role → effect → overlap; kind is a floor)
+        ▼
+   effect status: BENEFICIAL / HARMFUL / UNRESOLVED / INSUFFICIENT_DATA
+        │
+        ▼
+   ExperimentScheduler → next real experiment
+```
+
+- **Effect status is not support.** `support_sufficient` is the weighted-sample floor; `effect_status` is the sign the data actually established, decided by an anytime-valid interval (summable α-spending over looks) and a practical-effect threshold. A supported interval that crosses zero is `unresolved` — it schedules more evidence and proposes nothing. Only `beneficial` feeds `TrialChoiceModel.choose`; only `harmful` feeds `refuted`.
+- **Censoring is causal.** Aborts carry structured reasons, per-arm censor rates are reported, and extreme or sharply imbalanced censoring refuses to establish an effect — the surviving subset of a differentially censored arm is a biased sample, not a smaller unbiased one.
+- **Generalization is bounded and named.** An estimate applies to a treatment *signature* — kind, effect class, role, overlap, offered rank, workflow phase — inside a task/site context; the answer reports which stratum and which backoff mask produced it. It is never presented as an exact-action measurement, and operation kind is never generalized across.
+- **Plans are bound, fresh, and can be signed.** The live agent re-verifies every stamped binding including `family_key`, discards plans that newer randomized evidence refutes, and — when trusted keys are configured — requires a domain-separated Ed25519 signature, so digest integrity is never mistaken for provenance.
+- **The policy layer is operator-gated.** `CausalChoicePolicy` runs `shadow` (annotate only) → `canary` (randomized assignment) → `active` (deterministic override, but only for randomized-established beneficial proposals, still through the authority plane, recorded as `causal_policy_applied`, and excluded from policy-canary qualification). Mode changes are configuration decisions, never learned ones.
+
+Hard safety constraints remain outside every utility function: no weight combination can trade away an effect classification, a payload review, an approval, or a browser guard.
+
 ## What this still is not
 
 DREAM-Jev remains empirical replay, not a latent browser-dynamics model. It cannot predict unseen DOM transitions, infer the outcome of an action never executed, or prove that historical page behavior still holds today. Live canary qualification is therefore mandatory by design.
@@ -332,7 +387,7 @@ v0.4.1 introduces the first two lower-trust learned layers, both deliberately ou
 - `ChoiceModel` (Level 3, v0.6.0; corrected in v0.6.1) is the first *counterfactual* layer: an uncertainty-aware prior over the same cells that proposes which offered action it would have preferred (`choose` scores posterior mean + an exploration bonus × posterior stddev, so promising-but-sparse actions stay reachable, while the `confident` flag abstains on cells without support). Two corrections landed in v0.6.1: the model trains on the action's rank in the catalogue the policy *offered* (`selected_offered_rank`), not the pre-policy observed index — the v0.6 recorder wrote the observed coordinate under `selected_rank`, so training and replay were on different bases — and the learned target is the run's verified outcome, not raw page activity. As of v0.8.0 (`jev-choice/3`) the labeling is trajectory-success again: every step of a run takes the run's final independently verified outcome, so intermediate `page_changed` churn inside a failed run is a negative association — correlational trajectory credit, not per-action causality. Since v0.8.2 (`jev-choice/4`) runs with no measured outcome — `aborted`, `claimed_done` without a verifier, torn tails with no `run_finished` — are censored out of the fit entirely rather than counted as failures; a run that was never measured is missing data, not evidence its actions were bad. During replay the prior is queried under the candidate policy's own recomputed offered rank, so its annotations are policy-dependent rather than a descriptive prior over history. It reports per-candidate `divergence_rate` (how often it would have chosen differently) with the two subjects kept separate — `selected_mean_uncertainty`/`selected_confident_fraction` for the recorded action's prior and `proposal_mean_uncertainty`/`proposal_confident_fraction` for the proposal's. It is still a correlational prior over *selected* actions, not a causal success model — outcomes for rejected candidates are not in the data — and its proposals remain annotation metadata: never an outcome, never evidence, never a gate input. Since v0.8.3 (`jev-choice/5`) the prior is hierarchical: a task-family stratum over the same cells answers when it meets `MIN_CONFIDENT`, otherwise the pooled cell does — unrelated task families no longer share one tiny posterior — and experiment-tagged transitions are excluded from the fit, since a scheduler-assigned action is not the recorded policy's own choice.
 - `CounterfactualTrials` (Level 4, v0.7.0; endpoint corrected in v0.8.0/`jev-trials/2`, assignment-based in v0.8.2/`jev-trials/3`) closes the loop between "the prior prefers B" and "B has actually been tried". `DreamReport.experiment_proposals` surfaces divergent replay annotations as stamped `jev-experiment-plan/1` hypotheses ranked by expected delta; `Agent(experiment={"proposals": [...], "rate", "rng"})` consumes those stamped plans directly, while `Agent(experiment={"model", "rate", "rng"})` asks a live `ChoiceModel` — either way the proposal must be a member of the policy-filtered offered catalogue, at most one deviation per run so outcomes stay attributable, and the assigned action passes through the unchanged authority plane (policy assessment, approvals, payload review). A stamped plan is *immutable*: its digest binds the hypothesis plus the task key, state fingerprint, model choice, offered catalogue, policy behavior, originating model, and pool/head lineage — the agent re-verifies every binding before executing, and a state-matching plan that fails any binding is discarded as stale (recorded `experiment_plan_stale`) and suppresses ad-hoc substitution for that step rather than silently running a different hypothesis. Randomization records `experiment_assigned` *before* the authority plane — a denied, vetoed, or stale trial still marks the run experimental — and trial transitions carry the frozen assignment binding (arm, `assignment_probability`, proposal/model/policy/catalogue digests, predicted delta and uncertainty).
 
-  `CounterfactualTrials.fit` analyzes *assignments*, not just executed transitions — intention-to-treat: an arm that was assigned but never executed still counts under its run's real terminal outcome, so post-randomization selection cannot drop the losing half of a trial. The primary endpoint `p_success` is the run's final independently verified outcome — a mid-run page move inside a failed run is a failure, not progress (`p_page_changed` remains secondary telemetry over executed trials only); runs with no measured outcome (`aborted`, interrupted, unverifiable `claimed_done`) are *censored* — counted and excluded rather than treated as failures. Estimates report assigned/analyzed/executed/censored counts, Wilson intervals on effective sample size, and `reliable` against a raised `MIN_ESS = 8` floor; context keys on the model choice's pre-randomization features so both arms share a cell. Since v0.8.3 (`jev-trials/4`) the context is hierarchical — `(scope, model kind/overlap, proposal kind/overlap)` where scope is `f:<task_family>`, `s:<site>`, or `*` — and `resolve` walks family → site → pooled, returning the first stratum whose contrast clears the reliability floor so a thin specific stratum cannot shadow a settled pooled refutation. Trials are excluded from `CanaryEvidence` — a trial never counts toward its own promotion — so the loop stays honest: hypotheses generate real data, real data sharpens the prior, and anything the prior prefers must still qualify through replay + bound live canary.
-- `TrialChoiceModel` (Level 4.5, v0.8.3/`jev-causal/1`) is the causal decision prior built *only* from `CounterfactualTrials` evidence — never observational transitions. Given the model choice as premise, `choose` proposes the offered candidate whose arm measured a reliable positive intention-to-treat delta; `refuted` marks a divergence whose delta is reliably non-positive. Replay proposal selection is causal-first: measured evidence proposes, the observational prior fills in only where trials are silent and not refuted, and the stamped plan's originator digest binds whichever model produced the hypothesis. Same advisory contract as every learned layer — proposals are hypotheses, never evidence, never gate input.
+  `CounterfactualTrials.fit` analyzes *assignments*, not just executed transitions — intention-to-treat: an arm that was assigned but never executed still counts under its run's real terminal outcome, so post-randomization selection cannot drop the losing half of a trial. The primary endpoint `p_success` is the run's final independently verified outcome — a mid-run page move inside a failed run is a failure, not progress (`p_page_changed` remains secondary telemetry over executed trials only); runs with no measured outcome (`aborted`, interrupted, unverifiable `claimed_done`) are *censored* — counted and excluded rather than treated as failures. Estimates report assigned/analyzed/executed/censored counts (with structured termination reasons since v0.9.0), Wilson intervals on effective sample size, and `support_sufficient` against a raised `MIN_ESS = 8` floor; context keys on the model choice's pre-randomization features so both arms share a cell. Since v0.9.0 (`jev-trials/5`) the context stores task family and site as separate coordinates plus a bounded treatment signature, and `resolve` walks `family+site → site → family → pooled` and backs off over signature coordinates (phase → rank → role → effect → overlap, with kind as a floor), returning the first supported stratum so a thin specific stratum cannot shadow a settled broader refutation — and an estimate that had to generalize says so via `signature_level`. Trials are excluded from `CanaryEvidence` — a trial never counts toward its own promotion — so the loop stays honest: hypotheses generate real data, real data sharpens the prior, and anything the prior prefers must still qualify through replay + bound live canary.
+- `TrialChoiceModel` (Level 4.5, v0.8.3/`jev-causal/1`; v0.9.0/`jev-causal/2`) is the causal decision prior built *only* from `CounterfactualTrials` evidence — never observational transitions. Given the model choice as premise, `choose` proposes the offered candidate whose arm *established* a beneficial intention-to-treat effect (sequentially valid interval clear of the practical threshold); `refuted` marks a divergence whose effect is established harmful. A supported interval that crosses zero is `unresolved` — not a proposal, not a refutation. Replay proposal selection is causal-first: measured evidence proposes, the observational prior fills in only where trials are silent and not refuted, and the stamped plan's originator digest binds whichever model produced the hypothesis. Same advisory contract as every learned layer — proposals are hypotheses, never evidence, never gate input.
 
 A future checkpointed branch orchestrator or learned world model could propose new exploration hypotheses. Such components remain hypothesis generators and are never allowed to satisfy execution, verification, or promotion gates with synthetic outcomes alone.

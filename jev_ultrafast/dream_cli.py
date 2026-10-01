@@ -11,11 +11,19 @@ import json
 import sys
 from pathlib import Path
 
-from .dream import DreamImprover, ExperienceStore, ExplorationPolicy, PolicyRegistry, ReplayWorld
+from .dream import (
+    DreamImprover,
+    ExperienceStore,
+    ExplorationPolicy,
+    PolicyRegistry,
+    ReplayWorld,
+    experiment_plan_signer_from_env,
+)
 from .dreamlearn import (
     ChoiceModel,
     CostModel,
     CounterfactualTrials,
+    ExperimentScheduler,
     OutcomeModel,
     TrialChoiceModel,
 )
@@ -246,6 +254,11 @@ def main(argv=None):
         choice_model=choice_model,
         trial_model=TrialChoiceModel(trials=trials),
         trials=trials,
+        # The scheduler picks which *unresolved* hypothesis is worth a real
+        # browser experiment; the signer (when a key is configured) gives
+        # stamped plans provenance, not just digest integrity.
+        scheduler=ExperimentScheduler(),
+        plan_signer=experiment_plan_signer_from_env(),
     )
     output = Path(args.report)
     output.parent.mkdir(parents=True, exist_ok=True)

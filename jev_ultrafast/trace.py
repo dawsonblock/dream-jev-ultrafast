@@ -188,8 +188,19 @@ class DreamTraceRecorder:
     def event(self, name: str, **payload):
         self._append({"event": name, **payload})
 
-    def finish(self, *, status: str, verified: bool):
+    def finish(self, *, status: str, verified: bool, reason: str | None = None):
+        """Terminal run record.
+
+        ``reason`` is recorded only for aborts: the structured censoring cause
+        (``operator_cancel``, ``browser_crash``, ``timeout``, …) that lets
+        trial analysis tell an unrelated interruption from a candidate arm
+        that crashed or hung the run. A missing reason on an old record is
+        read as ``unknown_abort``, never guessed.
+        """
         if self.finished:
             return
         self.finished = True
-        self._append({"event": "run_finished", "status": status, "verified": bool(verified)})
+        payload = {"event": "run_finished", "status": status, "verified": bool(verified)}
+        if reason:
+            payload["reason"] = str(reason)
+        self._append(payload)

@@ -859,7 +859,12 @@ def _stamped_plan(runner, *, proposal_id="e3", model_choice_id="e1", **overrides
         "schema": "jev-experiment-plan/1",
         "world": "w0",
         "task_key": task_key(goal),
-        "family_key": "family",
+        # Family identity exactly as the live agent derives it: the normalized
+        # task family, or the task key when no family was configured.
+        "family_key": (
+            str(getattr(runner, "task_family", None) or "").strip().lower()
+            or task_key(goal)
+        ),
         "step": 0,
         "state": runner.state["page"]["fingerprint"],
         "historical": {
@@ -1016,6 +1021,91 @@ def test_experiment_stale_plan_suppresses_live_fallback(runner, tmp_path, monkey
     assert not any(e["event"] == "experiment_assigned" for e in store.load())
 
 
+def test_experiment_stamped_plan_binds_task_family(runner, tmp_path, monkeypatch):
+    """The audit's repro: a hypothesis generated under one task family must
+    not execute under another. Same goal text, same page state, same model
+    choice — the family binding alone makes the plan stale."""
+    p = runner.state["page"]
+    runner.task_family = "banking"  # live family
+    plan = _stamped_plan(runner, family_key="flights")  # stamped under another
+    store = _experiment_runner(runner, tmp_path, plan, monkeypatch)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
+    stale = next(e for e in store.load() if e["event"] == "experiment_plan_stale")
+    assert "task_family" in stale["reasons"]
+    assert not any(e["event"] == "experiment_assigned" for e in store.load())
+
+
+def test_experiment_stamped_plan_stale_when_newer_evidence_refutes(runner, tmp_path, monkeypatch):
+    """Freshness: an old hypothesis does not survive newer randomized
+    evidence. A live causal model that now refutes the plan's proposal makes
+    the plan stale instead of silently re-running a settled question."""
+    p = runner.state["page"]
+    plan = _stamped_plan(runner)
+    store = _experiment_runner(runner, tmp_path, plan, monkeypatch)
+    refuting = Mock()
+    refuting.refuted = Mock(return_value=True)
+    refuting.digest = "refuting-digest"
+    runner.experiment = {"proposals": [plan], "model": refuting, "rate": 1.0}
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
+    stale = next(e for e in store.load() if e["event"] == "experiment_plan_stale")
+    assert "trial_refuted" in stale["reasons"]
+
+
+def test_experiment_stamped_plan_signature_required_when_keys_trusted(runner, tmp_path, monkeypatch):
+    """With trusted verification keys configured, plan provenance is
+    mandatory: unsigned plans are stale, forged signatures are stale, and a
+    correctly signed plan executes."""
+    from jev_ultrafast.dream import (
+        ExplorationPolicy,
+        experiment_plan_digest,
+        experiment_plan_signature,
+    )
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner(bytes(range(32)))
+    runner.exploration_policy = ExplorationPolicy()  # stable stamping basis
+    p = runner.state["page"]
+
+    def last_stale(store):
+        return [e for e in store.load() if e["event"] == "experiment_plan_stale"][-1]
+
+    unsigned = _stamped_plan(runner)
+    store = _experiment_runner(runner, tmp_path, unsigned, monkeypatch)
+    runner.experiment_verify_keys = {signer.key_id}
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
+    assert "plan_unsigned" in last_stale(store)["reasons"]
+
+    forged_plan = _stamped_plan(runner)
+    forged_plan["authority"] = {"key_id": signer.key_id, "signature": "00" * 64}
+    store2 = _experiment_runner(runner, tmp_path, forged_plan, monkeypatch)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert "plan_signature" in last_stale(store2)["reasons"]
+
+    signed = _stamped_plan(runner)
+    signed["digest"] = experiment_plan_digest(signed)
+    signed["authority"] = experiment_plan_signature(signed, signer)
+    store3 = _experiment_runner(runner, tmp_path, signed, monkeypatch)
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e3"
+    assert any(e["event"] == "experiment_assigned" for e in store3.load())
+
+
+def test_experiment_stamped_plan_requires_current_model_when_configured(runner, tmp_path, monkeypatch):
+    """``require_current_model`` turns the soft digest check into a hard one:
+    a plan whose originating model is not available and current is stale."""
+    p = runner.state["page"]
+    plan = _stamped_plan(runner, choice_model_digest="some-digest")
+    store = _experiment_runner(runner, tmp_path, plan, monkeypatch)
+    runner.experiment = {"proposals": [plan], "rate": 1.0, "require_current_model": True}
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
+    stale = next(e for e in store.load() if e["event"] == "experiment_plan_stale")
+    assert "choice_model" in stale["reasons"]
+
+
 def test_experiment_assignment_meta_carries_itt_context(runner, tmp_path):
     """The assignment event is self-contained: the pre-treatment context the
     intention-to-treat estimator needs survives even when nothing executes."""
@@ -1060,3 +1150,187 @@ def test_experiment_proposals_config_validated_in_init(monkeypatch):
         loop.Agent("https://example.test", "goal", experiment={
             "proposals": "notalist", "rate": 0.5,
         })
+
+
+# ------------------------------------------------------- structured aborts
+
+
+def test_close_records_operator_cancel_for_unfinished_run(runner, tmp_path):
+    """An operator closing a mid-run session is censored with its cause —
+    not scored as a task failure, and not confused with a crash."""
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    runner.browser = runner.state["browser"]  # close() tears the browser down
+    runner.state["status"] = "ready"  # mid-run, no terminal decision
+    runner.close()
+    final = next(e for e in store.load() if e["event"] == "run_finished")
+    assert final["status"] == "aborted"
+    assert final["reason"] == "operator_cancel"
+
+
+def test_run_records_structured_abort_reason_for_crashes(runner, tmp_path):
+    """A run that dies mid-flight records *why*: a model timeout, a browser
+    crash, and an unattributable exception are distinguishable in evidence,
+    so censoring analysis can tell infrastructure from treatment-side
+    hangs."""
+    from jev_ultrafast.browser import BrowserError
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.model import ModelConnectionError, ModelTimeoutError
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    cases = (
+        (ModelTimeoutError("timed out"), "timeout"),
+        (ModelConnectionError("connection refused"), "network_failure"),
+        (BrowserError("cdp died"), "browser_crash"),
+        (RuntimeError("boom"), "agent_exception"),
+    )
+    for exc, expected in cases:
+        store = ExperienceStore(tmp_path / f"{expected}.jsonl")
+        runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+        runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+        runner.state["status"] = "ready"
+        runner.state.pop("abort_reason", None)
+        runner.browser = runner.state["browser"]
+
+        def boom(*_args, **_kwargs):
+            raise exc
+
+        runner.command = boom
+        with pytest.raises(type(exc)):
+            list(runner.run())
+        runner.close()
+        final = next(e for e in store.load() if e["event"] == "run_finished")
+        assert final["status"] == "aborted"
+        assert final["reason"] == expected
+
+
+# ------------------------------------------------------- causal policy modes
+
+
+def _causal_evidence():
+    """Randomized evidence: assigning the high-overlap click was beneficial
+    for the divergence premise (model picked a low-overlap click)."""
+    from jev_ultrafast.dream import ExplorationPolicy
+
+    events = []
+    for i in range(8):
+        for arm, success in (("candidate", True), ("control", False)):
+            meta = {
+                "experiment_id": f"x{i}{arm}",
+                "arm": arm,
+                "assignment_probability": 0.5,
+                "proposal_id": "e3",
+                "proposal_kind": "click",
+                "proposal_overlap": 0,
+                "proposal_offered_rank": 1,
+                "model_choice_id": "e1",
+                "model_choice_kind": "fill",
+                "model_choice_overlap": 0,
+                "model_choice_offered_rank": 0,
+                "task_key": "t",
+            }
+            run_id = f"r{i}{arm}"
+            events += [
+                {"event": "run_started", "run_id": run_id, "task_key": "t", "goal": "g",
+                 "policy": ExplorationPolicy().to_dict(),
+                 "policy_digest": ExplorationPolicy().digest},
+                {"event": "experiment_assigned", "run_id": run_id, "task_key": "t",
+                 "experiment": meta},
+                {"event": "run_finished", "run_id": run_id, "task_key": "t",
+                 "status": "done" if success else "blocked", "verified": success},
+            ]
+    return events
+
+
+def test_causal_policy_shadow_annotates_without_influencing(runner, monkeypatch):
+    """Shadow mode reports what the combined policy would prefer — with
+    provenance — and changes nothing about execution."""
+    from jev_ultrafast.dreamlearn import CausalChoicePolicy, TrialChoiceModel
+
+    model = TrialChoiceModel.fit(_causal_evidence())
+    runner.experiment = {"causal_policy": CausalChoicePolicy(mode="shadow", trial_model=model)}
+    # One click sibling only, so the ranking has a single unambiguous top.
+    p = runner.state["page"]
+    p["actions"] = [a for a in p["actions"] if a["id"] != "e2"]
+    p["fingerprint"] = fingerprint(p)
+    monkeypatch.setattr(loop, "choose", lambda *a, **k: decision("e1"))
+    state = runner.command("predict")
+    assert state["decision"]["choice"] == "e1"  # untouched
+    shadow = state["causal_shadow"]
+    assert shadow["shadow"] is True
+    assert shadow["proposals"][0]["id"] == "e3"
+    # No task family was configured, so the evidence backed off to the pooled
+    # stratum — and the provenance says exactly that.
+    assert shadow["proposals"][0]["source"] == "pooled_randomized"
+    assert shadow["proposals"][0]["causal"]["effect_status"] == "beneficial"
+
+
+def test_causal_policy_canary_proposal_enters_randomized_assignment(runner, tmp_path, monkeypatch):
+    """Canary mode's proposal is a *trial* candidate: it runs only through
+    the recorded random assignment, never deterministically."""
+    from jev_ultrafast.dream import ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.dreamlearn import CausalChoicePolicy, TrialChoiceModel
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    runner.exploration_policy = ExplorationPolicy()
+    model = TrialChoiceModel.fit(_causal_evidence())
+    p = runner.state["page"]
+    p["actions"] = [a for a in p["actions"] if a["id"] != "e2"]
+    p["fingerprint"] = fingerprint(p)
+    import random
+
+    runner.experiment = {
+        "causal_policy": CausalChoicePolicy(mode="canary", trial_model=model),
+        "rng": random.Random(0),  # deterministic roll < rate
+        "rate": 1.0,
+    }
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+    p = runner.state["page"]
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e3"
+    assigned = next(e for e in store.load() if e["event"] == "experiment_assigned")
+    assert assigned["experiment"]["arm"] == "candidate"
+    assert assigned["experiment"]["proposal_id"] == "e3"
+    # The assignment carries the bounded treatment signature of both arms.
+    meta = assigned["experiment"]
+    assert meta["model_choice_effect"] and meta["proposal_effect"]
+    assert meta["phase"] == 0
+
+
+def test_causal_policy_active_override_is_recorded_and_canary_excluded(runner, tmp_path, monkeypatch):
+    """Active mode executes an established proposal deterministically — still
+    through the authority plane — records the override, and keeps the run out
+    of policy-canary qualification."""
+    from jev_ultrafast.dream import CanaryMetrics, ExperienceStore, ExplorationPolicy
+    from jev_ultrafast.dreamlearn import CausalChoicePolicy, TrialChoiceModel
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    store = ExperienceStore(tmp_path / "exp.jsonl")
+    runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
+    runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
+    runner.exploration_policy = ExplorationPolicy()
+    model = TrialChoiceModel.fit(_causal_evidence())
+    p = runner.state["page"]
+    p["actions"] = [a for a in p["actions"] if a["id"] != "e2"]
+    p["fingerprint"] = fingerprint(p)
+    runner.experiment = {"causal_policy": CausalChoicePolicy(mode="active", trial_model=model)}
+    runner.state["decision"] = decision("e1")
+    runner.state["status"] = "predicted"
+    p = runner.state["page"]
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    assert runner.state["browser"].act.call_args.args[0]["id"] == "e3"
+    events = store.load()
+    applied = next(e for e in events if e["event"] == "causal_policy_applied")
+    assert applied["selected"] == "e3"
+    # The override is not a trial (no randomized assignment), and the run is
+    # not a clean sample of the exploration policy under test.
+    assert not any(e["event"] == "experiment_assigned" for e in events)
+    assert CanaryMetrics.from_events(events, ExplorationPolicy().digest).tasks == 0

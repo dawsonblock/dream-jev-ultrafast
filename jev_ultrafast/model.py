@@ -24,6 +24,20 @@ class DecisionBackend(Protocol):
     def decide(self, body: dict) -> dict: ...
 
 
+class ModelConnectionError(RuntimeError):
+    """The decision/text model endpoint could not be reached."""
+
+
+class ModelTimeoutError(ModelConnectionError):
+    """The decision/text model endpoint did not answer in time.
+
+    A distinct subclass so run termination reasons can separate ``timeout``
+    from ``network_failure``: the censoring taxonomy needs to tell an
+    unrelated infrastructure hiccup from a hang the candidate arm may have
+    caused.
+    """
+
+
 @dataclass
 class SystemOneBackend:
     """TypeSafe/SystemOne-compatible backend. The endpoint may be local or remote."""
@@ -52,8 +66,10 @@ def post_json(url, key, body):
             if key:
                 headers["Authorization"] = f"Bearer {key}"
             response = CLIENT.post(url, content=encoded, headers=headers)
+        except httpx.TimeoutException:
+            raise ModelTimeoutError("Model connection timed out; no action executed.") from None
         except httpx.HTTPError:
-            raise RuntimeError("Model connection failed; no action executed.") from None
+            raise ModelConnectionError("Model connection failed; no action executed.") from None
         if response.status_code in {429, 529, 503} and attempt < 2:
             time.sleep(0.5 * 2**attempt)
             continue

@@ -24,6 +24,8 @@ from typing import Iterable
 from .privacy import action_goal_overlap
 from .signing import (
     ANCHOR_DOMAIN,
+    EXPERIMENT_PLAN_DOMAIN,
+    EXPERIMENT_SIGNING_KEY_ENV,
     PROMOTION_SIGNING_KEY_ENV,
     PROMOTION_VERIFY_KEYS_ENV,
     REGISTRY_ANCHOR_DOMAIN,
@@ -51,7 +53,13 @@ SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", "jev-dream/3", SCHEMA_VERSION
 # execution — and enriches experiment_assigned with the pre-treatment context
 # (choice/proposal overlap and offered ranks, task identity) the
 # intention-to-treat estimator groups on.
-TCB_VERSION = "jev-ultrafast-tcb/0.12"
+# 0.13 adds structured censoring (run_finished.reason: operator_cancel,
+# browser_crash, timeout, …), the bounded treatment signature (effect class,
+# role, offered rank, workflow phase) on assignment records, and
+# domain-separated experiment-plan signatures — pools that predate it cannot
+# distinguish why a run was censored, and their trial cells lack the signature
+# coordinates that keep class-level deltas from silently generalizing.
+TCB_VERSION = "jev-ultrafast-tcb/0.13"
 SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.3",
     "jev-ultrafast-tcb/0.4",
@@ -62,6 +70,7 @@ SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.9",
     "jev-ultrafast-tcb/0.10",
     "jev-ultrafast-tcb/0.11",
+    "jev-ultrafast-tcb/0.12",
     TCB_VERSION,
 }
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
@@ -157,13 +166,75 @@ def experiment_plan_digest(plan: dict) -> str:
     """Canonical content digest of a stamped experiment plan.
 
     The digest covers every field of the plan — hypothesis, provenance, and
-    the bindings revalidated at execution (task key, state fingerprint, model
-    choice, offered catalogue, policy behavior) — so a stamped plan is an
-    immutable artifact: any post-hoc edit invalidates the digest instead of
-    silently reinterpreting the plan.
+    the bindings revalidated at execution (task key, family key, state
+    fingerprint, model choice, offered catalogue, policy behavior) — so a
+    stamped plan is an immutable artifact: any post-hoc edit invalidates the
+    digest instead of silently reinterpreting the plan. The ``digest`` field
+    and the ``authority`` signature block are excluded: the signature covers
+    the digest, not the other way around.
     """
-    material = {k: v for k, v in plan.items() if k != "digest"}
+    material = {k: v for k, v in plan.items() if k not in {"digest", "authority"}}
     return _stable_hash(json.dumps(material, sort_keys=True, separators=(",", ":")))
+
+
+def experiment_plan_signature(plan: dict, signer) -> dict:
+    """The domain-separated authority block for a stamped plan.
+
+    SHA-256 alone establishes *integrity* — anyone who can write the plan can
+    compute a valid digest. An Ed25519 signature over
+    ``jev-dream/experiment-plan/v1:<digest>`` establishes *provenance*: the
+    plan was stamped by whoever holds the improvement key. Execution
+    distinguishes ``digest_valid`` from ``authority_signature_valid``; with
+    trusted verification keys configured, an unsigned or forged plan fails
+    closed.
+    """
+    if signer is None:
+        return {}
+    return {
+        "key_id": signer.key_id,
+        "signature": signer.sign_hex(plan["digest"], EXPERIMENT_PLAN_DOMAIN),
+        "domain": EXPERIMENT_PLAN_DOMAIN.decode("ascii"),
+    }
+
+
+def experiment_plan_authority(plan: dict, trusted_keys) -> dict:
+    """Verify a plan's signature block.
+
+    Returns ``{"present", "signature_valid", "trusted"}``. ``trusted`` is
+    only meaningful when a trusted-key set is configured; a present signature
+    is always checked for self-consistency, so a forged self-claim fails even
+    in unsigned-compatibility mode.
+    """
+    authority = plan.get("authority")
+    if not isinstance(authority, dict) or not authority.get("signature"):
+        return {"present": False, "signature_valid": False, "trusted": False}
+    key_id = str(authority.get("key_id") or "")
+    digest = str(plan.get("digest") or "")
+    valid = bool(
+        key_id
+        and digest
+        and verify_signature(
+            key_id, digest, str(authority.get("signature") or ""), EXPERIMENT_PLAN_DOMAIN
+        )
+    )
+    trusted = bool(valid and trusted_keys and key_id in set(trusted_keys))
+    return {"present": True, "signature_valid": valid, "trusted": trusted}
+
+
+def experiment_plan_signer_from_env() -> EvidenceSigner | None:
+    """The improvement authority's plan signer.
+
+    ``JEV_EXPERIMENT_SIGNING_KEY`` takes precedence, falling back to the
+    promotion key and then the evidence key — the same precedence chain the
+    policy registry uses for promotion authority. No key configured means
+    plans are stamped digest-only and the execution plane stays in explicit
+    unsigned-compatibility mode.
+    """
+    return (
+        EvidenceSigner.from_env(EXPERIMENT_SIGNING_KEY_ENV)
+        or EvidenceSigner.from_env(PROMOTION_SIGNING_KEY_ENV)
+        or EvidenceSigner.from_env()
+    )
 
 
 @dataclass(frozen=True)
@@ -1124,18 +1195,35 @@ class ReplaySimulator:
                             "policy_behavior_digest": policy.behavior_digest,
                             # The digest of whichever prior generated this
                             # hypothesis — observational ChoiceModel or causal
-                            # TrialChoiceModel — bound into the stamped plan.
+                            # TrialChoiceModel — bound into the stamped plan,
+                            # plus the explicit channel so a live agent can
+                            # tell causal provenance from correlational.
                             "choice_model_digest": getattr(proposal_source, "digest", None),
+                            "origin": (
+                                "randomized" if proposal_source is trial_model else "observational"
+                            ),
+                            "causal_model_digest": (
+                                getattr(trial_model, "digest", None)
+                                if proposal_source is trial_model
+                                else None
+                            ),
                             "selected_prior": (
                                 {
                                     "p_progress": prediction["p_progress"],
                                     "uncertainty": prediction["uncertainty"],
                                     "confident": prediction["confident"],
+                                    "source": prediction.get("source"),
                                 }
                                 if prediction is not None
                                 else None
                             ),
                             "expected_delta": expected_delta,
+                            "expected_uncertainty": (
+                                proposal.get("uncertainty")
+                                if proposal.get("uncertainty") is not None
+                                else (prediction or {}).get("uncertainty")
+                            ),
+                            "created_at_ms": int(time.time() * 1000),
                         })
             if transition.selected_kind != "wait" and not transition.page_changed:
                 no_progress += 1
@@ -1604,6 +1692,8 @@ class DreamImprover:
         choice_model=None,
         trial_model=None,
         trials=None,
+        scheduler=None,
+        plan_signer=None,
     ) -> DreamReport:
         worlds = list(worlds)
         splits = split_worlds(worlds)
@@ -1790,21 +1880,38 @@ class DreamImprover:
                 for summary in base_results["train"].per_world
                 for proposal in summary.get("experiment_proposals", ())
             ]
-            # Highest expected-delta hypotheses first, capped: a proposal is a
-            # hypothesis to test under the real authority plane, not a finding.
-            collected.sort(key=lambda p: (-p["expected_delta"], p["world"], p["step"]))
+            # The scheduler decides which *unresolved* hypothesis is worth a
+            # real browser experiment (expected information gain × practical
+            # importance ÷ evidence coverage); settled hypotheses are dropped
+            # entirely. Without a scheduler the historical expected-delta
+            # order is the fallback. A proposal is a hypothesis to test under
+            # the real authority plane, not a finding.
+            if scheduler is not None:
+                collected = scheduler.rank(collected, estimates=trials)
+            else:
+                collected.sort(key=lambda p: (-p["expected_delta"], p["world"], p["step"]))
             stamped = []
             for proposal in collected[:24]:
                 # A stamped plan is an immutable ExperimentPlan: the digest
                 # binds the hypothesis *and* the bindings the agent
-                # revalidates live (task, state, model choice, offered
+                # revalidates live (task, family, state, model choice, offered
                 # catalogue, policy behavior, originating model, world pool
                 # and evidence head). A plan whose bindings no longer hold is
-                # stale and must be discarded, never reinterpreted.
-                item = {"schema": EXPERIMENT_PLAN_SCHEMA, **proposal}
+                # stale and must be discarded, never reinterpreted. With a
+                # signer configured the plan additionally carries a
+                # domain-separated Ed25519 authority block — digest integrity
+                # alone is not provenance.
+                item = {
+                    k: v
+                    for k, v in {"schema": EXPERIMENT_PLAN_SCHEMA, **proposal}.items()
+                    if k not in {"estimate", "scheduler"}
+                }
                 item["world_pool_digest"] = pool_digest
                 item["evidence_head_hash"] = evidence_head_hash
                 item["digest"] = experiment_plan_digest(item)
+                authority = experiment_plan_signature(item, plan_signer)
+                if authority:
+                    item["authority"] = authority
                 stamped.append(item)
             experiment_proposals = tuple(stamped)
 
@@ -1932,8 +2039,13 @@ def _canary_run_summaries(
         # A run that executed an experiment arm is not a clean
         # policy-performance sample: the deviated step belongs to the
         # scheduler, not to the policy being qualified. Trials qualify
-        # evidence only through CounterfactualTrials, never promotion.
-        if any(event.get("experiment") for event in run_events):
+        # evidence only through CounterfactualTrials, never promotion. The
+        # same holds for a run whose action was overridden by an active
+        # causal policy — that choice was the causal prior's, not the
+        # exploration policy's.
+        if any(event.get("experiment") for event in run_events) or any(
+            event.get("event") == "causal_policy_applied" for event in run_events
+        ):
             continue
         final = next((e for e in reversed(run_events) if e.get("event") == "run_finished"), None)
         # Runs abandoned before a terminal decision are not task outcomes.

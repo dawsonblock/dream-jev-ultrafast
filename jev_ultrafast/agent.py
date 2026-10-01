@@ -11,22 +11,49 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .browser import Browser, StalePage
+from .browser import Browser, BrowserError, StalePage
 from .dream import (
     ExperienceStore,
     ExplorationPolicy,
     PolicyRegistry,
     candidate_catalog_digest,
+    experiment_plan_authority,
     experiment_plan_digest,
     task_key,
 )
-from .model import action_space, candidate_actions, choose, field_context, field_text
-from .policy import DefaultActionPolicy, assess_payload
+from .model import (
+    ModelConnectionError,
+    ModelTimeoutError,
+    action_space,
+    candidate_actions,
+    choose,
+    field_context,
+    field_text,
+)
+from .policy import DefaultActionPolicy, assess_payload, classify_effect
 from .privacy import action_goal_overlap, redact_text, sanitize_url, tokenize
 from .questions import MAX_STEPS
+from .signing import verify_keys_from_env
 from .trace import DreamTraceRecorder, compact_candidate
 
 TERMINAL_STATUSES = {"claimed_done", "done", "blocked"}
+
+
+def _abort_reason(exc: BaseException) -> str:
+    """Structured termination reason for an exception that ended a run.
+
+    Deliberately closed and coarse: only the failure shapes the runtime can
+    actually distinguish get their own reason. Everything else is
+    ``agent_exception`` — an unattributable interruption, censored as missing
+    data rather than scored as a task failure.
+    """
+    if isinstance(exc, ModelTimeoutError):
+        return "timeout"
+    if isinstance(exc, ModelConnectionError):
+        return "network_failure"
+    if isinstance(exc, BrowserError):
+        return "browser_crash"
+    return "agent_exception"
 
 
 def _page_site(page: dict) -> str | None:
@@ -71,6 +98,7 @@ class Agent:
         task_family=None,
         instance_id=None,
         experiment=None,
+        experiment_verify_keys=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -110,7 +138,24 @@ class Agent:
                 raise ValueError("experiment proposals must be a list of stamped plans")
             if experiment.get("model") is None and not proposals:
                 raise ValueError("experiment requires a fitted model or stamped proposals")
+            causal_policy = experiment.get("causal_policy")
+            if causal_policy is not None:
+                if getattr(causal_policy, "mode", None) not in {"shadow", "canary", "active"}:
+                    raise ValueError(
+                        "experiment causal_policy must expose a mode of shadow/canary/active"
+                    )
+                if not callable(getattr(causal_policy, "rank", None)):
+                    raise ValueError("experiment causal_policy must expose rank()")
         self.experiment = experiment
+        # Trusted Ed25519 keys for experiment-plan provenance. With keys
+        # configured, a stamped plan must carry a valid domain-separated
+        # signature or it is stale; without them the agent stays in explicit
+        # unsigned-compatibility mode (digest integrity only).
+        if isinstance(experiment_verify_keys, str):
+            experiment_verify_keys = experiment_verify_keys.replace(",", " ").split()
+        self.experiment_verify_keys = {
+            str(key) for key in (experiment_verify_keys or ()) if key
+        }
         # Task identity for experiment-plan binding and assignment records —
         # normalized exactly as the trace recorder stores them.
         self.task_family = str(task_family).strip()[:256] if task_family else None
@@ -250,6 +295,81 @@ class Agent:
             raise ValueError("Verifier must return bool or a dict containing passed: bool")
         return result
 
+    def _experiment_verify_keys(self) -> set[str]:
+        """Trusted experiment-plan verification keys.
+
+        Configured on the agent, in the experiment config, or through
+        ``JEV_EXPERIMENT_VERIFY_KEYS``/``JEV_EXPERIMENT_VERIFY_KEY``. With no
+        keys the agent stays in explicit unsigned-compatibility mode: digest
+        integrity is still enforced, and a *present* signature must still
+        verify against its own key, but provenance is not established.
+        """
+        keys = set(getattr(self, "experiment_verify_keys", None) or ())
+        experiment = getattr(self, "experiment", None) or {}
+        configured = experiment.get("verify_keys")
+        if isinstance(configured, str):
+            keys.update(part for part in configured.replace(",", " ").split() if part)
+        elif configured:
+            keys.update(str(key) for key in configured)
+        keys |= verify_keys_from_env(
+            "JEV_EXPERIMENT_VERIFY_KEYS", "JEV_EXPERIMENT_VERIFY_KEY"
+        )
+        return keys
+
+    def _annotated_offered(self):
+        """Offered catalogue with goal_overlap on the redacted-goal basis.
+
+        The priors were trained on the trace's sanitized features; raw page
+        actions carry no goal_overlap, so annotate it — otherwise every live
+        proposal is scored on a zeroed overlap the model never saw in
+        training. The token basis is the redacted goal, matching what the
+        recorder stored.
+        """
+        goal_tokens = set(tokenize(redact_text(self.state["goal"], 4096)))
+        offered = [
+            {**c, "goal_overlap": action_goal_overlap(c, goal_tokens)}
+            for c in self._perception()[0]
+        ]
+        return offered, goal_tokens
+
+    def _live_proposal(self, *, trial_model, causal_policy, offered_now, selected, action, page):
+        """The live (unstamped) experimental proposal for this step.
+
+        A canary-mode ``CausalChoicePolicy`` speaks first — its combined
+        ranking may propose only under randomized assignment — then the
+        standalone trial prior. A ``shadow`` or ``active`` policy contributes
+        nothing here: shadow observes, and active overrides the choice
+        directly (a different code path) rather than entering the randomized
+        assignment.
+        """
+        model_choice = {
+            "id": selected,
+            "kind": action.get("kind"),
+            "goal_overlap": next(
+                (c.get("goal_overlap") for c in offered_now if c.get("id") == selected),
+                None,
+            ),
+        }
+        if causal_policy is not None and getattr(causal_policy, "mode", "shadow") == "canary":
+            proposal = _model_call(
+                causal_policy.proposal,
+                offered_now,
+                model_choice=model_choice,
+                task_family=getattr(self, "task_family", None),
+                site=_page_site(page),
+            )
+            if proposal is not None:
+                return proposal
+        if trial_model is None:
+            return None
+        return _model_call(
+            trial_model.choose,
+            offered_now,
+            model_choice=model_choice,
+            task_family=getattr(self, "task_family", None),
+            site=_page_site(page),
+        )
+
     def _match_stamped_plan(self, proposals, *, page, offered_now, model_choice_id, goal_tokens):
         """Match a stamped DreamReport experiment plan against the live step.
 
@@ -257,24 +377,39 @@ class Agent:
         hypothesis — "when the model picks A in this state under this policy,
         try B" — so every binding recorded at stamping time must still hold:
         the plan digest verifies over its own content, the task key matches
-        this run's goal, the state fingerprint matches, the live model choice
-        equals the recorded historical choice the hypothesis was conditioned
-        on, the proposal is still in the offered catalogue, and the offered
-        catalogue and policy behavior digests still hold. A plan that claims
-        this state but fails any binding is *stale*: it is discarded, never
-        reinterpreted, and its staleness suppresses an ad-hoc substitution for
-        the same step — the experiment that runs must be the one that was
-        stamped, or none.
+        this run's goal, the **task family** matches the run's family (a
+        hypothesis generated under one family must not execute under another,
+        even when goal text and state happen to collide), the state
+        fingerprint matches, the live model choice equals the recorded
+        historical choice, the proposal is still offered, and the offered
+        catalogue and policy behavior digests still hold. Freshness is
+        enforced too: a live causal model that now *refutes* the plan's
+        proposal makes the plan stale — an old hypothesis does not survive
+        newer randomized evidence. With trusted verification keys configured,
+        the plan must additionally carry a valid domain-separated signature
+        (``authority_signature_valid``), so a hand-written plan cannot
+        masquerade as one stamped by the improvement authority.
+
+        A plan that claims this state but fails any binding is *stale*: it is
+        discarded, never reinterpreted, and its staleness suppresses an ad-hoc
+        substitution for the same step — the experiment that runs must be the
+        one that was stamped, or none.
         """
         stale: list[str] = []
         policy = getattr(self, "exploration_policy", None)
         live_policy_digest = getattr(policy, "behavior_digest", None)
         live_task_key = task_key(self.state["goal"])
+        # Family identity is ``normalized task_family or task_key`` — the same
+        # derivation the replay worlds use for ``family_key``.
+        live_family = str(getattr(self, "task_family", None) or "").strip().lower() or live_task_key
         offered_ids = {a["id"] for a in offered_now}
         live_offered_digest = candidate_catalog_digest(
             [compact_candidate(candidate, goal_tokens) for candidate in offered_now]
         )
-        trial_model = (getattr(self, "experiment", None) or {}).get("model")
+        experiment = getattr(self, "experiment", None) or {}
+        trial_model = experiment.get("model")
+        trusted_keys = self._experiment_verify_keys()
+        require_model = bool(experiment.get("require_current_model"))
         for plan in proposals:
             if not isinstance(plan, dict) or plan.get("state") != page.get("fingerprint"):
                 continue
@@ -283,7 +418,10 @@ class Agent:
                 reasons.append("digest")
             if not plan.get("task_key") or plan.get("task_key") != live_task_key:
                 reasons.append("task_key")
-            if (plan.get("historical") or {}).get("id") != model_choice_id:
+            if plan.get("family_key") != live_family:
+                reasons.append("task_family")
+            historical = plan.get("historical") or {}
+            if historical.get("id") != model_choice_id:
                 reasons.append("model_choice")
             proposal = plan.get("proposal")
             if not isinstance(proposal, dict) or proposal.get("id") not in offered_ids:
@@ -292,12 +430,39 @@ class Agent:
                 reasons.append("offered_catalogue")
             if plan.get("policy_behavior_digest") != live_policy_digest:
                 reasons.append("policy_behavior")
+            if plan.get("choice_model_digest") is not None:
+                if trial_model is None:
+                    # "Available and current": with require_current_model the
+                    # originating model must be supplied and match; otherwise
+                    # proposals-only execution stays possible in explicit
+                    # unsigned mode.
+                    if require_model:
+                        reasons.append("choice_model")
+                elif getattr(trial_model, "digest", None) != plan["choice_model_digest"]:
+                    reasons.append("choice_model")
             if (
-                plan.get("choice_model_digest") is not None
-                and trial_model is not None
-                and getattr(trial_model, "digest", None) != plan["choice_model_digest"]
+                trial_model is not None
+                and isinstance(proposal, dict)
+                and callable(getattr(trial_model, "refuted", None))
+                and _model_call(
+                    trial_model.refuted,
+                    kind=str(proposal.get("kind") or "unknown"),
+                    goal_overlap=None,
+                    model_kind=str(historical.get("kind") or "unknown"),
+                    model_overlap=historical.get("goal_overlap"),
+                    task_family=getattr(self, "task_family", None),
+                    site=_page_site(page),
+                )
             ):
-                reasons.append("choice_model")
+                reasons.append("trial_refuted")
+            authority = experiment_plan_authority(plan, trusted_keys)
+            if trusted_keys:
+                if not authority["trusted"]:
+                    reasons.append(
+                        "plan_signature" if authority["present"] else "plan_unsigned"
+                    )
+            elif authority["present"] and not authority["signature_valid"]:
+                reasons.append("plan_signature")
             if not reasons:
                 return plan, []
             stale.extend(reasons)
@@ -334,6 +499,8 @@ class Agent:
             # that never executed — it dies with the decision it belonged to.
             state["granted_approval"] = None
             state["experiment_assignment"] = None
+            state["causal_shadow"] = None
+            state["causal_override"] = None
             if state["status"] in TERMINAL_STATUSES:
                 raise ValueError("This run has stopped. Start a fresh demo.")
             if state["status"] == "approval_required":
@@ -356,6 +523,29 @@ class Agent:
                     "elapsed_ms": self._elapsed(),
                 }
             )
+            # Shadow mode: annotate what the combined causal policy *would*
+            # prefer, with provenance, without letting it influence anything.
+            causal_policy = (getattr(self, "experiment", None) or {}).get("causal_policy")
+            if causal_policy is not None and getattr(causal_policy, "mode", "shadow") == "shadow":
+                offered_now, _goal_tokens = self._annotated_offered()
+                choice_id = state["decision"]["choice"]
+                state["causal_shadow"] = _model_call(
+                    causal_policy.rank,
+                    offered_now,
+                    model_choice={
+                        "id": choice_id,
+                        "kind": next(
+                            (a.get("kind") for a in offered_now if a.get("id") == choice_id),
+                            None,
+                        ),
+                        "goal_overlap": next(
+                            (a.get("goal_overlap") for a in offered_now if a.get("id") == choice_id),
+                            None,
+                        ),
+                    },
+                    task_family=getattr(self, "task_family", None),
+                    site=_page_site(state["page"]),
+                )
             state["status"] = "predicted"
             return self.snapshot()
 
@@ -465,6 +655,52 @@ class Agent:
             # survive the round trip instead of silently reverting.
             experiment_meta = state.pop("experiment_assignment", None)
             experiment = getattr(self, "experiment", None)
+            causal_policy = (experiment or {}).get("causal_policy")
+            if (
+                experiment_meta is None
+                and causal_policy is not None
+                and getattr(causal_policy, "mode", "shadow") == "active"
+                and not state.get("experiment_spent")
+            ):
+                # Active mode (operator-gated): a randomized-established
+                # beneficial proposal overrides the model's own choice. The
+                # action stays bounded to the offered catalogue and still
+                # passes the full authority plane below; the override is
+                # recorded as provenance and keeps the run out of canary
+                # qualification, because the executed action was the causal
+                # policy's, not the exploration policy's.
+                offered_now, _goal_tokens = self._annotated_offered()
+                override = _model_call(
+                    causal_policy.proposal,
+                    offered_now,
+                    model_choice={
+                        "id": selected,
+                        "kind": action.get("kind"),
+                        "goal_overlap": next(
+                            (c.get("goal_overlap") for c in offered_now if c.get("id") == selected),
+                            None,
+                        ),
+                    },
+                    task_family=getattr(self, "task_family", None),
+                    site=_page_site(page),
+                )
+                if (
+                    override is not None
+                    and override.get("id") is not None
+                    and override["id"] != selected
+                    and override["id"] in {a["id"] for a in offered_now}
+                ):
+                    state["experiment_spent"] = True
+                    state["causal_override"] = override
+                    if getattr(self, "dream_recorder", None):
+                        self.dream_recorder.event(
+                            "causal_policy_applied",
+                            state=page.get("fingerprint"),
+                            selected=override["id"],
+                            proposal=override,
+                        )
+                    selected = override["id"]
+                    action = next(a for a in offered_now if a["id"] == selected)
             if experiment_meta is None and experiment is not None and not state.get("experiment_spent"):
                 # On-policy counterfactual trial: when the fitted choice prior
                 # prefers a different *offered* action than the model picked,
@@ -473,19 +709,10 @@ class Agent:
                 # through every authority check below — a trial can never
                 # bypass policy assessment, approval, or payload review.
                 trial_model = experiment.get("model")
+                causal_policy = experiment.get("causal_policy")
                 rate = float(experiment.get("rate", 0.0) or 0.0)
                 if 0.0 < rate <= 1.0:
-                    offered_now = self._perception()[0]
-                    # The prior was trained on the trace's sanitized features;
-                    # raw page actions carry no goal_overlap, so annotate it —
-                    # otherwise every live proposal is scored on a zeroed
-                    # overlap the model never saw in training. The token basis
-                    # is the redacted goal, matching what the recorder stored.
-                    goal_tokens = set(tokenize(redact_text(state["goal"], 4096)))
-                    offered_now = [
-                        {**c, "goal_overlap": action_goal_overlap(c, goal_tokens)}
-                        for c in offered_now
-                    ]
+                    offered_now, goal_tokens = self._annotated_offered()
                     # A stamped DreamReport experiment plan is immutable: it
                     # executes only when every stamped binding still verifies
                     # (digest, task, state, model choice, offered catalogue,
@@ -513,27 +740,13 @@ class Agent:
                         else (
                             None
                             if stale_reasons
-                            else (
-                                _model_call(
-                                    trial_model.choose,
-                                    offered_now,
-                                    model_choice={
-                                        "id": selected,
-                                        "kind": action.get("kind"),
-                                        "goal_overlap": next(
-                                            (
-                                                c.get("goal_overlap")
-                                                for c in offered_now
-                                                if c.get("id") == selected
-                                            ),
-                                            None,
-                                        ),
-                                    },
-                                    task_family=getattr(self, "task_family", None),
-                                    site=_page_site(page),
-                                )
-                                if trial_model is not None
-                                else None
+                            else self._live_proposal(
+                                trial_model=trial_model,
+                                causal_policy=causal_policy,
+                                offered_now=offered_now,
+                                selected=selected,
+                                action=action,
+                                page=page,
                             )
                         )
                     )
@@ -607,6 +820,25 @@ class Agent:
                         # assignment must be self-contained: an assigned-but-
                         # never-executed trial leaves no transition to recover
                         # this context from.
+                        # The bounded treatment signature of both arms of the
+                        # divergence, frozen at assignment time: kind, effect
+                        # class, element role, overlap, offered rank, and the
+                        # workflow phase (browser-action count so far). Trial
+                        # analysis keys on these coordinates so a measured
+                        # delta generalizes over a treatment *class* with
+                        # provenance, never silently onto an arbitrary action
+                        # ID that was never randomized.
+                        proposal_action = next(
+                            (a for a in offered_now if a["id"] == proposal["id"]),
+                            None,
+                        )
+                        phase = len(
+                            [
+                                h
+                                for h in state["history"]
+                                if h.get("kind") not in {"verification", "approval"}
+                            ]
+                        )
                         experiment_meta = {
                             "state": page.get("fingerprint"),
                             "arm": arm,
@@ -615,6 +847,16 @@ class Agent:
                             ),
                             "proposal_id": proposal["id"],
                             "proposal_kind": proposal.get("kind"),
+                            "proposal_effect": (
+                                classify_effect(proposal_action).value
+                                if proposal_action is not None
+                                else None
+                            ),
+                            "proposal_role": (
+                                proposal_action.get("role")
+                                if proposal_action is not None
+                                else None
+                            ),
                             "proposal_overlap": (
                                 offered_now[proposal_rank].get("goal_overlap", 0)
                                 if proposal_rank is not None
@@ -623,12 +865,15 @@ class Agent:
                             "proposal_offered_rank": proposal_rank,
                             "model_choice_id": selected,
                             "model_choice_kind": action.get("kind"),
+                            "model_choice_effect": classify_effect(action).value,
+                            "model_choice_role": action.get("role"),
                             "model_choice_overlap": (
                                 offered_now[selected_rank].get("goal_overlap", 0)
                                 if selected_rank is not None
                                 else None
                             ),
                             "model_choice_offered_rank": selected_rank,
+                            "phase": phase,
                             "task_key": task_key(state["goal"]),
                             "task_family": getattr(self, "task_family", None),
                             "site": _page_site(page),
@@ -856,16 +1101,32 @@ class Agent:
 
     def run(self):
         while self.state["status"] not in TERMINAL_STATUSES | {"approval_required"}:
-            yield self.command("tick")
+            try:
+                yield self.command("tick")
+            except Exception as exc:
+                # A run that dies mid-flight records *why* before close()
+                # writes its aborted run_finished: the censoring taxonomy
+                # must be able to tell an operator cancel from a crash the
+                # candidate arm may have caused.
+                self.state["abort_reason"] = _abort_reason(exc)
+                raise
 
-    def close(self):
+    def close(self, reason: str | None = None):
         try:
             if getattr(self, "dream_recorder", None) and not self.dream_recorder.finished:
                 status = self.state.get("status", "closed")
-                self.dream_recorder.finish(
-                    status=status if status in TERMINAL_STATUSES else "aborted",
-                    verified=self.state.get("verified", False),
-                )
+                if status in TERMINAL_STATUSES:
+                    self.dream_recorder.finish(status=status, verified=self.state.get("verified", False))
+                else:
+                    self.dream_recorder.finish(
+                        status="aborted",
+                        verified=False,
+                        reason=(
+                            reason
+                            or self.state.get("abort_reason")
+                            or "operator_cancel"
+                        ),
+                    )
         finally:
             self.browser.close()
 

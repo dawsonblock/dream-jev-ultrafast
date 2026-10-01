@@ -81,23 +81,27 @@ def _transition(selected="sel", offered=40, tokens=400, latency_ms=120, page_cha
 
 
 def _run_events(run_id, transitions, *, status="done", verified=True, task_key="t", policy=None,
-                task_family=None):
+                task_family=None, reason=None):
     """Wrap bare transition dicts as one run with a terminal outcome.
 
     Trajectory-success labeling keys positives off the run's verified finish,
     so tests expressing outcome semantics must write real run boundaries —
-    loose transitions carry no outcome and fit as negatives.
+    loose transitions carry no outcome and fit as negatives. ``reason`` is the
+    structured termination cause recorded on an aborted run_finished.
     """
     policy = policy or ExplorationPolicy()
     started = {"event": "run_started", "run_id": run_id, "task_key": task_key, "goal": "g",
                "policy": policy.to_dict(), "policy_digest": policy.digest}
     if task_family is not None:
         started["task_family"] = task_family
+    finished = {"event": "run_finished", "run_id": run_id, "task_key": task_key,
+                "status": status, "verified": verified}
+    if reason is not None:
+        finished["reason"] = reason
     events = [
         started,
         *[{**t, "run_id": run_id, "task_key": task_key} for t in transitions],
-        {"event": "run_finished", "run_id": run_id, "task_key": task_key,
-         "status": status, "verified": verified},
+        finished,
     ]
     return events
 
@@ -814,8 +818,22 @@ def test_choice_model_page_churn_on_failed_runs_is_not_progress():
     assert pred["p_progress"] < 0.05
 
 
+def _trial_key(*, family="", site="", m_kind="click", m_effect="unknown", m_role="unknown",
+               m_ov="0", m_rank="0-4", m_phase="unknown", p_kind="click",
+               p_effect="unknown", p_role="unknown", p_ov="1", p_rank="0-4",
+               p_phase="unknown"):
+    """The 14-coordinate trial context string: family and site are separate
+    coordinates, then the bounded treatment signature of both arms."""
+    return "|".join([
+        family, site, m_kind, m_effect, m_role, m_ov, m_rank, m_phase,
+        p_kind, p_effect, p_role, p_ov, p_rank, p_phase,
+    ])
+
+
 def _trial_meta(run_id, arm, *, propensity=0.5, kind="click", model_kind="click",
-                overlap=1, model_overlap=0, task_family=None, site=None):
+                overlap=1, model_overlap=0, task_family=None, site=None,
+                proposal_effect=None, model_effect=None, proposal_role=None,
+                model_role=None, phase=None, proposal_rank=0, model_rank=1):
     """The experiment record exactly as the agent stamps it at assignment
     time — arm, propensity, and the pre-treatment context of both sides."""
     meta = {
@@ -825,23 +843,36 @@ def _trial_meta(run_id, arm, *, propensity=0.5, kind="click", model_kind="click"
         "proposal_id": f"p{run_id}",
         "proposal_kind": kind,
         "proposal_overlap": overlap,
-        "proposal_offered_rank": 0,
+        "proposal_offered_rank": proposal_rank,
         "model_choice_id": f"m{run_id}",
         "model_choice_kind": model_kind,
         "model_choice_overlap": model_overlap,
-        "model_choice_offered_rank": 1,
+        "model_choice_offered_rank": model_rank,
         "task_key": "t",
     }
     if task_family is not None:
         meta["task_family"] = task_family
     if site is not None:
         meta["site"] = site
+    if proposal_effect is not None:
+        meta["proposal_effect"] = proposal_effect
+    if model_effect is not None:
+        meta["model_choice_effect"] = model_effect
+    if proposal_role is not None:
+        meta["proposal_role"] = proposal_role
+    if model_role is not None:
+        meta["model_choice_role"] = model_role
+    if phase is not None:
+        meta["phase"] = phase
     return meta
 
 
 def _trial_run(run_id, arm, *, success=True, page=True, propensity=0.5, kind="click",
                model_kind="click", overlap=1, model_overlap=0, status=None, verified=None,
-               executed=True, task_family=None, site=None):
+               executed=True, task_family=None, site=None, reason=None,
+               proposal_effect=None, model_effect=None, proposal_role=None,
+               model_role=None, phase=None, proposal_rank=0, model_rank=1,
+               latency_ms=0, tokens=0, approvals=0):
     """One randomized trial as a complete run: the ``experiment_assigned``
     record written at randomization, the executed arm's transition (absent
     when the trial was denied or vetoed before execution), and the
@@ -852,6 +883,9 @@ def _trial_run(run_id, arm, *, success=True, page=True, propensity=0.5, kind="cl
         run_id, arm, propensity=propensity, kind=kind, model_kind=model_kind,
         overlap=overlap, model_overlap=model_overlap,
         task_family=task_family, site=site,
+        proposal_effect=proposal_effect, model_effect=model_effect,
+        proposal_role=proposal_role, model_role=model_role, phase=phase,
+        proposal_rank=proposal_rank, model_rank=model_rank,
     )
     proposal_id, model_id = meta["proposal_id"], meta["model_choice_id"]
     transitions = []
@@ -860,6 +894,8 @@ def _trial_run(run_id, arm, *, success=True, page=True, propensity=0.5, kind="cl
             **_transition(
                 selected=proposal_id if arm == "candidate" else model_id,
                 page_changed=page,
+                latency_ms=latency_ms,
+                tokens=tokens,
                 candidates=[
                     {"id": proposal_id, "kind": kind, "label": "Go", "goal_overlap": overlap},
                     {"id": model_id, "kind": model_kind, "label": "M", "goal_overlap": model_overlap},
@@ -872,7 +908,12 @@ def _trial_run(run_id, arm, *, success=True, page=True, propensity=0.5, kind="cl
         transitions,
         status=status or ("done" if success else "blocked"),
         verified=success if verified is None else verified,
+        reason=reason,
     )
+    if approvals:
+        events = events[:1] + [
+            {"event": "approval_required", "run_id": run_id, "task_key": "t"}
+        ] * int(approvals) + events[1:]
     # The assignment lands at randomization — before authority, approval, and
     # any transition — tagged with the same run and task.
     assignment = {
@@ -897,8 +938,8 @@ def test_counterfactual_trials_ipw_estimates():
     estimates = trials.estimate()
     # Context keys on the model choice's features (overlap 0), not the
     # executed arm's — otherwise the two arms would land in different cells.
-    assert set(estimates) == {"*|click|0|click|1"}
-    arms = estimates["*|click|0|click|1"]
+    assert set(estimates) == {_trial_key()}
+    arms = estimates[_trial_key()]
     assert arms["candidate"]["assigned"] == arms["candidate"]["trials"] == 8
     assert arms["candidate"]["executed"] == 8
     assert arms["candidate"]["censored"] == 0
@@ -906,13 +947,21 @@ def test_counterfactual_trials_ipw_estimates():
     assert arms["control"]["trials"] == 8
     assert abs(arms["control"]["p_success"] - 0.25) < 1e-9
     assert abs(arms["delta"] - 0.5) < 1e-9
-    assert arms["delta_reliable"] is True
-    assert arms["candidate"]["reliable"] and arms["control"]["reliable"]
+    assert arms["support_sufficient"] is True
+    assert arms["candidate"]["support_sufficient"] and arms["control"]["support_sufficient"]
+    # 8+8 with a 0.5 delta is *supported* but not *established*: the
+    # sequentially valid interval still crosses zero, so the honest status is
+    # unresolved — "enough samples" is not "we know the sign".
+    assert arms["effect_status"] == "unresolved"
+    assert arms["unresolved_reason"] == "ci_crosses_zero"
     # Uncertainty intervals bracket the point estimate on effective support.
     for arm in ("candidate", "control"):
         lo, hi = arms[arm]["p_success_ci"]
         assert lo <= arms[arm]["p_success"] <= hi
     assert arms["delta_ci"][0] <= arms["delta"] <= arms["delta_ci"][1]
+    # The sequential interval is never narrower than the fixed-sample one.
+    assert arms["sequential_delta_ci"][0] <= arms["delta_ci"][0]
+    assert arms["sequential_delta_ci"][1] >= arms["delta_ci"][1]
 
 
 def test_counterfactual_trials_require_recorded_propensity():
@@ -946,13 +995,14 @@ def test_counterfactual_trials_endpoint_is_run_outcome_not_page_change():
     for i in range(4):
         events += _trial_run(f"c{i}", "candidate", success=False, page=True)
         events += _trial_run(f"k{i}", "control", success=True, page=False)
-    arms = CounterfactualTrials.fit(events).estimate()["*|click|0|click|1"]
+    arms = CounterfactualTrials.fit(events).estimate()[_trial_key()]
     assert arms["candidate"]["p_success"] < 0.01
     assert arms["control"]["p_success"] > 0.99
     assert arms["candidate"]["p_page_changed"] > 0.99
     assert arms["control"]["p_page_changed"] < 0.01
     assert arms["delta"] < -0.9
-    assert arms["delta_reliable"] is False  # 4 trials/arm is below MIN_ESS
+    assert arms["support_sufficient"] is False  # 4 trials/arm is below MIN_ESS
+    assert arms["effect_status"] == "insufficient_data"
 
 
 def test_counterfactual_trials_partial_success_counts_verified_share():
@@ -965,12 +1015,12 @@ def test_counterfactual_trials_partial_success_counts_verified_share():
         + _trial_run("r2", "candidate", success=True, page=True)
     )
     estimates = CounterfactualTrials.fit(events).estimate()
-    arm = estimates["*|click|0|click|1"]["candidate"]
+    arm = estimates[_trial_key()]["candidate"]
     assert arm["assigned"] == arm["trials"] == arm["executed"] == 2
     assert arm["censored"] == 0
     assert abs(arm["p_success"] - 0.5) < 1e-9  # one verified success of two
     assert arm["p_page_changed"] > 0.99  # both steps moved the page
-    assert arm["reliable"] is False  # two effective samples is not evidence
+    assert arm["support_sufficient"] is False  # two effective samples is not evidence
 
 
 def test_counterfactual_trials_context_is_arm_independent():
@@ -982,8 +1032,8 @@ def test_counterfactual_trials_context_is_arm_independent():
     # model's overlap-0 choice. Both arms must land in the model choice's cell.
     events = _trial_run("x", "candidate") + _trial_run("y", "control")
     estimates = CounterfactualTrials.fit(events).estimate()
-    assert set(estimates) == {"*|click|0|click|1"}
-    entry = estimates["*|click|0|click|1"]
+    assert set(estimates) == {_trial_key()}
+    entry = estimates[_trial_key()]
     assert set(entry["candidate"]) and set(entry["control"])
     assert "delta" in entry
 
@@ -1001,7 +1051,7 @@ def test_counterfactual_trials_itt_counts_unexecuted_assignments():
         # (blocked) with no transition ever recorded for the trial.
         events += _trial_run(f"c{i}", "candidate", executed=False, success=False)
         events += _trial_run(f"k{i}", "control", success=True)
-    arms = CounterfactualTrials.fit(events).estimate()["*|click|0|click|1"]
+    arms = CounterfactualTrials.fit(events).estimate()[_trial_key()]
     candidate = arms["candidate"]
     assert candidate["assigned"] == 8
     assert candidate["executed"] == 0  # no transition — yet still analyzed
@@ -1010,27 +1060,33 @@ def test_counterfactual_trials_itt_counts_unexecuted_assignments():
     assert candidate["p_page_changed"] is None  # no step ever moved a page
     assert arms["control"]["p_success"] > 0.99
     assert arms["delta"] < -0.9
-    assert arms["delta_reliable"] is True
+    assert arms["support_sufficient"] is True
+    assert arms["effect_status"] == "harmful"
 
 
 def test_counterfactual_trials_censor_unmeasured_runs():
     """Aborted/interrupted runs are censored — counted as assigned but not as
-    failures — in both the primary endpoint and the analyzed denominator."""
+    failures — in both the primary endpoint and the analyzed denominator, and
+    the structured termination reason survives into the report."""
     from jev_ultrafast.dreamlearn import CounterfactualTrials
 
     events = (
         # Aborted: operator closed the session — no outcome measured.
-        _trial_run("a", "candidate", status="aborted", verified=False)
+        _trial_run("a", "candidate", status="aborted", verified=False, reason="operator_cancel")
         # Interrupted: the store holds no run_finished at all.
         + _trial_run("t", "candidate")[:-1]
         # A real measured failure for contrast.
         + _trial_run("f", "candidate", success=False)
     )
-    arm = CounterfactualTrials.fit(events).estimate()["*|click|0|click|1"]["candidate"]
+    arm = CounterfactualTrials.fit(events).estimate()[_trial_key()]["candidate"]
     assert arm["assigned"] == 3
     assert arm["censored"] == 2
     assert arm["trials"] == 1  # only the measured failure is analyzed
     assert arm["p_success"] < 0.01
+    # The causes stay distinguishable: an operator cancel is not a crash, and
+    # an interrupted recording is not invented as either.
+    assert arm["terminations"] == {"operator_cancel": 1, "unknown_abort": 1}
+    assert abs(arm["censor_rate"] - 2 / 3) < 1e-9
 
 
 def test_counterfactual_trials_legacy_transition_only_pool():
@@ -1043,7 +1099,7 @@ def test_counterfactual_trials_legacy_transition_only_pool():
         for event in _trial_run("x", "candidate", success=False)
         if event["event"] != "experiment_assigned"
     ]
-    arm = CounterfactualTrials.fit(events).estimate()["*|click|0|click|1"]["candidate"]
+    arm = CounterfactualTrials.fit(events).estimate()[_trial_key()]["candidate"]
     assert arm["assigned"] == arm["trials"] == arm["executed"] == 1
     assert arm["p_success"] < 0.01
 
@@ -1057,10 +1113,10 @@ def test_counterfactual_trials_unreliable_below_effective_support():
     for i in range(4):
         events += _trial_run(f"c{i}", "candidate", success=i < 3)
         events += _trial_run(f"k{i}", "control", success=i < 1)
-    arms = CounterfactualTrials.fit(events).estimate()["*|click|0|click|1"]
+    arms = CounterfactualTrials.fit(events).estimate()[_trial_key()]
     assert abs(arms["delta"] - 0.5) < 1e-9
     assert arms["candidate"]["ess"] < CounterfactualTrials.MIN_ESS
-    assert arms["delta_reliable"] is False
+    assert arms["support_sufficient"] is False
     assert arms["delta_ci"][1] - arms["delta_ci"][0] > 0.5  # honestly wide
 
 
@@ -1124,8 +1180,8 @@ def test_report_surfaces_trial_estimates_without_gating(tmp_path):
         worlds, ExplorationPolicy())
     assert with_trials.trials_digest == trials.digest
     estimates = with_trials.trial_estimates
-    assert estimates["*|click|0|click|1"]["candidate"]["assigned"] == 1
-    assert estimates["*|click|0|click|1"]["candidate"]["executed"] == 1
+    assert estimates[_trial_key()]["candidate"]["assigned"] == 1
+    assert estimates[_trial_key()]["candidate"]["executed"] == 1
     # Trial estimates are annotation only — identical promotion outcome.
     assert with_trials.promotion.approved == without.promotion.approved
     assert with_trials.selected.digest == without.selected.digest
@@ -1257,21 +1313,61 @@ def test_choice_model_excludes_experiment_transitions():
 
 
 def test_trials_scope_stratifies_family_site_global():
-    """The 5-field context keeps scopes separate: f:<family> wins over
-    s:<site>, and an unscoped assignment pools under ``*``."""
+    """Task family and site are *separate* stored coordinates: a
+    family-carrying trial keeps its site stratum, and an unscoped assignment
+    pools under empty coordinates."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
     events = (
         _trial_run("a", "candidate", task_family="flights")
         + _trial_run("b", "candidate", site="example.com")
         + _trial_run("c", "candidate")
     )
     trials = CounterfactualTrials.fit(events)
-    assert {cell[0] for cell in trials.cells} == {"f:flights", "s:example.com", "*"}
+    # The collapsed v0.8.3 scope would have stored f:flights / s:example.com /
+    # * — losing the site dimension for the family-carrying trial.
+    assert {(cell[0], cell[1]) for cell in trials.cells} == {
+        ("flights", ""), ("", "example.com"), ("", ""),
+    }
     estimates = trials.estimate()
     assert set(estimates) == {
-        "f:flights|click|0|click|1",
-        "s:example.com|click|0|click|1",
-        "*|click|0|click|1",
+        _trial_key(family="flights"),
+        _trial_key(site="example.com"),
+        _trial_key(),
     }
+
+
+def test_trials_site_fallback_survives_family_indexing():
+    """The audit's repro: a thin family stratum must fall back to the *site*
+    stratum — not skip straight to a pooled estimate dominated by unrelated
+    sites. Site evidence is only reachable when family and site are stored as
+    separate coordinates."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    events = []
+    # Thin "flights" family evidence at another site: positive but tiny.
+    events += _trial_run("t1", "candidate", success=True, task_family="flights",
+                         site="other.example")
+    events += _trial_run("t2", "control", success=True, task_family="flights",
+                         site="other.example")
+    # Strong site evidence at target.example: clearly positive.
+    for i in range(8):
+        events += _trial_run(f"s{i}", "candidate", success=True, site="target.example")
+        events += _trial_run(f"k{i}", "control", success=False, site="target.example")
+    # Strong unrelated-site evidence: negative, and it would dominate a naive
+    # pooled fallback.
+    for i in range(8):
+        events += _trial_run(f"o{i}", "candidate", success=False, site="other.example")
+        events += _trial_run(f"p{i}", "control", success=True, site="other.example")
+    resolved = CounterfactualTrials.fit(events).resolve(
+        task_family="flights", site="target.example",
+        model_kind="click", model_overlap=0,
+        proposal_kind="click", proposal_overlap=1,
+    )
+    assert resolved["level"] == "site"
+    assert resolved["support_sufficient"]
+    assert resolved["delta"] > 0.9
+    assert resolved["effect_status"] == "beneficial"
 
 
 def test_trials_resolve_family_stratum_wins_when_reliable():
@@ -1285,24 +1381,26 @@ def test_trials_resolve_family_stratum_wins_when_reliable():
         task_family="flights", model_kind="click", model_overlap=0,
         proposal_kind="click", proposal_overlap=1)
     assert resolved["level"] == "family"
-    assert resolved["delta"] > 0.9 and resolved["delta_reliable"]
+    assert resolved["delta"] > 0.9 and resolved["support_sufficient"]
+    assert resolved["effect_status"] == "beneficial"
 
 
 def test_trials_resolve_thin_scope_falls_through_to_pooled():
-    """A 2-assignment family stratum cannot hide a 24-assignment pooled
-    refutation — resolution keeps walking until a stratum is reliable."""
+    """A 2-assignment family stratum cannot hide a 40-assignment pooled
+    refutation — resolution keeps walking until a stratum is supported."""
     events = []
     for i in range(2):
         events += _trial_run(f"fc{i}", "candidate", success=True, task_family="flights")
         events += _trial_run(f"fk{i}", "control", success=False, task_family="flights")
-    for i in range(10):
+    for i in range(20):
         events += _trial_run(f"c{i}", "candidate", success=False, task_family="banking")
         events += _trial_run(f"k{i}", "control", success=True, task_family="banking")
     resolved = CounterfactualTrials.fit(events).resolve(
         task_family="flights", model_kind="click", model_overlap=0,
         proposal_kind="click", proposal_overlap=1)
     assert resolved["level"] == "pooled"
-    assert resolved["delta_reliable"] and resolved["delta"] < 0
+    assert resolved["support_sufficient"] and resolved["delta"] < 0
+    assert resolved["effect_status"] == "harmful"
 
 
 def test_trials_resolve_sparse_returns_unreliable_specific_estimate():
@@ -1316,7 +1414,8 @@ def test_trials_resolve_sparse_returns_unreliable_specific_estimate():
         task_family="flights", model_kind="click", model_overlap=0,
         proposal_kind="click", proposal_overlap=1)
     assert resolved["level"] == "family"
-    assert resolved["delta_reliable"] is False
+    assert resolved["support_sufficient"] is False
+    assert resolved["effect_status"] == "insufficient_data"
     # A hypothesis that was never tried resolves to nothing.
     assert CounterfactualTrials.fit([]).resolve(task_family="x") is None
 
@@ -1424,7 +1523,8 @@ def test_trial_choice_model_serialization_roundtrip():
     model = TrialChoiceModel.fit(events)
     clone = TrialChoiceModel.from_dict(model.to_dict())
     assert clone.digest == model.digest
-    assert clone.version == "jev-causal/1"
+    assert clone.version == "jev-causal/2"
+    assert clone.trials.version == "jev-trials/5"
 
 
 def test_improve_suppresses_trial_refuted_proposals(tmp_path):
