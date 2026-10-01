@@ -159,7 +159,10 @@ def ask(state: dict, question: dict, *, context: str, previews: dict | None = No
         + (f"Actions already taken:\n{history}\n" if history else "")
         + "Do not repeat an action that already ran unless it clearly remains the next step. "
         "A control whose current value already matches the goal is done — "
-        "move on to an unsatisfied part of the goal.\n\n"
+        "move on to an unsatisfied part of the goal. "
+        "If a goal part names a value that belongs in a field (place, date, "
+        "name) and that field is empty or wrong, choose the operation that "
+        "fills it — clicking other controls cannot satisfy it.\n\n"
         + f"Options:\n{listing}\n"
     )
     last_error = ""
@@ -246,6 +249,17 @@ def decide(body: dict) -> dict:
                     suffix += " — already satisfies the goal"
                 suffix += ")"
             previews[operation] = ", ".join(labels) + suffix
+        # Grounding for the operation choice: fields that still hold no value
+        # are where goal text like "in Lisbon" can only ever go — small models
+        # otherwise keep clicking filter/search controls around them.
+        if operation == "TYPE_TEXT":
+            empty = [
+                str(c.get("element") or k)[:60]
+                for k, c in criteria.items()
+                if isinstance(c, dict) and c.get("current_value") in (None, "")
+            ]
+            if empty:
+                previews[operation] += f" — EMPTY FIELDS: {', '.join(empty[:4])}"
     operation, op_confidence, usage = ask(
         state, operation_q, context="operation", previews=previews
     )
