@@ -4,7 +4,7 @@ Validation date: 2026-09-30, updated for the v0.7.1 hardening pass, the v0.8.0 a
 
 ## Reproduced in this build environment
 
-- `uv run pytest`: **361 passed** against the project environment (including the new `tests/test_causal_validity.py` adversarial suite); browser/CDP calls in unit tests remain mocked by the tests themselves.
+- `uv run pytest`: **363 passed** against the project environment (including the new `tests/test_causal_validity.py` adversarial suite); browser/CDP calls in unit tests remain mocked by the tests themselves.
 - `uv run python scripts/check_guards.py` against a dedicated headless Chrome 154 instance (`BU_CDP_URL=http://127.0.0.1:9222`, throwaway `--user-data-dir`): **all 34 live browser guard checks passed** — re-run at v0.9.0 (Chrome 154.0.8037.59) after the structured-abort changes to `browser.py`/`model.py` — including the adversarial mid-input cases (post-observe commit swap, same-label node swap between press and release, pre-release overlay, pre-release geometry drift, mid-press page mutation, pointer-state hygiene after abort, nested-descendant interception, post-observe hidden/detached targets, structured `ctx` propagation) and the atomic-guarantee check proving `DOM_ATOMIC` clicks dispatch no press/release window for mid-event sabotage. Earlier validation against Chrome 152 also passed; the first v0.4.0 live run had exposed a latent defect that mocked tests could not see, which is why CI now runs this suite in a `live-guards` job on every change.
 - `uv run ruff check .`: passed.
 - `uv build`: passed.
@@ -16,7 +16,7 @@ Validation date: 2026-09-30, updated for the v0.7.1 hardening pass, the v0.8.0 a
 - JSON parse for bundled JSON evidence files: passed.
 - DREAM CLI smoke: `verify` and `improve --stage` completed against synthetic hash-chained evidence; the staged record bound the parent policy, world-pool digest, split-manifest digest, evidence head, and TCB versions.
 - Cross-process serialization tests: four spawned processes appended 40 events to one JSONL store and the resulting chain verified; three spawned processes ran 30 serialized suspend/resume registry writes without lost updates.
-- Release ZIP re-verification (post-packaging): a `git archive` of the v0.9.0 commit (`artifacts/jev-ultrafast-0.9.0-dream.zip`, 62 files, no caches/build junk) was extracted to a clean directory and run through the same gates — `MANIFEST.sha256` 62/62, `uv run ruff check .`, **361 passed**, `node --check` for both JS files, `compileall`, `uv lock --check`, `uv build`, TOML/JSON parse, and the live Chrome 154 guard suite (**34/34**) — all passed against the packaged tree, not merely before packaging.
+- Release ZIP re-verification (post-packaging): a `git archive` of the v0.9.0 commit (`artifacts/jev-ultrafast-0.9.0-dream.zip`, 62 files, no caches/build junk) was extracted to a clean directory and run through the same gates — `MANIFEST.sha256` 62/62, `uv run ruff check .`, **363 passed**, `node --check` for both JS files, `compileall`, `uv lock --check`, `uv build`, TOML/JSON parse, and the live Chrome 154 guard suite (**34/34**) — all passed against the packaged tree, not merely before packaging.
 
 ## Remaining environment limitation
 

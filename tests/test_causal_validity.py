@@ -389,6 +389,47 @@ def test_duplicate_assignment_records_count_once():
     assert trials.duplicates == 1
 
 
+def test_resolve_never_answers_a_contrast_from_one_arm():
+    """A bucket holding only one arm cannot answer "is assigning B better
+    than A" — resolution keeps walking and returns None, while the raw arm
+    stays visible in ``estimate()`` reporting. Regression: a one-armed
+    resolution used to crash ``predict`` and the scheduler with KeyError."""
+    events = []
+    for i in range(8):
+        events += _trial_run(f"c{i}", "candidate", success=True)
+    trials = CounterfactualTrials.fit(events)
+    assert trials.resolve(
+        model_kind="click", model_overlap=0, proposal_kind="click", proposal_overlap=1
+    ) is None
+    arm = trials.estimate()[next(iter(trials.estimate()))]["candidate"]
+    assert arm["assigned"] == 8  # the arm itself is still reported
+    model = TrialChoiceModel(trials=trials)
+    prediction = model.predict(kind="click", goal_overlap=1)
+    assert prediction["p_progress"] is None
+    assert model.choose(
+        [{"id": "p", "kind": "click", "goal_overlap": 1}],
+        model_choice={"id": "m", "kind": "click", "goal_overlap": 0},
+    ) is None
+    ranked = ExperimentScheduler(budget=5).rank([{
+        "world": "w", "step": 0, "expected_delta": 0.5,
+        "proposal": {"id": "p", "kind": "click", "goal_overlap": 1},
+        "historical": {"kind": "click", "goal_overlap": 0}}], estimates=trials)
+    assert [r["world"] for r in ranked] == ["w"]
+    assert ranked[0]["scheduler"]["support_fraction"] == 0.0
+
+
+def test_v4_migration_preserves_fractional_weights():
+    """v4 cells migrate verbatim: IPW weighted sums are fractional whenever
+    propensities differ, and truncating them would silently corrupt the
+    estimate (regression: ``int()`` on migration)."""
+    v4 = ("*", "click", "0", "click", "1", "candidate",
+          2, 2, 2, 0, 1.0, 2.3333333333333335, 3.0, 2.0, 2.3333333333333335)
+    trials = CounterfactualTrials.from_dict({"version": "jev-trials/4", "cells": [v4]})
+    entry = trials.estimate()[next(iter(trials.estimate()))]["candidate"]
+    assert abs(entry["p_success"] - 1.0 / 2.3333333333333335) < 1e-12
+    assert abs(entry["ess"] - 2.3333333333333335 ** 2 / 3.0) < 1e-12
+
+
 # ------------------------------------------------------ serialization / v4
 
 

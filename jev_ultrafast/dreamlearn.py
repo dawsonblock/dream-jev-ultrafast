@@ -969,6 +969,11 @@ def _migrate_v4_trial_cells(cells) -> tuple[tuple, ...]:
     (effect class, role, offered rank, phase) migrate as ``"unknown"`` —
     wildcards, never invented values — and censored counts migrate under
     ``unknown_abort`` because v4 evidence did not record why a run stopped.
+
+    Values are carried over verbatim: the four counters are ints, but the
+    weighted sums are floats and *fractional* whenever IPW weights differ
+    (propensity 1/3 → weight 3.0 against others) — casting them would
+    silently truncate the evidence.
     """
     migrated = []
     for cell in cells:
@@ -979,7 +984,7 @@ def _migrate_v4_trial_cells(cells) -> tuple[tuple, ...]:
             family, site = "", scope[2:]
         else:
             family, site = "", ""
-        stats = [int(v) for v in counts[:9]]
+        stats = list(counts[:9])
         key = (
             family, site,
             str(mk), "unknown", "unknown", str(mov), "unknown", "unknown",
@@ -1475,6 +1480,12 @@ class CounterfactualTrials:
                         slot[i] += v
                 if not bucket:
                     continue
+                if "candidate" not in bucket or "control" not in bucket:
+                    # A bucket holding only one arm cannot answer a *contrast*
+                    # question — "is assigning B better than A" needs both
+                    # sides. The arm stays visible in ``estimate()`` reporting;
+                    # resolution simply keeps walking (and may return None).
+                    continue
                 contrast = {
                     **self._contrast(bucket, min_effect=min_effect, weights=weights),
                     "level": level,
@@ -1645,7 +1656,7 @@ class TrialChoiceModel:
         if best is None:
             return None
         delta, candidate, estimate = best
-        control_p = estimate["control"]["p_success"]
+        control_p = estimate["control"]["p_success"] if "control" in estimate else 0.0
         ci = estimate.get("delta_ci") or [delta, delta]
         return {
             "id": candidate.get("id"),
@@ -1710,9 +1721,23 @@ class TrialChoiceModel:
                 "source": "randomized",
             }
         delta = estimate.get("delta")
-        control_p = estimate["control"]["p_success"]
+        control = estimate.get("control")
+        if delta is None or control is None:
+            # Defensive: a resolved estimate always carries both arms, but a
+            # one-armed bucket must never crash a caller — it simply predicts
+            # nothing.
+            return {
+                "p_progress": None,
+                "n": int((estimate.get("candidate") or {}).get("trials", 0)),
+                "level": estimate.get("level"),
+                "signature_level": estimate.get("signature_level"),
+                "effect_status": estimate.get("effect_status") or "insufficient_data",
+                "support_sufficient": bool(estimate.get("support_sufficient")),
+                "source": "randomized",
+            }
+        control_p = control["p_success"]
         return {
-            "p_progress": min(max(control_p + delta, 0.0), 1.0) if delta is not None else None,
+            "p_progress": min(max(control_p + delta, 0.0), 1.0),
             "delta": delta,
             "n": estimate["control"]["trials"] + estimate["candidate"]["trials"],
             "level": estimate.get("level"),
@@ -1896,7 +1921,7 @@ class ExperimentScheduler:
             status = (estimate or {}).get("effect_status")
             if status in {"beneficial", "harmful"}:
                 continue
-            if estimate is not None:
+            if estimate is not None and "candidate" in estimate and "control" in estimate:
                 sequential = estimate.get("sequential_delta_ci")
                 width = (sequential[1] - sequential[0]) if sequential else 1.0
                 support = min(
@@ -1907,6 +1932,8 @@ class ExperimentScheduler:
                 if importance_basis is None:
                     importance_basis = estimate.get("delta")
             else:
+                # No contrast (or no evidence at all): maximum uncertainty,
+                # importance from the prior's own expected delta.
                 width = 1.0
                 support_fraction = 0.0
                 importance_basis = None
