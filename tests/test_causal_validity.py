@@ -755,3 +755,192 @@ def _divergent_worlds(store_path):
         run(f"bad{i}", "low", False, "blocked")
     store_path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
     return ReplayWorld.from_events(events)
+
+
+def test_execution_step_never_matches_on_absent_ids():
+    """A sparse assignment meta must not claim an unrelated step.
+
+    ``proposal_id=None`` matching a step that lacks a proposal id is a
+    ``None == None`` coincidence, not evidence — misattribution would fold a
+    different experiment's execution (and its treatment-signature context)
+    into this arm's cell.
+    """
+    step = {
+        "event": "transition",
+        "experiment": {"experiment_id": "other", "proposal_id": "pB", "model_choice_id": "mB"},
+    }
+    tagged = {"event": "transition", "experiment": {"experiment_id": "tagged"}}
+    meta = {"experiment_id": "self", "proposal_id": None, "model_choice_id": None}
+    assert CounterfactualTrials._execution_step(meta, [step, tagged]) is None
+    # Identity still resolves when the meta is informative.
+    assert (
+        CounterfactualTrials._execution_step(
+            {"experiment_id": "nope", "proposal_id": "pB", "model_choice_id": "mB"},
+            [step, tagged],
+        )
+        is step
+    )
+    # ...and a run with exactly one tagged step still resolves by singleton.
+    assert (
+        CounterfactualTrials._execution_step(
+            {"experiment_id": "self", "proposal_id": None}, [tagged]
+        )
+        is tagged
+    )
+
+
+def test_loose_assignment_records_deduplicate():
+    """Runless ``experiment_assigned`` events deduplicate like run-scoped ones.
+
+    A loose record is censored-by-construction evidence, but two copies of the
+    same assignment are still one unit of analysis — without the dedupe the
+    arm's censor counts inflate silently.
+    """
+    meta = {
+        "experiment_id": "e1",
+        "proposal_id": "p",
+        "model_choice_id": "m",
+        "arm": "candidate",
+        "assignment_probability": 0.5,
+        "proposal_kind": "click",
+        "model_choice_kind": "click",
+    }
+    trials = CounterfactualTrials.fit(
+        [{"event": "experiment_assigned", "experiment": meta} for _ in range(3)]
+    )
+    estimate = trials.estimate()
+    arm = next(iter(estimate.values()))["candidate"]
+    assert arm["assigned"] == 1 and arm["censored"] == 1
+    assert trials.duplicates == 2
+
+
+def test_context_coordinates_never_carry_the_join_delimiter():
+    """Page-controlled metadata cannot collide two contexts under ``|``.join.
+
+    A role like ``"a|b"`` is attacker-shaped input: left raw, two distinct
+    signature tuples would merge into one estimate key and one cell would
+    silently overwrite the other's evidence in reporting.
+    """
+    def assignment(run_id, arm, m_role, p_role):
+        return {
+            "event": "experiment_assigned",
+            "run_id": run_id,
+            "experiment": {
+                "experiment_id": f"e{run_id}",
+                "arm": arm,
+                "assignment_probability": 0.5,
+                "model_choice_kind": "click",
+                "model_choice_role": m_role,
+                "proposal_id": "p",
+                "proposal_kind": "click",
+                "proposal_role": p_role,
+            },
+        }
+
+    events = [
+        assignment("a1", "candidate", "a|b", "c"),
+        assignment("a2", "control", "a|b", "c"),
+        assignment("b1", "candidate", "a", "b|c"),
+        assignment("b2", "control", "a", "b|c"),
+    ]
+    trials = CounterfactualTrials.fit(events)
+    # Two distinct cells, two distinct estimate keys — the adversarial values
+    # sanitized so neither silently overwrote the other's evidence.
+    assert len(trials.estimate()) == 2
+    for key in trials.estimate():
+        assert len(key.split("|")) == 14  # exactly the 14 coordinates joined
+    # Stored cells are normalized on load as well: a legacy or hostile cell
+    # cannot smuggle the delimiter back in.
+    loaded = CounterfactualTrials.from_dict(
+        {
+            "cells": [
+                ["f|x", "", "click", "unknown", "a|b", "unknown", "unknown",
+                 "unknown", "click", "unknown", "c", "unknown", "unknown",
+                 "unknown", "candidate"] + [1] * 20
+            ]
+        }
+    )
+    assert all("|" not in str(v) for v in loaded.cells[0][:15])
+
+
+def test_causal_override_steps_stay_out_of_observational_fit():
+    """An active-mode override is the causal prior's choice, not the policy's.
+
+    The step is tagged ``causal_override`` on the transition — it must not
+    teach the observational prior that the recorded policy chose it, exactly
+    like an experiment-tagged step.
+    """
+    events = []
+    for i in range(10):
+        run = f"o{i}"
+        events += [
+            {"event": "run_started", "run_id": run, "task_key": "t", "goal": "g",
+             "task_family": "f", "policy": ExplorationPolicy().to_dict()},
+            {"event": "transition", "run_id": run, "task_key": "t",
+             "selected": {"id": "pX", "kind": "fill", "label": "P"},
+             "candidates": [{"id": "pX", "kind": "fill", "goal_overlap": 2}],
+             "page_changed": True,
+             "causal_override": {"id": "pX", "mode": "active"}},
+            {"event": "run_finished", "run_id": run, "task_key": "t",
+             "status": "done", "verified": True},
+        ]
+    model = ChoiceModel.fit(events)
+    assert model.samples == 0
+    assert model.predict(kind="fill", goal_overlap=2, rank=0, task_family="f")["n"] == 0
+
+
+def test_signature_role_rank_and_phase_are_queryable():
+    """The richer signature coordinates are live, not just stored.
+
+    A query that supplies matching role values resolves at ``full``; one whose
+    roles differ must visibly back off through ``minus_phase_rank_role`` —
+    while still answering from the pooled evidence underneath.
+    """
+    events = []
+    for i in range(12):
+        meta = _trial_meta(
+            f"s{i}", "candidate", task_family="f",
+        )
+        meta["model_choice_role"] = "button"
+        meta["proposal_role"] = "button"
+        events += [
+            {"event": "run_started", "run_id": f"s{i}", "task_key": "t", "goal": "g",
+             "task_family": "f"},
+            {"event": "experiment_assigned", "run_id": f"s{i}", "task_key": "t",
+             "experiment": meta},
+            {"event": "run_finished", "run_id": f"s{i}", "task_key": "t",
+             "status": "done", "verified": True},
+        ]
+    for i in range(12):
+        meta = _trial_meta(f"c{i}", "control", task_family="f")
+        meta["model_choice_role"] = "button"
+        meta["proposal_role"] = "button"
+        events += [
+            {"event": "run_started", "run_id": f"c{i}", "task_key": "t", "goal": "g",
+             "task_family": "f"},
+            {"event": "experiment_assigned", "run_id": f"c{i}", "task_key": "t",
+             "experiment": meta},
+            {"event": "run_finished", "run_id": f"c{i}", "task_key": "t",
+             "status": "blocked", "verified": False},
+        ]
+    trials = CounterfactualTrials.fit(events)
+    matched = trials.resolve(
+        task_family="f", model_role="button", proposal_role="button"
+    )
+    assert matched["signature_level"] == "full"
+    assert matched["effect_status"] == "beneficial"
+    divergent = trials.resolve(
+        task_family="f", model_role="link", proposal_role="link"
+    )
+    assert divergent is not None
+    assert divergent["signature_level"] == "minus_phase_rank_role"
+    # The backoff still answers — a mismatched role generalizes over the cell,
+    # it does not erase the evidence.
+    assert divergent["effect_status"] == "beneficial"
+    # And the TrialChoiceModel query path exercises the same coordinates.
+    model = TrialChoiceModel(trials=trials)
+    estimate = model._estimate(
+        proposal_kind="click", proposal_role="link", model_kind="click",
+        model_role="link", task_family="f",
+    )
+    assert estimate["signature_level"] == "minus_phase_rank_role"

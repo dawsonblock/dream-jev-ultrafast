@@ -280,17 +280,27 @@ def phase_bucket(step) -> str:
     return _bucket(value, (3, 10), _PHASE_BUCKETS)
 
 
-def _role_bucket(role) -> str:
-    text = str(role or "").strip().lower()
+def _coord(value) -> str:
+    """A trial-context coordinate, safe for the ``|``-joined context key.
+
+    Page metadata is attacker-shaped input: a role like ``"a|b"`` would let two
+    distinct context tuples collide under ``"|".join`` — silently merging two
+    cells into one estimate key. The join delimiter can never survive into a
+    stored coordinate.
+    """
+    text = str(value).replace("|", " ").strip()
     return text if text else "unknown"
+
+
+def _role_bucket(role) -> str:
+    return _coord(str(role or "").lower())
 
 
 def _effect_bucket(effect) -> str:
     """Effect class of an action, as the deterministic classifier names it."""
     if effect is None:
         return "unknown"
-    text = str(getattr(effect, "value", effect)).strip().lower()
-    return text if text else "unknown"
+    return _coord(str(getattr(effect, "value", effect)).lower())
 
 
 # The bounded treatment signature: which *kind* of intervention this arm was,
@@ -303,8 +313,6 @@ _SIGNATURE_FIELDS = (
     "m_kind", "m_effect", "m_role", "m_ov", "m_rank", "m_phase",
     "p_kind", "p_effect", "p_role", "p_ov", "p_rank", "p_phase",
 )
-# Drop order for hierarchical backoff: least-identifying coordinates first.
-_SIGNATURE_DROP_ORDER = ("phase", "rank", "role", "effect", "overlap", "kind")
 
 
 def _transitions(events: Iterable[dict]):
@@ -577,9 +585,13 @@ class ChoiceModel:
                 # An experiment-tagged transition was chosen by the trial
                 # scheduler, not by the policy under study — fitting it as an
                 # ordinary choice would mix randomized evidence into the
-                # correlational prior. It belongs to CounterfactualTrials.
+                # correlational prior. It belongs to CounterfactualTrials. The
+                # same holds for an active causal-policy override: that action
+                # was the causal prior's choice, not the recorded policy's.
                 None
-                if outcome == "censored" or event.get("experiment")
+                if outcome == "censored"
+                or event.get("experiment")
+                or event.get("causal_override")
                 else outcome == "success"
             ),
         )
@@ -794,13 +806,13 @@ def _trial_context(meta: dict, transition: dict | None) -> tuple[str, ...]:
     records, and anything still unknown stays ``"unknown"`` — a wildcard
     dimension during resolution, never a fabricated value.
     """
-    family = str(meta.get("task_family") or "").strip().lower()
-    site = str(meta.get("site") or "").strip().lower()
+    family = str(meta.get("task_family") or "").replace("|", " ").strip().lower()
+    site = str(meta.get("site") or "").replace("|", " ").strip().lower()
     selected = (transition.get("selected") or {}) if transition is not None else {}
-    m_kind = str(meta.get("model_choice_kind") or "unknown")
+    m_kind = str(meta.get("model_choice_kind") or "unknown").replace("|", " ")
     if m_kind == "unknown":
-        m_kind = str(selected.get("kind") or "unknown")
-    p_kind = str(meta.get("proposal_kind") or "unknown")
+        m_kind = str(selected.get("kind") or "unknown").replace("|", " ")
+    p_kind = str(meta.get("proposal_kind") or "unknown").replace("|", " ")
     if p_kind == "unknown" and transition is not None:
         p_cand = next(
             (
@@ -811,7 +823,7 @@ def _trial_context(meta: dict, transition: dict | None) -> tuple[str, ...]:
             None,
         )
         if p_cand is not None:
-            p_kind = str(p_cand.get("kind") or "unknown")
+            p_kind = str(p_cand.get("kind") or "unknown").replace("|", " ")
     return (
         family,
         site,
@@ -930,9 +942,8 @@ def _newcombe(candidate: dict, control: dict, *, z: float = 1.96) -> list[float]
     """
     pc, pk = candidate["p_success"], control["p_success"]
     delta = pc - pk
-    lc, _uc = _wilson_interval(pc, candidate["ess"], z)
+    lc, uc = _wilson_interval(pc, candidate["ess"], z)
     lk, uk = _wilson_interval(pk, control["ess"], z)
-    _lc2, uc = _wilson_interval(pc, candidate["ess"], z)
     return [
         delta - math.sqrt((pc - lc) ** 2 + (uk - pk) ** 2),
         delta + math.sqrt((uc - pc) ** 2 + (pk - lk) ** 2),
@@ -944,9 +955,10 @@ def _signature_masks(known: list[str]) -> list[tuple[str, tuple[str, ...]]]:
 
     Each mask names the coordinates still enforced; the rest are wildcards
     merged by summation. The order is most specific first, dropping phase,
-    rank, role, effect class, overlap, and finally kind — a bounded,
-    auditable hierarchy that lets thin signature cells borrow support from
-    coarser ones without ever mixing unrelated strata or inventing values.
+    rank, role, effect class, and overlap — a bounded, auditable hierarchy
+    that lets thin signature cells borrow support from coarser ones without
+    ever mixing unrelated strata or inventing values. ``kind`` is the floor:
+    it is never dropped, so click evidence can never answer a fill proposal.
     """
     enforced = list(known)
     masks = [("full", tuple(enforced))]
@@ -1192,13 +1204,26 @@ class CounterfactualTrials:
                 # observed at execution time.
                 for step in trial_steps:
                     record(step["experiment"], outcome, reason, step.get("page_changed"), step, run_costs)
+        loose_seen: set = set()
         for event in loose:
             # No run means no measurable outcome — the assignment is real but
-            # censored by construction, with no recorded cause.
+            # censored by construction, with no recorded cause. Dedup applies
+            # here too: a loose record replayed twice is still one unit.
             if event.get("event") == "experiment_assigned" and isinstance(
                 event.get("experiment"), dict
             ):
-                record(event["experiment"], "censored", "unknown_abort", None, None, (0, 0, 0))
+                meta = event["experiment"]
+                identity = (
+                    meta.get("experiment_id"),
+                    meta.get("proposal_id"),
+                    meta.get("model_choice_id"),
+                    meta.get("arm"),
+                )
+                if identity in loose_seen:
+                    duplicates += 1
+                    continue
+                loose_seen.add(identity)
+                record(meta, "censored", "unknown_abort", None, None, (0, 0, 0))
             elif event.get("event") == "transition" and isinstance(event.get("experiment"), dict):
                 record(
                     event["experiment"], "censored", "unknown_abort",
@@ -1232,17 +1257,27 @@ class CounterfactualTrials:
             if match is not None:
                 return match
         proposal_id = meta.get("proposal_id")
-        match = next(
-            (
-                t
-                for t in trial_steps
-                if (t.get("experiment") or {}).get("proposal_id") == proposal_id
-                and (t.get("experiment") or {}).get("model_choice_id")
-                == meta.get("model_choice_id")
-            ),
-            None,
-        )
-        return match if match is not None else (trial_steps[0] if len(trial_steps) == 1 else None)
+        if proposal_id is not None:
+            model_choice_id = meta.get("model_choice_id")
+            match = next(
+                (
+                    t
+                    for t in trial_steps
+                    if (t.get("experiment") or {}).get("proposal_id") == proposal_id
+                    and (
+                        model_choice_id is None
+                        or (t.get("experiment") or {}).get("model_choice_id")
+                        == model_choice_id
+                    )
+                ),
+                None,
+            )
+            if match is not None:
+                return match
+        # A meta with no disambiguating ids must not match a step by
+        # ``None == None`` — that would attribute a different experiment's
+        # execution to this assignment. Only a single tagged step is safe.
+        return trial_steps[0] if len(trial_steps) == 1 else None
 
     def estimate(self, context: str | None = None) -> dict:
         """Self-normalized IPW intention-to-treat estimates per context/arm.
@@ -1417,8 +1452,10 @@ class CounterfactualTrials:
            and pooling unrelated tasks must not override it.
         2. **Treatment signature** — within a stratum, the full signature is
            tried first, then coordinates are dropped in order (phase, rank,
-           role, effect class, overlap, kind) until a mask has both arms with
-           support. Coordinates the caller does not know are wildcards from
+           role, effect class, overlap) until a mask has both arms with
+           support. ``kind`` is never dropped: it is the signature floor, so
+           evidence about one operation kind can never answer for another.
+           Coordinates the caller does not know are wildcards from
            the start; unknown *stored* values only match once their coordinate
            is dropped.
 
@@ -1440,13 +1477,13 @@ class CounterfactualTrials:
                 return "unknown"
 
         query = {
-            "m_kind": str(model_kind or "unknown") or "unknown",
+            "m_kind": str(model_kind or "unknown").replace("|", " ") or "unknown",
             "m_effect": _effect_bucket(model_effect),
             "m_role": _role_bucket(model_role),
             "m_ov": _overlap(model_overlap),
             "m_rank": _rank(model_rank),
             "m_phase": phase_bucket(phase),
-            "p_kind": str(proposal_kind or "unknown") or "unknown",
+            "p_kind": str(proposal_kind or "unknown").replace("|", " ") or "unknown",
             "p_effect": _effect_bucket(proposal_effect),
             "p_role": _role_bucket(proposal_role),
             "p_ov": _overlap(proposal_overlap),
@@ -1455,8 +1492,8 @@ class CounterfactualTrials:
         }
         known = [field for field in _SIGNATURE_FIELDS if query[field] != "unknown"]
         masks = _signature_masks(known)
-        family = str(task_family or "").strip().lower()
-        host = str(site or "").strip().lower()
+        family = str(task_family or "").replace("|", " ").strip().lower()
+        host = str(site or "").replace("|", " ").strip().lower()
         levels = []
         if family and host:
             levels.append("family+site")
@@ -1519,6 +1556,13 @@ class CounterfactualTrials:
             version = "jev-trials/5"
         if any(len(c) != TRIAL_CELL_LEN for c in cells):
             raise ValueError("Unsupported counterfactual-trials cell arity")
+        # Coordinates are join-delimiter-free by construction at fit time;
+        # normalize stored cells too so a hostile or legacy value can never
+        # collide two distinct contexts under estimate()'s "|".join key.
+        cells = tuple(
+            tuple(str(v).replace("|", " ") for v in cell[:_TRIAL_KEY_LEN]) + cell[_TRIAL_KEY_LEN:]
+            for cell in cells
+        )
         return cls(
             cells=cells,
             duplicates=int(payload.get("duplicates", 0) or 0),
@@ -1589,9 +1633,14 @@ class TrialChoiceModel:
         proposal_kind: str,
         proposal_overlap=None,
         proposal_effect=None,
+        proposal_role=None,
+        proposal_rank=None,
         model_kind: str = "unknown",
         model_overlap=None,
         model_effect=None,
+        model_role=None,
+        model_rank=None,
+        phase=None,
         task_family: str | None = None,
         site: str | None = None,
         min_effect: float | None = None,
@@ -1602,9 +1651,14 @@ class TrialChoiceModel:
             model_kind=model_kind,
             model_overlap=model_overlap,
             model_effect=model_effect,
+            model_role=model_role,
+            model_rank=model_rank,
             proposal_kind=proposal_kind,
             proposal_overlap=proposal_overlap,
             proposal_effect=proposal_effect,
+            proposal_role=proposal_role,
+            proposal_rank=proposal_rank,
+            phase=phase,
             min_effect=(self.min_effect_for(task_family) if min_effect is None else min_effect),
         )
 
@@ -1615,6 +1669,7 @@ class TrialChoiceModel:
         model_choice: dict | None = None,
         task_family: str | None = None,
         site: str | None = None,
+        phase=None,
     ) -> dict | None:
         """The offered candidate whose arm *established* a beneficial effect.
 
@@ -1629,20 +1684,31 @@ class TrialChoiceModel:
         """
         if not model_choice:
             return None
+        candidates = list(candidates)
         mc_kind = str(model_choice.get("kind") or "unknown")
         mc_overlap = model_choice.get("goal_overlap")
         mc_effect = model_choice.get("effect")
+        mc_role = model_choice.get("role")
+        mc_rank = next(
+            (i for i, c in enumerate(candidates) if c.get("id") == model_choice.get("id")),
+            None,
+        )
         best = None
-        for candidate in candidates:
+        for p_rank, candidate in enumerate(candidates):
             if candidate.get("id") == model_choice.get("id"):
                 continue
             estimate = self._estimate(
                 proposal_kind=str(candidate.get("kind") or "unknown"),
                 proposal_overlap=candidate.get("goal_overlap"),
                 proposal_effect=candidate.get("effect"),
+                proposal_role=candidate.get("role"),
+                proposal_rank=p_rank,
                 model_kind=mc_kind,
                 model_overlap=mc_overlap,
                 model_effect=mc_effect,
+                model_role=mc_role,
+                model_rank=mc_rank,
+                phase=phase,
                 task_family=task_family,
                 site=site,
             )
@@ -1689,7 +1755,11 @@ class TrialChoiceModel:
         model_kind: str = "unknown",
         model_overlap=None,
         model_effect=None,
+        model_role=None,
+        model_rank=None,
         proposal_effect=None,
+        proposal_role=None,
+        phase=None,
     ) -> dict:
         """The candidate-side implied success probability for one action.
 
@@ -1704,9 +1774,14 @@ class TrialChoiceModel:
             proposal_kind=str(kind or "unknown"),
             proposal_overlap=goal_overlap,
             proposal_effect=proposal_effect,
+            proposal_role=proposal_role,
+            proposal_rank=rank,
             model_kind=model_kind,
             model_overlap=model_overlap,
             model_effect=model_effect,
+            model_role=model_role,
+            model_rank=model_rank,
+            phase=phase,
             task_family=task_family,
             site=site,
         )
@@ -1754,6 +1829,7 @@ class TrialChoiceModel:
         model_choice: dict,
         task_family: str | None = None,
         site: str | None = None,
+        phase=None,
     ) -> list[dict]:
         """Bounded causal ranking of offered candidates, with provenance.
 
@@ -1764,21 +1840,32 @@ class TrialChoiceModel:
         whatever it prefers still passes effect classification, payload
         review, approvals, and the browser guards.
         """
+        candidates = list(candidates)
         mc_kind = str(model_choice.get("kind") or "unknown")
         mc_overlap = model_choice.get("goal_overlap")
         mc_effect = model_choice.get("effect")
+        mc_role = model_choice.get("role")
+        mc_rank = next(
+            (i for i, c in enumerate(candidates) if c.get("id") == model_choice.get("id")),
+            None,
+        )
         tiers = {"beneficial": 0, "unresolved": 1, "insufficient_data": 2}
         entries = []
-        for candidate in candidates:
+        for p_rank, candidate in enumerate(candidates):
             if candidate.get("id") == model_choice.get("id"):
                 continue
             estimate = self._estimate(
                 proposal_kind=str(candidate.get("kind") or "unknown"),
                 proposal_overlap=candidate.get("goal_overlap"),
                 proposal_effect=candidate.get("effect"),
+                proposal_role=candidate.get("role"),
+                proposal_rank=p_rank,
                 model_kind=mc_kind,
                 model_overlap=mc_overlap,
                 model_effect=mc_effect,
+                model_role=mc_role,
+                model_rank=mc_rank,
+                phase=phase,
                 task_family=task_family,
                 site=site,
             )
@@ -1812,7 +1899,12 @@ class TrialChoiceModel:
         model_kind: str = "unknown",
         model_overlap=None,
         model_effect=None,
+        model_role=None,
+        model_rank=None,
         proposal_effect=None,
+        proposal_role=None,
+        proposal_rank=None,
+        phase=None,
         task_family: str | None = None,
         site: str | None = None,
     ) -> bool:
@@ -1827,9 +1919,14 @@ class TrialChoiceModel:
             proposal_kind=kind,
             proposal_overlap=goal_overlap,
             proposal_effect=proposal_effect,
+            proposal_role=proposal_role,
+            proposal_rank=proposal_rank,
             model_kind=model_kind,
             model_overlap=model_overlap,
             model_effect=model_effect,
+            model_role=model_role,
+            model_rank=model_rank,
+            phase=phase,
             task_family=task_family,
             site=site,
         )
@@ -1900,23 +1997,34 @@ class ExperimentScheduler:
         for hypothesis in hypotheses:
             estimate = hypothesis.get("estimate")
             if estimate is None and estimates is not None:
+                historical = hypothesis.get("historical") or {}
+                proposal = hypothesis.get("proposal") or {}
                 estimate = estimates.resolve(
                     task_family=self._family(hypothesis) or None,
                     site=hypothesis.get("site"),
                     model_kind=str(
-                        hypothesis.get("model_choice_kind")
+                        historical.get("kind")
+                        or hypothesis.get("model_choice_kind")
                         or hypothesis.get("model_kind")
                         or "unknown"
                     ),
-                    model_overlap=hypothesis.get("model_choice_overlap", hypothesis.get("model_overlap")),
+                    model_overlap=historical.get(
+                        "goal_overlap",
+                        hypothesis.get("model_choice_overlap", hypothesis.get("model_overlap")),
+                    ),
+                    model_role=historical.get("role"),
+                    model_rank=historical.get("offered_rank"),
                     proposal_kind=str(
-                        (hypothesis.get("proposal") or {}).get("kind")
+                        proposal.get("kind")
                         or hypothesis.get("proposal_kind")
                         or "unknown"
                     ),
-                    proposal_overlap=(hypothesis.get("proposal") or {}).get(
+                    proposal_overlap=proposal.get(
                         "goal_overlap", hypothesis.get("proposal_overlap")
                     ),
+                    proposal_role=proposal.get("role"),
+                    proposal_rank=hypothesis.get("proposal_offered_rank"),
+                    phase=hypothesis.get("step"),
                 )
             status = (estimate or {}).get("effect_status")
             if status in {"beneficial", "harmful"}:
@@ -2022,6 +2130,7 @@ class CausalChoicePolicy:
         model_choice: dict,
         task_family: str | None = None,
         site: str | None = None,
+        phase=None,
     ) -> dict:
         candidates = list(candidates)
         causal = {}
@@ -2033,6 +2142,7 @@ class CausalChoicePolicy:
                     model_choice=model_choice,
                     task_family=task_family,
                     site=site,
+                    phase=phase,
                 )
             }
         entries = []
@@ -2102,6 +2212,7 @@ class CausalChoicePolicy:
         model_choice: dict,
         task_family: str | None = None,
         site: str | None = None,
+        phase=None,
     ) -> dict | None:
         """The top entry when this mode may act on it, else ``None``.
 
@@ -2111,7 +2222,8 @@ class CausalChoicePolicy:
         observes, it does not act.
         """
         ranking = self.rank(
-            candidates, model_choice=model_choice, task_family=task_family, site=site
+            candidates, model_choice=model_choice, task_family=task_family,
+            site=site, phase=phase,
         )
         if not ranking["proposals"] or self.mode == "shadow":
             return None

@@ -59,7 +59,11 @@ SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", "jev-dream/3", SCHEMA_VERSION
 # domain-separated experiment-plan signatures — pools that predate it cannot
 # distinguish why a run was censored, and their trial cells lack the signature
 # coordinates that keep class-level deltas from silently generalizing.
-TCB_VERSION = "jev-ultrafast-tcb/0.13"
+# 0.14 tags active causal-policy overrides on the transition (causal_override)
+# so an overridden step is evidence of scheduler influence, not an on-policy
+# choice the observational priors may fit — pools that predate the tag would
+# read that step as the recorded policy's own selection.
+TCB_VERSION = "jev-ultrafast-tcb/0.14"
 SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.3",
     "jev-ultrafast-tcb/0.4",
@@ -71,6 +75,7 @@ SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.10",
     "jev-ultrafast-tcb/0.11",
     "jev-ultrafast-tcb/0.12",
+    "jev-ultrafast-tcb/0.13",
     TCB_VERSION,
 }
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
@@ -791,6 +796,7 @@ class RecordedTransition:
     selected_offered_rank: int | None = None
     selected_propensity: float | None = None
     experiment: dict | None = None
+    causal_override: dict | None = None
 
 
 @dataclass
@@ -951,6 +957,7 @@ class ReplayWorld:
                         else len(event_candidates)
                     ),
                     experiment=event.get("experiment"),
+                    causal_override=event.get("causal_override"),
                 )
                 transitions.append(tr)
             worlds.append(cls(
@@ -1118,9 +1125,18 @@ class ReplaySimulator:
                         model_choice={
                             "id": transition.selected_id,
                             "kind": transition.selected_kind,
+                            "role": next(
+                                (
+                                    c.get("role")
+                                    for c in transition.candidate_actions
+                                    if c.get("id") == transition.selected_id
+                                ),
+                                None,
+                            ),
                             "goal_overlap": selected_overlap,
                         },
                         task_family=world.family_key,
+                        phase=step_index,
                     )
                     if proposal is not None:
                         proposal_source = trial_model
@@ -1140,6 +1156,16 @@ class ReplaySimulator:
                             goal_overlap=proposal_overlap,
                             model_kind=transition.selected_kind,
                             model_overlap=selected_overlap,
+                            model_rank=offered_rank,
+                            proposal_rank=next(
+                                (
+                                    i
+                                    for i, item in enumerate(offered)
+                                    if item.get("id") == proposal["id"]
+                                ),
+                                None,
+                            ),
+                            phase=step_index,
                             task_family=world.family_key,
                         ):
                             proposal = None

@@ -86,6 +86,7 @@ class DreamTraceRecorder:
         helper: dict | None = None,
         risk_events=0,
         experiment: dict | None = None,
+        causal_override: dict | None = None,
     ):
         selected = sanitize_action(action)
         goal_tokens = set(tokenize(self.goal))
@@ -176,6 +177,12 @@ class DreamTraceRecorder:
             # propensity any off-policy correction is weighted by — and the
             # model choice the trial deviated from or confirmed.
             "experiment": experiment,
+            # An active causal-policy override is scheduler influence too: the
+            # executed action was the causal prior's choice, not the recorded
+            # policy's, so this step must not fit observational models as an
+            # on-policy choice. Distinct from ``experiment``: an override is
+            # not a randomized arm and has no propensity.
+            "causal_override": causal_override,
             "page_changed": after.get("fingerprint") != before.get("fingerprint"),
             "latency_ms": int(decision.get("latency_ms", 0)) + int((helper or {}).get("latency_ms", 0)),
             "model_calls": 1 + int(helper is not None),

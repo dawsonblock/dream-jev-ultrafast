@@ -345,11 +345,19 @@ class Agent:
         model_choice = {
             "id": selected,
             "kind": action.get("kind"),
+            "role": action.get("role"),
             "goal_overlap": next(
                 (c.get("goal_overlap") for c in offered_now if c.get("id") == selected),
                 None,
             ),
         }
+        phase = len(
+            [
+                h
+                for h in self.state["history"]
+                if h.get("kind") not in {"verification", "approval"}
+            ]
+        )
         if causal_policy is not None and getattr(causal_policy, "mode", "shadow") == "canary":
             proposal = _model_call(
                 causal_policy.proposal,
@@ -357,6 +365,7 @@ class Agent:
                 model_choice=model_choice,
                 task_family=getattr(self, "task_family", None),
                 site=_page_site(page),
+                phase=phase,
             )
             if proposal is not None:
                 return proposal
@@ -368,6 +377,7 @@ class Agent:
             model_choice=model_choice,
             task_family=getattr(self, "task_family", None),
             site=_page_site(page),
+            phase=phase,
         )
 
     def _match_stamped_plan(self, proposals, *, page, offered_now, model_choice_id, goal_tokens):
@@ -450,6 +460,8 @@ class Agent:
                     goal_overlap=None,
                     model_kind=str(historical.get("kind") or "unknown"),
                     model_overlap=historical.get("goal_overlap"),
+                    model_rank=historical.get("offered_rank"),
+                    proposal_rank=plan.get("proposal_offered_rank"),
                     task_family=getattr(self, "task_family", None),
                     site=_page_site(page),
                 )
@@ -538,6 +550,10 @@ class Agent:
                             (a.get("kind") for a in offered_now if a.get("id") == choice_id),
                             None,
                         ),
+                        "role": next(
+                            (a.get("role") for a in offered_now if a.get("id") == choice_id),
+                            None,
+                        ),
                         "goal_overlap": next(
                             (a.get("goal_overlap") for a in offered_now if a.get("id") == choice_id),
                             None,
@@ -545,6 +561,13 @@ class Agent:
                     },
                     task_family=getattr(self, "task_family", None),
                     site=_page_site(state["page"]),
+                    phase=len(
+                        [
+                            h
+                            for h in state["history"]
+                            if h.get("kind") not in {"verification", "approval"}
+                        ]
+                    ),
                 )
             state["status"] = "predicted"
             return self.snapshot()
@@ -676,6 +699,7 @@ class Agent:
                     model_choice={
                         "id": selected,
                         "kind": action.get("kind"),
+                        "role": action.get("role"),
                         "goal_overlap": next(
                             (c.get("goal_overlap") for c in offered_now if c.get("id") == selected),
                             None,
@@ -683,6 +707,13 @@ class Agent:
                     },
                     task_family=getattr(self, "task_family", None),
                     site=_page_site(page),
+                    phase=len(
+                        [
+                            h
+                            for h in state["history"]
+                            if h.get("kind") not in {"verification", "approval"}
+                        ]
+                    ),
                 )
                 if (
                     override is not None
@@ -1083,6 +1114,7 @@ class Agent:
                     helper=helper,
                     risk_events=int(approval_consumed),
                     experiment=experiment_meta,
+                    causal_override=state.get("causal_override"),
                 )
             browser_history = [h for h in state["history"] if h.get("kind") not in {"verification", "approval"}]
             no_progress_window = getattr(getattr(self, "exploration_policy", None), "no_progress_window", 3)
