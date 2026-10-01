@@ -310,8 +310,11 @@ class Handler(BaseHTTPRequestHandler):
             f"http://127.0.0.1:{bound_port}",
             f"http://localhost:{bound_port}",
         )
+        # Byte comparison: str inputs must be ASCII for compare_digest, but a
+        # hostile Authorization header can carry latin-1 codepoints.
         token_ok = not token or hmac.compare_digest(
-            self.headers.get("Authorization") or "", f"Bearer {token}"
+            (self.headers.get("Authorization") or "").encode("utf-8"),
+            f"Bearer {token}".encode("utf-8"),
         )
         return host_ok and origin_ok and token_ok
 
