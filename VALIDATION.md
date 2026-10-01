@@ -16,6 +16,7 @@ Validation date: 2026-09-30, updated for the v0.7.1 hardening pass, the v0.8.0 a
 - JSON parse for bundled JSON evidence files: passed.
 - DREAM CLI smoke: `verify` and `improve --stage` completed against synthetic hash-chained evidence; the staged record bound the parent policy, world-pool digest, split-manifest digest, evidence head, and TCB versions.
 - Cross-process serialization tests: four spawned processes appended 40 events to one JSONL store and the resulting chain verified; three spawned processes ran 30 serialized suspend/resume registry writes without lost updates.
+- Release ZIP re-verification (post-packaging): a `git archive` of the v0.9.0 commit (`artifacts/jev-ultrafast-0.9.0-dream.zip`, 62 files, no caches/build junk) was extracted to a clean directory and run through the same gates — `MANIFEST.sha256` 62/62, `uv run ruff check .`, **361 passed**, `node --check` for both JS files, `compileall`, `uv lock --check`, `uv build`, TOML/JSON parse, and the live Chrome 154 guard suite (**34/34**) — all passed against the packaged tree, not merely before packaging.
 
 ## Remaining environment limitation
 
