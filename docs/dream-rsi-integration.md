@@ -320,7 +320,21 @@ uv run jev-dream rollback --registry REGISTRY [--digest SHA256]
 # to checkpoint/verify the signed state head; after a confirmed gap, repair
 # explicitly with:
 uv run jev-dream registry-reanchor --registry REGISTRY --registry-anchor PATH
+
+# Randomized causal evidence: cell inventory, or one divergence resolved
+# against the treatment signature (read-only; the same verification flags
+# as verify/improve apply)
+uv run jev-dream trials EXPERIENCE [--cells]
+uv run jev-dream trials EXPERIENCE \
+  --task-family F --site HOST \
+  --model-kind KIND --model-effect EFFECT --model-role ROLE \
+  --model-overlap N --model-rank N \
+  --proposal-kind KIND --proposal-effect EFFECT --proposal-role ROLE \
+  --proposal-overlap N --proposal-rank N \
+  --phase N [--min-effect D]
 ```
+
+`trials` is the read side of the causal layer. With no signature flags it reports the fitted cell count, evidence version, and duplicate assignments; `--cells` additionally decodes every cell's stratum, signature, arm, and assignment/censoring counters. With any signature flag it runs `CounterfactualTrials.resolve()` and prints the winning stratum (`level`), the backoff mask that answered (`signature_level`), per-arm counts, and the α-spent effect verdict — `null` when no stratum can answer. Omitted coordinates are wildcards; `kind` and `effect` are floors that stored `unknown` values never satisfy, so an unanswered question prints `null` rather than borrowing unrelated evidence.
 
 ## The causal decision-learning plane (v0.9.0)
 
@@ -361,7 +375,7 @@ normal decision model
    causal estimator
         │
    hierarchical context (family+site → site → family → pooled)
-        │                (treatment signature backoff: phase → rank → role → effect → overlap; kind is a floor)
+        │                (treatment signature backoff: phase → rank → role → overlap; kind and effect are floors)
         ▼
    effect status: BENEFICIAL / HARMFUL / UNRESOLVED / INSUFFICIENT_DATA
         │

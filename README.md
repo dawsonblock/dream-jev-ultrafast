@@ -209,6 +209,10 @@ Learned models annotate and prioritize only. A counterfactual proposal is a hypo
 uv run jev-dream verify .jev/experience.jsonl --verify-keys <hex-pubkey>,<hex-pubkey> --require-signatures
 uv run jev-dream promote .jev/experience.jsonl --registry .jev/policy-registry.json
 uv run jev-dream health  .jev/experience.jsonl --registry .jev/policy-registry.json --recent-tasks 20
+# Read-only causal inspection: cell inventory, or one divergence resolved
+# through the treatment-signature hierarchy (null when nothing can answer)
+uv run jev-dream trials  .jev/experience.jsonl --cells
+uv run jev-dream trials  .jev/experience.jsonl --model-kind click --proposal-effect navigate
 ```
 
 Staging is not activation: promotion requires matched baseline/candidate canaries (≥12 runs each across ≥4 task families by default), no verified-success/risk regression, ≤25% latency/action/token regression, and an exact two-sided sign-test over `(task_family, instance_id)` pairs at p ≤ 0.05 by default — which in practice demands more than the minimum canary, since four pairs cannot reach significance. See [DREAM-Jev design](docs/dream-rsi-integration.md).

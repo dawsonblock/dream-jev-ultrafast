@@ -1,6 +1,7 @@
 import hashlib
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -1736,3 +1737,135 @@ def test_improve_suppresses_trial_refuted_proposals(tmp_path):
     # The guard is causal suppression, not an empty pipeline: without the
     # trial prior the same replay does stamp the divergence.
     assert plain.experiment_proposals != ()
+
+
+# --- jev-dream trials: read-only causal evidence inspection -----------------
+
+def _trial_store(tmp_path):
+    """A store holding randomized evidence: 8 candidate vs 8 control trials
+    on the same click divergence, effect-stamped so floor queries match."""
+    path = tmp_path / "trials.jsonl"
+    store = ExperienceStore(path)
+    for i in range(8):
+        for e in _trial_run(f"c{i}", "candidate", success=i < 6, propensity=0.25,
+                            model_effect="observe", proposal_effect="navigate"):
+            store.append(e)
+        for e in _trial_run(f"k{i}", "control", success=i < 2, propensity=0.75,
+                            model_effect="observe", proposal_effect="navigate"):
+            store.append(e)
+    return path
+
+
+def test_trials_cli_summarizes_and_resolves(tmp_path, capsys):
+    """The trials command is the read side of the causal layer: a bare call
+    summarizes the fitted cells, and signature flags resolve the matching
+    contrast — with the estimator's own support/effect verdicts attached."""
+    from jev_ultrafast.dream_cli import main
+
+    path = _trial_store(tmp_path)
+
+    assert main(["trials", str(path)]) == 0
+    bare = json.loads(capsys.readouterr().out)
+    assert bare["trials"]["cells"] > 0
+    assert bare["trials"]["version"] == "jev-trials/6"
+    assert "resolved" not in bare  # no query asked, no pooled guess printed
+
+    assert main([
+        "trials", str(path),
+        "--model-kind", "click", "--proposal-kind", "click",
+    ]) == 0
+    resolved = json.loads(capsys.readouterr().out)
+    contrast = resolved["resolved"]
+    assert contrast["level"] == "pooled"
+    assert contrast["support_sufficient"] is True
+    # 6/8 candidate successes vs 2/8 control successes — a real raw delta,
+    # and the α-spent interval honestly says how settled it is.
+    assert contrast["delta"] > 0
+    assert contrast["effect_status"] in {"beneficial", "unresolved"}
+    assert contrast["candidate"]["assigned"] == 8
+    assert resolved["query"]["model_kind"] == "click"
+
+
+def test_trials_cli_abstains_on_effect_mismatch(tmp_path, capsys):
+    """A query whose effect floor no stored cell can answer resolves to
+    null — evidence never generalizes across effect classes."""
+    from jev_ultrafast.dream_cli import main
+
+    path = _trial_store(tmp_path)
+    assert main([
+        "trials", str(path),
+        "--model-effect", "purchase", "--proposal-effect", "purchase",
+    ]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["resolved"] is None
+    assert out["query"]["model_effect"] == "purchase"
+
+
+def test_trials_cli_cells_dump_and_verify_flags(tmp_path, capsys):
+    """--cells decodes each cell's stratum/signature/arm counters, and the
+    shared verification flags apply like every other evidence command."""
+    from jev_ultrafast.dream_cli import main
+
+    signer = EvidenceSigner.from_hex("ab" * 32)
+    path = tmp_path / "signed-trials.jsonl"
+    store = ExperienceStore(path, signer=signer)
+    for e in _trial_run("c0", "candidate", propensity=0.5,
+                        model_effect="observe", proposal_effect="navigate"):
+        store.append(e)
+
+    assert main(["trials", str(path), "--verify-keys", signer.key_id,
+                 "--cells"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    cell = out["cells"][0]
+    assert cell["assigned"] == 1
+    assert cell["signature"]["model_kind"] == "click"
+    assert cell["signature"]["model_effect"] == "observe"
+    assert cell["arm"] == "candidate"
+    # Signed store without the key fails closed — same as verify/improve.
+    with pytest.raises(ValueError, match="no verification key"):
+        main(["trials", str(path)])
+
+
+def test_update_manifest_script_regenerates_and_verifies(tmp_path):
+    """The manifest script is the canonical generator: --check is a
+    byte-exact comparison that catches a stale hash or a missing entry."""
+    import subprocess
+    import sys
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "update_manifest.py"
+    # Exercise it against a tree shaped like the repo: no .git, so it
+    # re-covers the manifest's own file list.
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "a.txt").write_text("alpha")
+    (tree / "b.txt").write_text("beta")
+    manifest = tree / "MANIFEST.sha256"
+    manifest.write_text(
+        "".join(
+            f"{hashlib.sha256((tree / n).read_bytes()).hexdigest()}  {n}\n"
+            for n in ("a.txt", "b.txt")
+        )
+    )
+    # --check passes on a fresh manifest, fails after a file changes.
+    ok = subprocess.run([sys.executable, str(script), "--check"], cwd=tree,
+                        capture_output=True, text=True)
+    # The script anchors on its own repo root, so run it with a patched ROOT.
+    patched = tmp_path / "update_manifest.py"
+    patched.write_text(script.read_text().replace(
+        'ROOT = Path(__file__).resolve().parent.parent',
+        f'ROOT = Path({str(tree)!r})',
+    ))
+    ok = subprocess.run([sys.executable, str(patched), "--check"],
+                        capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stderr
+    (tree / "a.txt").write_text("changed")
+    bad = subprocess.run([sys.executable, str(patched), "--check"],
+                         capture_output=True, text=True)
+    assert bad.returncode == 1
+    # Regenerate and it verifies again.
+    regen = subprocess.run([sys.executable, str(patched)],
+                           capture_output=True, text=True)
+    assert regen.returncode == 0
+    ok2 = subprocess.run([sys.executable, str(patched), "--check"],
+                         capture_output=True, text=True)
+    assert ok2.returncode == 0

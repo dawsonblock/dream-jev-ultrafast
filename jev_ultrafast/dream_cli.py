@@ -20,6 +20,10 @@ from .dream import (
     experiment_plan_signer_from_env,
 )
 from .dreamlearn import (
+    _COUNT_REASON_BASE,
+    _SIGNATURE_INDEX,
+    _TRIAL_KEY_LEN,
+    TERMINATION_REASONS,
     ChoiceModel,
     CostModel,
     CounterfactualTrials,
@@ -30,7 +34,7 @@ from .dreamlearn import (
 
 COMMANDS = {
     "improve", "verify", "promote", "status", "rollback", "health",
-    "suspend", "resume", "registry-reanchor",
+    "suspend", "resume", "registry-reanchor", "trials",
 }
 
 
@@ -158,11 +162,114 @@ def build_parser():
     )
     reanchor.add_argument("--registry", required=True)
     reanchor.add_argument("--registry-anchor", required=True, help="Anchor file to re-write")
+
+    trials = sub.add_parser(
+        "trials",
+        help="Inspect randomized causal evidence: summarize stored trial cells, "
+        "or resolve one divergence against the recorded treatment signature",
+    )
+    trials.add_argument("experience")
+    trials.add_argument(
+        "--cells",
+        action="store_true",
+        help="Print every decoded trial cell (family/site stratum, signature, arm, counters)",
+    )
+    # Stratum and treatment-signature query coordinates. Omitted coordinates
+    # are wildcards; kind and effect are floors that stored unknown values can
+    # never satisfy.
+    trials.add_argument("--task-family")
+    trials.add_argument("--site")
+    for side in ("model", "proposal"):
+        trials.add_argument(f"--{side}-kind")
+        trials.add_argument(f"--{side}-effect")
+        trials.add_argument(f"--{side}-role")
+        trials.add_argument(f"--{side}-overlap", type=int)
+        trials.add_argument(f"--{side}-rank", type=int)
+    trials.add_argument("--phase", type=int, help="Workflow step index (bucketed)")
+    trials.add_argument(
+        "--min-effect",
+        type=float,
+        help="Practical-effect threshold the interval must clear to establish",
+    )
+    _add_verify_args(trials)
     return parser
 
 
 def _json(value):
     print(json.dumps(value, indent=2, sort_keys=True, default=str))
+
+
+# Signature coordinates rendered with the same names the query flags use.
+_SIGNATURE_LABELS = (
+    ("model_kind", "m_kind"), ("model_effect", "m_effect"),
+    ("model_role", "m_role"), ("model_overlap", "m_ov"),
+    ("model_rank", "m_rank"), ("model_phase", "m_phase"),
+    ("proposal_kind", "p_kind"), ("proposal_effect", "p_effect"),
+    ("proposal_role", "p_role"), ("proposal_overlap", "p_ov"),
+    ("proposal_rank", "p_rank"), ("proposal_phase", "p_phase"),
+)
+
+
+def _decode_trial_cell(cell) -> dict:
+    """Render one trial cell readably: stratum, treatment signature, arm,
+    and the assignment/outcome counters the estimator aggregates."""
+    counts = cell[_TRIAL_KEY_LEN:]
+    return {
+        "task_family": cell[0] or None,
+        "site": cell[1] or None,
+        "signature": {
+            label: cell[_SIGNATURE_INDEX[field]]
+            for label, field in _SIGNATURE_LABELS
+        },
+        "arm": cell[_TRIAL_KEY_LEN - 1],
+        "assigned": counts[0],
+        "analyzed": counts[1],
+        "executed": counts[2],
+        "censored": counts[3],
+        "p_success": round(counts[4] / counts[5], 4) if counts[5] else None,
+        "ess": round(counts[5] ** 2 / counts[6], 2) if counts[6] else None,
+        "terminations": {
+            reason: counts[_COUNT_REASON_BASE + i]
+            for i, reason in enumerate(TERMINATION_REASONS)
+            if counts[_COUNT_REASON_BASE + i]
+        },
+    }
+
+
+def _trials(args) -> int:
+    fitted = CounterfactualTrials.fit(_store(args).load())
+    summary = {
+        "version": fitted.version,
+        "cells": len(fitted.cells),
+        "duplicates": fitted.duplicates,
+    }
+    query = {
+        "task_family": args.task_family,
+        "site": args.site,
+        "model_kind": args.model_kind,
+        "model_effect": args.model_effect,
+        "model_role": args.model_role,
+        "model_overlap": args.model_overlap,
+        "model_rank": args.model_rank,
+        "proposal_kind": args.proposal_kind,
+        "proposal_effect": args.proposal_effect,
+        "proposal_role": args.proposal_role,
+        "proposal_overlap": args.proposal_overlap,
+        "proposal_rank": args.proposal_rank,
+        "phase": args.phase,
+        "min_effect": args.min_effect,
+    }
+    asked = {k: v for k, v in query.items() if v is not None}
+    output = {"trials": summary}
+    if asked:
+        output["query"] = asked
+        # resolve() returns the best-supported estimate or None when no cell
+        # in any stratum can answer — an abstention is evidence too.
+        output["resolved"] = fitted.resolve(**query)
+    if args.cells:
+        output["cells"] = [_decode_trial_cell(cell) for cell in fitted.cells]
+    _json(output)
+    return 0
 
 
 def main(argv=None):
@@ -198,6 +305,9 @@ def main(argv=None):
     if args.command == "registry-reanchor":
         _json({"reanchored": True, "anchor": _registry(args).reanchor()})
         return 0
+
+    if args.command == "trials":
+        return _trials(args)
 
     if args.command == "promote":
         store = _store(args)
