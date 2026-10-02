@@ -259,7 +259,7 @@ A `DONE` choice is `claimed_done` unless a caller-supplied verifier passes. The 
 
 ```bash
 uv run ruff check .
-uv run pytest                                   # 435 tests, offline
+uv run pytest                                   # 437 tests, offline
 node --check jev_ultrafast/static/app.js
 node --check jev_ultrafast/snapshot.js
 uv build
