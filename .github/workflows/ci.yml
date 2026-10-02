@@ -11,8 +11,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, macos-13]
         python: ["3.12", "3.13"]
+        # macos-13 is Intel x86_64; macos-latest is arm64 — together with
+        # ubuntu-latest this covers the supported OS/arch/Python surface.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
