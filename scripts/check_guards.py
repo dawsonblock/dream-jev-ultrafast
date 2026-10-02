@@ -270,7 +270,19 @@ def main():
              "click", {"guarantee": "trusted"}, None),
         ]
         for label, html, kind, extra, text in nav_cases:
-            browser.evaluate("document.body.innerHTML=" + repr(html))
+            # The prior case may have left the tab mid-navigation
+            # (location.replace inside the handler): evaluate on a navigating
+            # target races 'Inspected target navigated or closed', so wait for
+            # a live document before injecting the next fixture.
+            for _settle in range(100):
+                try:
+                    browser.evaluate("document.body.innerHTML=" + repr(html))
+                    break
+                except Exception:
+                    import time
+                    time.sleep(0.05)
+            else:
+                raise AssertionError(f"{label}: page never settled for fixture injection")
             page = browser.observe(screenshot=False)
             action = next(a for a in page["actions"] if a["kind"] == kind)
             try:

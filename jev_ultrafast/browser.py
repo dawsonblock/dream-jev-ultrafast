@@ -368,26 +368,30 @@ def browser_operation(request):
                 guarded + json.dumps(payload) + ")",
                 mutating=kind == "select" or guarantee == "atomic",
             )
-            if not target or target.get("error"):
+            if not isinstance(target, dict) or not target or target.get("error"):
                 # Every explicit {error: ...} return is provably pre-mutation
-                # and safe to retry after re-observing. A *missing* result on a
-                # mutating call is different: nothing distinguishes "validated
-                # and returned nothing" from "mutated, then the result was
-                # lost" — so it is non-retryable, not stale.
-                if target is None:
-                    raise IndeterminateMutation(
-                        "Dropdown execution returned no result; inspect before retrying."
-                        if kind == "select"
-                        else "Mutation evaluation returned no result; the outcome is "
-                             "unknown and must not be retried."
-                    )
+                # and safe to retry after re-observing. A *missing or shapeless*
+                # result is different: on a mutating call nothing distinguishes
+                # "validated and returned nothing" from "mutated, then the
+                # result was lost" — so it is indeterminate, not stale. On a
+                # validation-only (trusted) call the script provably never
+                # mutated, so a missing result is just a failed check.
+                if not isinstance(target, dict) or not target.get("error"):
+                    if kind == "select" or guarantee == "atomic":
+                        raise IndeterminateMutation(
+                            "Dropdown execution returned no result; inspect before retrying."
+                            if kind == "select"
+                            else "Mutation evaluation returned no result; the outcome is "
+                                 "unknown and must not be retried."
+                        )
+                    raise StalePage("Target validation returned no result. Observe again.")
                 if guarantee == "atomic" and target.get("error") == "unsupported":
                     # Programmatic control is unavailable; nothing was mutated.
                     # Escalate to the trusted-input path for this element.
                     guarantee = "trusted"
                     payload["guarantee"] = "trusted"
                     target = evaluate(guarded + json.dumps(payload) + ")")
-                    if not target or target.get("error"):
+                    if not isinstance(target, dict) or not target or target.get("error"):
                         raise StalePage("Target changed, became unavailable, or is covered. Observe again.")
                 else:
                     raise StalePage("Target changed, became unavailable, or is covered. Observe again.")
@@ -428,7 +432,22 @@ def browser_operation(request):
                 )
                 if not evaluate(precheck):
                     raise StalePage("Target failed pre-press identity check. Observe again.")
-                call("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=1)
+                try:
+                    call("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=1)
+                except Exception as exc:
+                    # The dispatch may already have reached the browser before
+                    # the acknowledgement was lost — mousedown is itself a
+                    # mutation point, so a lost answer is indeterminate, and a
+                    # release is still attempted for pointer hygiene.
+                    try:
+                        call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=1)
+                    except Exception:
+                        pass
+                    raise IndeterminateMutation(
+                        "Trusted-input press dispatch was not acknowledged; the "
+                        "press may already have landed — the outcome is unknown "
+                        "and must not be retried."
+                    ) from exc
                 # The press already left the process — mousedown handlers may
                 # have run. From here on nothing can be called "not executed":
                 # a failed or interrupted pre-release check, a lost release,

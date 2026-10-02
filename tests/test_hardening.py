@@ -466,6 +466,45 @@ def test_atomic_mutation_missing_result_is_indeterminate(monkeypatch):
         })
 
 
+@pytest.mark.parametrize("shapeless", [{}, 0, False, "", "ok", [1]])
+def test_atomic_mutation_shapeless_result_is_indeterminate(monkeypatch, shapeless):
+    """A mutating call whose acknowledgement is not the expected object —
+    empty, scalar, or a wrong type — can no more prove 'not executed' than a
+    missing result can. Falsy shapes used to take the retryable-stale branch
+    (and a truthy non-dict would have crashed on .get())."""
+    monkeypatch.setattr(
+        browser, "cdp", Mock(return_value={"result": {"value": shapeless}})
+    )
+    with pytest.raises(IndeterminateMutation):
+        browser_operation({
+            "operation": "act",
+            "session": "s",
+            "context_id": 42,
+            "expected": {"page_key": [1], "guard": [1]},
+            "action": {"id": "e1", "kind": "click", "node": 1},
+            "guarantee": "atomic",
+        })
+
+
+@pytest.mark.parametrize("shapeless", [None, {}, 0, "ok"])
+def test_trusted_validation_shapeless_result_is_stale(monkeypatch, shapeless):
+    """Under 'trusted' the guarded script only validates and reports
+    coordinates — it provably never mutates, so a missing or shapeless
+    result is a failed check (retryable stale), not an ambiguous mutation."""
+    monkeypatch.setattr(
+        browser, "cdp", Mock(return_value={"result": {"value": shapeless}})
+    )
+    with pytest.raises(StalePage):
+        browser_operation({
+            "operation": "act",
+            "session": "s",
+            "context_id": 42,
+            "expected": {"page_key": [1], "guard": [1]},
+            "action": {"id": "e1", "kind": "click", "node": 1},
+            "guarantee": "trusted",
+        })
+
+
 def test_atomic_fill_lost_result_is_indeterminate(monkeypatch):
     """execCommand('insertText') may fire handlers that navigate before the
     evaluation returns; same indeterminate class as click."""

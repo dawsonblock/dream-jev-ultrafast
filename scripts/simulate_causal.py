@@ -102,7 +102,8 @@ def multiplicity_probe(sequences, *, divergences, n_per_arm, base, seed):
                         success=rng.random() < p_succ,
                         propensity=0.5, rng=rng, base=base)
                     for event in meta_events:
-                        event.setdefault("task_family", f"fam{d}")
+                        # The stratum lives on the experiment meta — the
+                        # assignment record's task_family is what cells key on.
                         if isinstance(event.get("experiment"), dict):
                             event["experiment"]["task_family"] = f"fam{d}"
                     events += meta_events
