@@ -4,6 +4,80 @@ Detailed release history for Jev Ultrafast. Cut releases live on the
 [GitHub releases page](https://github.com/dawsonblock/dream-jev-ultrafast/releases);
 this file documents what changed and why, in the project's own words.
 
+## Unreleased — qualification correctness
+
+A third-pass audit went after scientific-method defects rather than authority
+defects: the executor held, but several places the evidence could not carry
+the claims being made on it. All ten recommendations implemented:
+
+- **Action-catalogue truncation is node-fair.** `snapshot.js` previously
+  expanded every control inline in DOM order and then dropped everything past
+  1,200 actions — one giant `<select>` early in the page could starve every
+  later control out of the Python-side catalogue entirely. Options are now
+  collected per-node and merged round-robin before the bound applies, so a
+  big select loses its own deepest alternatives instead of hiding unrelated
+  controls. A Node-driven regression test proves a 1,500-option select cannot
+  starve the controls after it.
+- **The replay holdout is actually held out.** `DreamImprover.improve()` used
+  to evaluate every candidate on train, validation, *and* holdout, and
+  `_robust_gain`/candidate sorting consumed all three — the holdout was a
+  second validation set. Selection now runs on train+validation only; the
+  single selected candidate is then assessed on holdout once, reported as
+  `holdout` promotion evidence. A spy test proves non-selected candidates
+  never touch the holdout pool.
+- **Degenerate randomization is rejected.** `experiment.rate` must keep both
+  arms supported (`0.05 ≤ rate ≤ 0.95`); `rate=1.0` produced all-candidate
+  "experiments" with zero control support — evidence that could never
+  identify a causal effect. The bound also caps inverse-propensity weights.
+- **Censoring is a bound, not a hope.** Trial cells (`jev-trials/7`) carry
+  the censored weight per arm. Estimates report Manski worst/best-case
+  `delta_bounds` — every censored unit re-counted as failure, then as
+  success — and establishment requires the conservative bound to agree with
+  the confidence sequence: `beneficial` only when the worst-case bound still
+  clears the threshold, else `unresolved: censoring_bounds_cross_threshold`.
+  Legacy v6 cells load with a conservatively imputed censor mass.
+- **Sequential inference is a real confidence sequence.** The approximate
+  α-spent interval is replaced by `delta_cs`: per-arm KL confidence bounds
+  (self-normalized IPW statistics) union-bounded across looks by the summable
+  schedule — coverage holds at *every* sample size simultaneously, which is
+  the property unlimited peeking actually needs. The fixed-sample Newcombe
+  interval stays for reporting only; `sequential_alpha` reports the per-look
+  spend. Honest trade-off: the sequence is deliberately low-power at canary
+  scale — a δ≈0.6 effect needs ~60–100 per arm to establish, so thin evidence
+  now honestly reports `unresolved` instead of pretending.
+- **Multiplicity is controlled.** Concurrent hypotheses share the family
+  error budget — the per-look α is Bonferroni-split across the tracked
+  hypothesis count (`hypothesis_count` is reported per contrast). A hundred
+  simultaneous null divergences no longer each get a full α.
+- **Trusted input is operator-selectable.** `JEV_INPUT_GUARANTEE=trusted` (or
+  `Agent(input_guarantee=…)`) routes click/fill through the non-transactional
+  CDP input path for `isTrusted`-gated sites. Automatic escalation still
+  happens only after the atomic path provably did not mutate (`unsupported`);
+  a silent no-op synthetic click is indistinguishable from one that landed,
+  so it is never retried — the guarantee that matters is preserved by
+  declaration, not by guessing. The dispatched guarantee is journaled on
+  `action_attempted`.
+- **Model routing has security levels.** `JEV_MODEL_ROUTING` binds the run to
+  `local-only` (every model endpoint must be loopback; remote URLs fail
+  closed before the request is built), `sanitized` (default — goal/objective
+  text crosses the wire only through the redaction pass, same as page
+  content), or `public` (explicit opt-in; goal sent verbatim). The goal used
+  to cross to remote backends unsanitized even when page content was
+  redacted.
+- **Provenance is a qualification requirement.** `scripts/qualify.py` now
+  verifies `MANIFEST.sig` against pinned keys (`JEV_MANIFEST_VERIFY_KEYS`) as
+  a Q0 gate — under `--full` an unsigned or unverifiable manifest fails
+  closed — and runs the anchor-enforcement test slice (rollback, truncation,
+  forged/missing anchor on evidence store *and* registry) as a Q3 gate.
+- **Validation documentation is generated.** `qualify.py --report-md` emits a
+  generated report (`jev-qualify/2` JSON + markdown) bound to the exact
+  artifact: manifest digest, signature key identity, git commit + dirty flag,
+  environment digest, and per-stage pass/fail/skip tallies — the counts are
+  produced by the run, not transcribed. The external Inter stylesheet was
+  dropped from the inspector (fully local as documented), and the read-only
+  store test now skips under a privileged runner instead of failing
+  spuriously.
+
 ## Unreleased — audit remediation
 
 A second-pass audit found four defects that mattered precisely because everything else was already tight: none of them let the model or learner self-authorize, but each one stretched a claim the evidence could not fully carry.

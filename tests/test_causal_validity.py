@@ -145,7 +145,7 @@ def test_ci_crossing_zero_is_unresolved_not_beneficial():
     assert arms["support_sufficient"] is True
     assert arms["effect_status"] == "unresolved"
     assert arms["unresolved_reason"] == "ci_crosses_zero"
-    assert arms["alpha_spent_delta_ci"][0] <= 0 <= arms["alpha_spent_delta_ci"][1]
+    assert arms["delta_cs"][0] <= 0 <= arms["delta_cs"][1]
     model = TrialChoiceModel.fit(events)
     assert model.choose(
         [{"id": "m", "kind": "click", "goal_overlap": 0},
@@ -174,10 +174,12 @@ def test_inconclusive_negative_delta_is_not_refuted():
 
 def test_established_signs_still_establish():
     """The conservative direction must not become vacuity: strong, fully
-    separated arms do establish in both directions."""
+    separated arms do establish in both directions — the anytime-valid
+    sequence is stricter than the old approximate interval, so this needs
+    more than the old eight per arm."""
     positive = []
     negative = []
-    for i in range(8):
+    for i in range(24):
         positive += _trial_run(f"c{i}", "candidate", success=True)
         positive += _trial_run(f"k{i}", "control", success=False)
         negative += _trial_run(f"d{i}", "candidate", success=False)
@@ -192,7 +194,7 @@ def test_established_signs_still_establish():
 
 def test_sequential_establishment_is_stricter_than_fixed_sample():
     """Optional stopping: a fixed-sample interval that excludes zero is not
-    enough. Establishment uses the α-spent approximate interval, so data that
+    enough. Establishment uses the confidence sequence, so data that
     merely looks favorable at one peek stays unresolved."""
     events = []
     for i in range(8):
@@ -200,9 +202,9 @@ def test_sequential_establishment_is_stricter_than_fixed_sample():
         events += _trial_run(f"k{i}", "control", success=i < 3)
     arms = _cell(events)
     assert arms["delta_ci"][0] > 0  # a single fixed-sample look excludes zero
-    assert arms["effect_status"] == "unresolved"  # the sequential rule does not
-    assert arms["alpha_spent_delta_ci"][0] < 0
-    assert arms["alpha_spent_delta_ci"][0] <= arms["delta_ci"][0]
+    assert arms["effect_status"] == "unresolved"  # the sequence does not
+    assert arms["delta_cs"][0] < 0
+    assert arms["delta_cs"][0] <= arms["delta_ci"][0]
     assert arms["sequential_alpha"] < CounterfactualTrials.SEQUENTIAL_ALPHA
 
 
@@ -261,9 +263,10 @@ def test_candidate_induced_timeout_is_distinguishable_from_operator_cancel():
 def test_balanced_operator_cancels_are_censored_not_failures():
     """Operator cancels are unrelated to treatment: when both arms carry the
     same small censor rate, they are excluded from the endpoint and the
-    effect can still establish."""
+    effect can still establish — provided the worst-case bounds confirm the
+    censored outcomes could not erase the margin."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True)
         events += _trial_run(f"k{i}", "control", success=False)
     for i in range(2):
@@ -274,9 +277,38 @@ def test_balanced_operator_cancels_are_censored_not_failures():
     arms = _cell(events)
     assert arms["candidate"]["censored"] == 2
     assert arms["control"]["censored"] == 2
-    assert abs(arms["candidate"]["censor_rate"] - 0.2) < 1e-9
+    assert abs(arms["candidate"]["censor_rate"] - 2 / 26) < 1e-9
     assert arms["censoring_imbalance"] is False
+    # The bounds still contain a positive margin: even if every missing
+    # outcome broke against the candidate, the effect survives.
+    assert arms["delta_bounds"][0] > 0
     assert arms["effect_status"] == "beneficial"
+
+
+def test_balanced_heavy_censoring_vetoes_a_sign_the_bounds_cannot_confirm():
+    """The subtler censoring failure the rate gates cannot see: perfectly
+    balanced censoring, but enough of it that worst-case bounds cross zero.
+    A candidate arm that is all surviving successes must not establish when
+    half its assignments are missing."""
+    events = []
+    for i in range(24):
+        events += _trial_run(f"c{i}", "candidate", success=True)
+        events += _trial_run(f"k{i}", "control", success=False)
+    for i in range(24):
+        events += _trial_run(f"ca{i}", "candidate", status="aborted", verified=False,
+                             reason="operator_cancel")
+        events += _trial_run(f"ka{i}", "control", status="aborted", verified=False,
+                             reason="operator_cancel")
+    arms = _cell(events)
+    # Rate gates pass: 50% censoring is not *over* the max, and the gap is 0.
+    assert arms["censoring_imbalance"] is False
+    assert arms["support_sufficient"] is True
+    # The point estimate looks perfect; the worst-case bound does not —
+    # every censored control could have succeeded and every censored
+    # candidate could have failed, flipping the sign.
+    assert arms["delta_bounds"][0] <= 0 <= arms["delta_bounds"][1]
+    assert arms["effect_status"] == "unresolved"
+    assert arms["unresolved_reason"] == "censoring_bounds_cross_threshold"
 
 
 # ------------------------------------------------- practical-effect thresholds
@@ -286,7 +318,7 @@ def test_minimum_effect_requires_practical_significance():
     """Statistically established is not automatically worthwhile: a family
     may demand a minimum absolute improvement."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True)
         events += _trial_run(f"k{i}", "control", success=False)
     resolved = CounterfactualTrials.fit(events).resolve(
@@ -320,7 +352,7 @@ def test_treatment_signature_backoff_reports_its_level():
     and names the mask that answered, so a class-level delta is never
     presented as if it were measured on the queried treatment."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True,
                              proposal_effect="navigate", model_effect="form_edit")
         events += _trial_run(f"k{i}", "control", success=False,
@@ -345,7 +377,7 @@ def test_never_randomized_action_class_is_flagged_not_assumed():
     provenance, and the policy layer refuses to execute it deterministically
     unless the estimate is established."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True, proposal_effect="navigate")
         events += _trial_run(f"k{i}", "control", success=False, proposal_effect="navigate")
     model = TrialChoiceModel.fit(events)
@@ -448,7 +480,7 @@ def test_v4_cells_migrate_to_split_coordinates():
         10, 8, 8, 2, 6.0, 8.0, 8.0, 8.0, 8.0,
     )
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/4", "cells": [v4]})
-    assert trials.version == "jev-trials/6"
+    assert trials.version == "jev-trials/7"
     cell = trials.cells[0]
     assert cell[0] == "flights" and cell[1] == ""
     assert cell[3] == "unknown" and cell[6] == "unknown"  # effect/rank wildcards
@@ -458,20 +490,21 @@ def test_v4_cells_migrate_to_split_coordinates():
 
 
 def test_v5_cells_migrate_with_zeroed_indeterminate_counter():
-    """v5 cells (8 reason counters) migrate to the v6 layout: the new
-    ``indeterminate_execution`` slot splices in as zero and every recorded
-    verdict — including the unverified_claim counter that used to sit at the
-    same tail position — keeps its count."""
+    """v5 cells (8 reason counters) migrate through v6 to the v7 layout: the
+    ``indeterminate_execution`` slot splices in as zero, the censored-weight
+    statistic starts empty for imputation, and every recorded verdict —
+    including the unverified_claim counter that used to sit at the same tail
+    position — keeps its count."""
     from jev_ultrafast.dreamlearn import TERMINATION_REASONS, TRIAL_CELL_LEN
 
     reasons_v5 = [0, 1, 0, 0, 0, 0, 3, 2]  # v5 tail order, ending unverified/unknown
     key = ("flights", "example.test", "click", "navigate", "button", "0", "0-4", "0-2",
            "click", "navigate", "link", "1", "0-4", "0-2", "candidate")
-    stats = [10, 8, 8, 2, 6.0, 8.0, 8.0, 8.0, 8.0]
-    v5 = (*key, *stats, 1.0, 2.0, 0.5, *reasons_v5)
-    assert len(v5) == TRIAL_CELL_LEN - 1
+    stats_v5 = [10, 8, 8, 2, 6.0, 8.0, 8.0, 8.0, 8.0]  # v5/v6 stats: no w_censored
+    v5 = (*key, *stats_v5, 1.0, 2.0, 0.5, *reasons_v5)
+    assert len(v5) == 35
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/5", "cells": [v5]})
-    assert trials.version == "jev-trials/6"
+    assert trials.version == "jev-trials/7"
     cell = trials.cells[0]
     assert len(cell) == TRIAL_CELL_LEN
     tail = cell[-len(TERMINATION_REASONS):]
@@ -503,14 +536,14 @@ def test_censoring_gate_boundaries_are_strict():
     """The imbalance gate triggers only beyond its thresholds: a small
     balanced censor rate is tolerated, an extreme or sharply imbalanced one
     is not."""
-    def build(candidate_censored, candidate_analyzed):
+    def build(candidate_censored, analyzed):
         events = []
-        for i in range(candidate_analyzed):
+        for i in range(analyzed):
             events += _trial_run(f"c{i}", "candidate", success=True)
         for i in range(candidate_censored):
             events += _trial_run(f"a{i}", "candidate", status="aborted", verified=False,
                                  reason="operator_cancel")
-        for i in range(8):
+        for i in range(analyzed):
             events += _trial_run(f"k{i}", "control", success=False)
         return _cell(events)
 
@@ -518,22 +551,22 @@ def test_censoring_gate_boundaries_are_strict():
     assert extreme["censoring_imbalance"] is True
     assert extreme["effect_status"] == "unresolved"
 
-    balanced = build(2, 8)  # 2/10 = 0.2, gap 0.2 — tolerated
+    balanced = build(2, 24)  # 2/26 ≈ 0.077, gap ≈ 0.077 — tolerated
     assert balanced["censoring_imbalance"] is False
     assert balanced["effect_status"] == "beneficial"
 
 
 def test_minimum_effect_boundary_is_strict():
-    """Establishment requires the interval to lie entirely *above* the
-    threshold — a CI touching it is not established."""
+    """Establishment requires the sequence to lie entirely *above* the
+    threshold — a bound touching it is not established."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True)
         events += _trial_run(f"k{i}", "control", success=False)
     trials = CounterfactualTrials.fit(events)
     resolved = trials.resolve(
         model_kind="click", model_overlap=0, proposal_kind="click", proposal_overlap=1)
-    lower = resolved["alpha_spent_delta_ci"][0]
+    lower = resolved["delta_cs"][0]
     assert lower > 0
     at_boundary = trials.resolve(
         model_kind="click", model_overlap=0, proposal_kind="click", proposal_overlap=1,
@@ -567,7 +600,7 @@ def test_scheduler_spreads_coverage_across_families():
     family: an identical hypothesis in a heavily-sampled family ranks below
     the same hypothesis in a fresh family."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True)
         events += _trial_run(f"k{i}", "control", success=False)
     trials = CounterfactualTrials.fit(events)
@@ -640,7 +673,7 @@ def test_scheduler_drops_settled_hypotheses_and_respects_budget():
     hypotheses are excluded, unresolved ones are ranked, and the budget caps
     the batch deterministically."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True)
         events += _trial_run(f"k{i}", "control", success=False)
     trials = CounterfactualTrials.fit(events)
@@ -673,7 +706,7 @@ def test_provenance_never_mixes_channels():
     randomized estimate that had to back off to the pooled stratum says
     ``pooled_randomized``."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True)
         events += _trial_run(f"k{i}", "control", success=False)
     trials = CounterfactualTrials.fit(events)
@@ -929,7 +962,7 @@ def test_signature_role_rank_and_phase_are_queryable():
     while still answering from the pooled evidence underneath.
     """
     events = []
-    for i in range(12):
+    for i in range(24):
         meta = _trial_meta(
             f"s{i}", "candidate", task_family="f",
         )
@@ -943,7 +976,7 @@ def test_signature_role_rank_and_phase_are_queryable():
             {"event": "run_finished", "run_id": f"s{i}", "task_key": "t",
              "status": "done", "verified": True},
         ]
-    for i in range(12):
+    for i in range(24):
         meta = _trial_meta(f"c{i}", "control", task_family="f")
         meta["model_choice_role"] = "button"
         meta["proposal_role"] = "button"

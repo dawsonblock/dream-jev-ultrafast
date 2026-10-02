@@ -1,6 +1,9 @@
 """Regression tests for v0.2 execution-integrity and policy boundaries."""
 
+import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -609,3 +612,155 @@ def test_trusted_insert_lost_result_is_indeterminate(monkeypatch):
             "text": "secret",
             "guarantee": "trusted",
         })
+
+
+# ------------------------------------------------- snapshot.js (real Node run)
+#
+# The snapshot only runs inside a page, but its catalogue-completeness contract
+# is too important to leave to source inspection. A minimal stub DOM is enough:
+# the script reads elements through a small, fully stubbable surface.
+
+
+_SNAPSHOT_HARNESS = r"""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const spec = JSON.parse(process.argv[3]);
+
+class El {
+  constructor(tag, attrs) {
+    this.tagName = tag.toUpperCase();
+    this.attrs = attrs || {};
+    this.type = String(this.attrs.type || '');
+    this.value = this.attrs.value || '';
+    this.name = this.attrs.name || '';
+    this.id = this.attrs.id || '';
+    this.labels = [];
+    this.childNodes = [];
+    this.isConnected = true;
+    this.disabled = false;
+    this.readOnly = false;
+    this.checked = false;
+    this.selectedIndex = -1;
+    this.isContentEditable = false;
+    this.form = null;
+    this.parentElement = {innerText: 'page'};
+  }
+  getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+  hasAttribute(k) { return k in this.attrs; }
+  closest() { return null; }
+  matches(sel) {
+    return sel.split(',').some(part => {
+      part = part.trim();
+      if (part === ':disabled') return this.disabled;
+      const attr = part.match(/^\[([^\]=]+)(?:="([^"]*)")?\]$/);
+      if (attr) {
+        const v = this.getAttribute(attr[1]);
+        return attr[2] === undefined ? v !== null : v === attr[2];
+      }
+      return this.tagName === part.toUpperCase();
+    });
+  }
+  checkVisibility() { return true; }
+  getBoundingClientRect() {
+    return {x: 10, y: 10, width: 100, height: 20, top: 10, bottom: 30, left: 10, right: 110};
+  }
+  querySelector() { return null; }
+}
+
+const els = spec.map(s => {
+  const e = new El(s.tag, {type: s.type, 'aria-label': s.label});
+  if (s.tag === 'select') {
+    e.options = [];
+    for (let i = 0; i < s.options; i++) {
+      e.options.push({selected: i === 0, disabled: false, closest: () => null,
+        label: 'Option ' + i, value: 'v' + i});
+    }
+    e.selectedOptions = e.options.filter(o => o.selected);
+    e.selectedIndex = 0;
+    e.multiple = false;
+  }
+  return e;
+});
+
+globalThis.location = {href: 'https://t.test/', origin: 'https://t.test'};
+globalThis.scrollX = 0;
+globalThis.scrollY = 0;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.NodeFilter = {SHOW_TEXT: 4};
+globalThis.document = {
+  body: {},
+  title: 'T',
+  documentElement: {scrollHeight: 800},
+  getElementById: () => null,
+  querySelectorAll: () => els,
+  createTreeWalker: () => ({nextNode: () => null}),
+  createRange: () => ({
+    selectNodeContents() {},
+    getBoundingClientRect() {
+      return {width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0};
+    },
+  }),
+};
+
+console.log(JSON.stringify(eval(src)));
+"""
+
+
+def _run_snapshot_js(spec, tmp_path):
+    """Run snapshot.js in Node against a stub DOM built from ``spec``."""
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is required for the browser snapshot contract")
+    harness = tmp_path / "snapshot_harness.js"
+    harness.write_text(_SNAPSHOT_HARNESS)
+    result = subprocess.run(
+        [node, str(harness),
+         str(Path(browser.__file__).with_name("snapshot.js")), json.dumps(spec)],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def test_giant_select_cannot_starve_the_action_catalogue(tmp_path):
+    """A 1500-option <select> early in DOM order used to consume the whole
+    1200-action catalogue before later controls were ever represented — the
+    anti-crowding ranking in Python then had nothing to rank. The node-fair
+    merge guarantees every node's first action lands before any node's
+    second, so the cap cuts a giant select's own tail, not the controls
+    behind it."""
+    page = _run_snapshot_js([
+        {"tag": "select", "label": "Country", "options": 1500},
+        {"tag": "input", "type": "search", "label": "Search"},
+        {"tag": "button", "label": "Go"},
+    ], tmp_path)
+    actions = page["actions"]
+    # 1499 selectable options + fill + open-click + go-click = 1502 raw.
+    assert page["raw_action_count"] == 1502
+    assert page["omitted_actions"] == 302
+    assert len(actions) == 1201  # 1200 catalogue + the wait sentinel
+    # First pass of the interleave: each node's head action, in DOM order.
+    assert actions[1]["kind"] == "fill" and actions[1]["label"] == "Search"
+    assert actions[2]["kind"] == "click" and actions[2]["label"] == "Go"
+    # Everything the cap removed was select tail — a prefix of its options
+    # survives, in order.
+    select_indexes = [a["option_index"] for a in actions if a["kind"] == "select"]
+    assert select_indexes == list(range(1, 1198))
+    assert actions[-1]["kind"] == "wait"
+
+
+def test_catalogue_stays_complete_below_the_cap(tmp_path):
+    """Below the cap nothing is dropped and DOM order is preserved node by
+    node (each node's bucket still interleaves deterministically)."""
+    page = _run_snapshot_js([
+        {"tag": "input", "type": "search", "label": "Search"},
+        {"tag": "select", "label": "Country", "options": 3},
+        {"tag": "button", "label": "Go"},
+    ], tmp_path)
+    actions = page["actions"]
+    assert page["omitted_actions"] == 0
+    kinds = [(a["kind"], a["label"]) for a in actions]
+    assert kinds[0] == ("fill", "Search")
+    assert ("click", "Go") in kinds
+    # Both non-selected options are represented before the catalogue ends.
+    assert [a["option_index"] for a in actions if a["kind"] == "select"] == [1, 2]

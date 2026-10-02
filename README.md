@@ -117,6 +117,10 @@ The shim binds `127.0.0.1` and applies the demo server's request hardening (Host
 
 `JEV_MODEL_PRIVACY=basic` (the default) bounds serialized strings and redacts incidental emails, card-like numbers, API-secret patterns, credential query parameters, and sensitive field values before observations reach a model. A useful reduction layer — not a complete DLP system.
 
+`JEV_MODEL_ROUTING` binds the run's model traffic to a security level before any inference starts: `local-only` refuses every non-loopback model endpoint outright (the goal and page never leave the machine), `sanitized` (the default) allows remote endpoints but sends the task goal through the same redaction pass as page content, and `public` declares the task non-sensitive and sends the goal verbatim. Regex redaction is a floor, not a guarantee — declare `local-only` for runs whose objective contains secrets.
+
+`JEV_INPUT_GUARANTEE=trusted` (or `Agent(input_guarantee="trusted")`) routes clicks/fills through the real-CDP-input path for sites that ignore synthetic `isTrusted=false` events. It is a declaration, not a fallback: a silent no-op synthetic click cannot be distinguished from one that landed, so the system escalates automatically only when the atomic path provably did not mutate.
+
 ## Use the library
 
 ```python
@@ -255,7 +259,7 @@ A `DONE` choice is `claimed_done` unless a caller-supplied verifier passes. The 
 
 ```bash
 uv run ruff check .
-uv run pytest                                   # 368 tests, offline
+uv run pytest                                   # 435 tests, offline
 node --check jev_ultrafast/static/app.js
 node --check jev_ultrafast/snapshot.js
 uv build

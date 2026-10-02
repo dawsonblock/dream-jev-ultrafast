@@ -655,6 +655,11 @@ def test_signer_failure_mid_chain_preserves_existing_events(tmp_path):
     assert len(loaded) == 1
 
 
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root writes through Unix file modes — the 0o444 precondition "
+           "cannot hold under a privileged test runner",
+)
 def test_append_fails_closed_on_readonly_store(tmp_path):
     """§60: when durable evidence cannot be written, append must raise —
     a mutation journaled nowhere must not silently proceed. (Appending to an

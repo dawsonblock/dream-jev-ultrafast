@@ -43,6 +43,63 @@ def _mode():
     return os.environ.get("JEV_MODEL_PRIVACY", "basic").strip().lower()
 
 
+# ---------------------------------------------------------------------------
+# Model routing security levels.
+#
+# Every value sent to a model endpoint is bound to one routing level before
+# inference starts (JEV_MODEL_ROUTING):
+#
+#   local-only  — every model endpoint must resolve to a loopback host; any
+#                 configured remote URL fails closed before the request body
+#                 is even built. Nothing the operator types leaves the machine.
+#   sanitized   — (default) remote endpoints are allowed, but goal/objective
+#                 text crosses the wire only after the same redaction pass as
+#                 page content. Residual risk: secrets the regexes do not
+#                 recognise still travel — declare local-only for those runs.
+#   public      — the task is declared non-sensitive; goal text is sent
+#                 verbatim. Explicit opt-in, never the silent default.
+#
+# The level classifies the *run*, not individual fields: regex redaction is a
+# floor, not a guarantee, which is why "local-only" exists.
+# ---------------------------------------------------------------------------
+
+ROUTING_LEVELS = ("local-only", "sanitized", "public")
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def routing_level():
+    level = os.environ.get("JEV_MODEL_ROUTING", "sanitized").strip().lower()
+    if level not in ROUTING_LEVELS:
+        # An unrecognized level is a misconfiguration, not a permission —
+        # fail closed rather than guessing how much may leave the machine.
+        raise ValueError(
+            f"JEV_MODEL_ROUTING must be one of {', '.join(ROUTING_LEVELS)}"
+        )
+    return level
+
+
+def loopback_endpoint(url):
+    host = (urlsplit(str(url)).hostname or "").lower()
+    return host in _LOOPBACK_HOSTS
+
+
+def assert_endpoint_allowed(url):
+    """Fail closed when the routing level forbids a remote model endpoint."""
+    if routing_level() == "local-only" and not loopback_endpoint(url):
+        raise ValueError(
+            "JEV_MODEL_ROUTING=local-only refuses remote model endpoint "
+            f"{urlsplit(str(url)).netloc or url!s}; point *_BASE_URL at a local "
+            "server or relax the routing level for this run."
+        )
+
+
+def outbound_text(value, limit=6000):
+    """Bound free-text that may reach a model endpoint to the routing level."""
+    if routing_level() == "public":
+        return str(value or "")[:limit]
+    return redact_text(value, limit)
+
+
 def redact_text(value, limit=6000):
     text = str(value or "")[:limit]
     if _mode() in {"off", "none", "0", "false"}:

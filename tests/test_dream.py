@@ -212,6 +212,92 @@ def test_promotion_gate_rejects_low_coverage(tmp_path):
     assert "coverage" in decision.reason
 
 
+def _family_efficiency_worlds(tmp_path, families):
+    """One efficiency world per task family so all three splits populate."""
+    worlds = []
+    goal = "find destination"
+    candidates = [
+        {"id": f"c{i}", "kind": "click", "label": f"Control {i}", "goal_overlap": 0}
+        for i in range(229)
+    ]
+    candidates.insert(0, {"id": "selected", "kind": "fill", "label": "Destination", "goal_overlap": 5})
+    for family in families:
+        store = ExperienceStore(tmp_path / f"{family}.jsonl")
+        _append_run(store, f"run-{family}", goal, [{
+            "state": "S", "next_state": "DONE", "selected": {"id": "selected", "kind": "fill"},
+            "candidates": candidates, "page_changed": True, "latency_ms": 50, "model_calls": 1,
+            "tokens": 1000, "stale_or_failure": 0, "risk_events": 0,
+        }], status="done", verified=True, extra={"task_family": family})
+        worlds += ReplayWorld.from_events(store.load())
+    return worlds
+
+
+def test_holdout_is_examined_once_after_selection(tmp_path, monkeypatch):
+    """A dataset that screens policies is a validation set, not a holdout.
+    The spy records every replay evaluation: the holdout simulator may see
+    only the incumbent (up front) and the already-selected candidate (once,
+    last). No searching, no ranking, no second look."""
+    import jev_ultrafast.dream as dream_mod
+
+    worlds = _family_efficiency_worlds(tmp_path, ("alpha", "beta", "gamma"))
+
+    calls = []
+
+    class SpySimulator(ReplaySimulator):
+        def evaluate(self, policy, **kwargs):
+            calls.append((self.worlds, policy.digest))
+            return super().evaluate(policy, **kwargs)
+
+    monkeypatch.setattr(dream_mod, "ReplaySimulator", SpySimulator)
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(worlds, ExplorationPolicy())
+    assert report.promotion.approved and report.selected.digest != report.baseline.digest
+
+    holdout_worlds = tuple(split_worlds(worlds)["holdout"])
+    assert holdout_worlds, "the test is meaningless unless a holdout split exists"
+    holdout_policies = {digest for ws, digest in calls if ws == holdout_worlds}
+    assert holdout_policies == {report.baseline.digest, report.selected.digest}
+    # The selected candidate's holdout evaluation is the last evaluation of
+    # the entire search — nothing else is examined on holdout afterward.
+    assert calls[-1] == (holdout_worlds, report.selected.digest)
+
+    for entry in report.candidates:
+        if entry["digest"] == report.selected.digest:
+            assert entry["holdout"] is not None
+            assert entry["holdout_examined"] == "post_selection"
+        else:
+            assert entry["holdout"] is None
+            assert "holdout_examined" not in entry
+
+
+def test_holdout_regression_rejects_the_selected_candidate(tmp_path, monkeypatch):
+    """The single holdout examination still gates promotion: a candidate that
+    wins selection but regresses on holdout is rejected rather than the
+    search reopening to try the runner-up."""
+    worlds = _family_efficiency_worlds(tmp_path, ("alpha", "beta", "gamma"))
+    holdout_worlds = tuple(split_worlds(worlds)["holdout"])
+    assert holdout_worlds
+
+    real_evaluate = ReplaySimulator.evaluate
+
+    def sabotaged(self, policy, **kwargs):
+        result = real_evaluate(self, policy, **kwargs)
+        if self.worlds == holdout_worlds and policy.digest != ExplorationPolicy().digest:
+            # The holdout worlds see the candidate as an honest regression —
+            # injected only at the post-selection examination.
+            from dataclasses import replace as _replace
+
+            result = type(result)(
+                metrics=_replace(result.metrics, successes=0, verified_successes=0),
+                per_world=result.per_world,
+            )
+        return result
+
+    monkeypatch.setattr(ReplaySimulator, "evaluate", sabotaged)
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(worlds, ExplorationPolicy())
+    assert not report.promotion.approved
+    assert "holdout" in report.promotion.reason
+
+
 
 def test_canary_gate_requires_real_verified_success():
     gate = CanaryGate(min_tasks=3, min_baseline_tasks=3)
@@ -308,7 +394,7 @@ def test_agent_emits_replayable_trace_without_changing_executor_contract(tmp_pat
         def fresh(self, _page, action=None):
             return True
 
-        def act(self, action, page, text=None):
+        def act(self, action, page, text=None, guarantee=None):
             assert action["id"] == "go" and page["fingerprint"] == "S" and text is None
             self.current = second
 

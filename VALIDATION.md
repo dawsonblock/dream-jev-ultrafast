@@ -1,6 +1,8 @@
 # Validation — Jev Ultrafast v0.9.1 DREAM-Jev
 
-Validation date: 2026-09-30, updated for the v0.7.1 hardening pass, the v0.8.0 audit-correction pass, the v0.8.1 stability patch, the v0.8.2 causal-integrity pass, the v0.8.3 causal-model/hierarchical-context pass, and the v0.9.1 post-release hardening pass (v0.5.1 applied the independent-audit authority patch; v0.6.0 added the `ChoiceModel` counterfactual layer; v0.7.0 added real randomized counterfactual trials; v0.7.1 fixed trial-approval resume and registry lineage; v0.8.0 restores the v0.6.2 hardening this line had dropped — trajectory-success labeling, honest propensity fields, the registry head anchor, pre-authority assignment recording, and the run-level trial endpoint — and wires stamped `experiment_proposals` into the agent; v0.8.1 fixes select-option target-key stability, OpenAI-compatible server compatibility for the text helper, and adds a local Ollama decision backend for key-free runs; v0.8.2 makes trial analysis intention-to-treat over assignment events, makes stamped plans genuinely immutable and bound, censors unmeasured run outcomes in learned models, and hardens the local backend request path; v0.8.3 adds the separate causal `TrialChoiceModel` decision prior and hierarchical task-family/site context across `ChoiceModel` and `CounterfactualTrials`; v0.9.0 makes the causal layer validity-first — support vs. effect certainty, sequentially valid establishment, structured censoring with an imbalance gate, true family/site coordinates with a bounded treatment signature, bound and optionally signed experiment plans, a hypothesis scheduler, multi-objective utility, and the operator-gated `CausalChoicePolicy`).
+Validation date: 2026-09-30, updated for the v0.7.1 hardening pass, the v0.8.0 audit-correction pass, the v0.8.1 stability patch, the v0.8.2 causal-integrity pass, the v0.8.3 causal-model/hierarchical-context pass, and the v0.9.1 post-release hardening pass (v0.5.1 applied the independent-audit authority patch; v0.6.0 added the `ChoiceModel` counterfactual layer; v0.7.0 added real randomized counterfactual trials; v0.7.1 fixed trial-approval resume and registry lineage; v0.8.0 restores the v0.6.2 hardening this line had dropped — trajectory-success labeling, honest propensity fields, the registry head anchor, pre-authority assignment recording, and the run-level trial endpoint — and wires stamped `experiment_proposals` into the agent; v0.8.1 fixes select-option target-key stability, OpenAI-compatible server compatibility for the text helper, and adds a local Ollama decision backend for key-free runs; v0.8.2 makes trial analysis intention-to-treat over assignment events, makes stamped plans genuinely immutable and bound, censors unmeasured run outcomes in learned models, and hardens the local backend request path; v0.8.3 adds the separate causal `TrialChoiceModel` decision prior and hierarchical task-family/site context across `ChoiceModel` and `CounterfactualTrials`; v0.9.0 makes the causal layer validity-first — support vs. effect certainty, sequentially valid establishment, structured censoring with an imbalance gate, true family/site coordinates with a bounded treatment signature, bound and optionally signed experiment plans, a hypothesis scheduler, multi-objective utility, and the operator-gated `CausalChoicePolicy`), and the qualification-correctness pass (action-catalogue node-fairness, a real holdout, non-degenerate experiment allocation, censoring bounds, a formally anytime-valid confidence sequence with multiplicity control, operator-declared input guarantees, model-routing security levels, provenance/anchor gates, and generated validation reporting).
+
+Historical run counts below are per-milestone records; the count authoritative for the current tree is the generated report (`scripts/qualify.py --report-md`), produced from the exact artifact under test.
 
 ## Reproduced in this build environment
 
@@ -201,8 +203,8 @@ The audit's two deferred items — "feed randomized causal evidence into a separ
 
 The v0.8.3 audit's finding was precise: `delta_reliable` tested sample *support*, not whether the treatment effect's sign was established, and the surrounding layer had differential-censoring, indexing, binding, and generalization defects. v0.9.0 fixes the semantics; nothing in this section changes the authority plane or any promotion gate.
 
-- **Support vs. effect certainty (`jev-trials/5`, widened to `jev-trials/6`)**: `support_sufficient` (both arms meet `MIN_ESS` on weighted evidence) is reported separately from `effect_status` — `beneficial` requires the α-spent approximate interval to lie entirely above the practical threshold (`min_effect`, configurable per task family on `TrialChoiceModel`), `harmful` entirely below its negative, and anything else is `unresolved` with a reason (`ci_crosses_zero`, `censoring_imbalance`). The audit's 5/8-vs-4/8 repro now stays unresolved instead of becoming a confident proposal, and 4/8-vs-5/8 no longer permanently refutes.
-- **Sequential establishment (corrected claim)**: effect status is decided by `alpha_spent_delta_ci` — an *approximate* interval built by applying a summable α-spending sequence (`α_n = α·ζ(3/2)⁻¹·n^-3/2` over integer looks) to a Newcombe-Wilson difference on a self-normalized IPW estimate with Kish ESS. The spending schedule is valid; the per-look interval is not an exact-coverage guarantee for the IPW estimator, so this is **not** a formally anytime-valid confidence sequence — it is a defensible sequential-look discipline that keeps re-peeking conservative. The fixed-sample Newcombe interval remains for reporting, a test pins that establishment is strictly harder than one fixed-sample look, and multiplicity across simultaneously tracked hypotheses is explicitly *not* corrected — the conservative direction is always `unresolved`, and per-hypothesis α budgeting (or a martingale/e-process estimator with a real coverage guarantee) remains roadmap.
+- **Support vs. effect certainty (`jev-trials/5`, widened to `jev-trials/6`, superseded by `jev-trials/7`)**: `support_sufficient` (both arms meet `MIN_ESS` on weighted evidence) is reported separately from `effect_status` — `beneficial` requires the establishment interval to lie entirely above the practical threshold (`min_effect`, configurable per task family on `TrialChoiceModel`), `harmful` entirely below its negative, and anything else is `unresolved` with a reason (`ci_crosses_zero`, `censoring_imbalance`, `censoring_bounds_cross_threshold`). The audit's 5/8-vs-4/8 repro now stays unresolved instead of becoming a confident proposal, and 4/8-vs-5/8 no longer permanently refutes.
+- **Sequential establishment (superseded claim)**: the `alpha_spent_delta_ci` approximate interval described here was replaced in the qualification-correctness pass by `delta_cs`, an anytime-valid confidence sequence — see the section above. Multiplicity across concurrently tracked hypotheses is additionally Bonferroni-controlled via `hypothesis_count`, and establishment now also requires the censored-outcome worst/best bounds to agree with the sequence.
 - **Effect class as a signature floor (`jev-trials/6`)**: trial cells now carry the deterministic `classify_effect` class for both arms (live `model_choice`/`proposal` metadata supplies it; legacy v5 cells migrate with `"unknown"` wildcards), and `resolve` never drops `kind` or effect during signature backoff (phase → rank → role → overlap only). Evidence measured on one semantic effect cannot answer a divergence under another — `PURCHASE` clicks no longer generalize to `SEARCH`/`DELETE`/`DISCLOSURE` proposals just because the operation kind matches.
 - **Structured censoring**: `run_finished` records a reason (`operator_cancel`, `browser_crash`, `agent_exception`, `network_failure`, `timeout`, `recorder_shutdown`, `unverified_claim`, `unknown_abort`); `model.py` raises distinguishable `ModelTimeoutError`/`ModelConnectionError` subclasses and `browser.py` normalizes transport failures to `BrowserError` so the agent can classify aborts honestly. Per-arm `censor_rate` and reason breakdowns are reported, and the imbalance gate refuses to establish an effect when either arm is censored above 50% or the arms differ by more than 25 points — the audit's 48-assigned/8-analyzed/40-aborted candidate now reads `unresolved: censoring_imbalance`, not `beneficial`.
 - **True family/site hierarchy + treatment signature**: cells store `task_family` and `site` as separate coordinates (v4 scopes migrate in place), so resolution walks `family+site → site → family → pooled` and the audit's flights/thin-family/target.example-site repro now answers at `site` instead of a pooled estimate dominated by unrelated sites. Each arm is additionally keyed by a bounded treatment signature — kind, effect class, element role, overlap bucket, offered rank bucket, workflow phase — and resolution backs off over those coordinates (phase → rank → role → overlap) with `kind` and effect class as floors: click evidence never answers a fill proposal, purchase evidence never answers a search proposal, and the returned `signature_level` names exactly how much generalization happened.
@@ -213,6 +215,68 @@ The v0.8.3 audit's finding was precise: `delta_reliable` tested sample *support*
 - **`CausalChoicePolicy`**: combines the observational and randomized channels with per-entry provenance (`observational` / `randomized` / `pooled_randomized`) under operator-gated modes — `shadow` (annotation only), `canary` (proposal enters the randomized assignment), `active` (a randomized-*established* beneficial proposal overrides the model's choice deterministically, still through the full authority plane, recorded as `causal_policy_applied`, and excluded from policy-canary qualification).
 - **Provenance is permanent**: `ChoiceModel.predict` reports `source: "observational"`; `TrialChoiceModel` reports `source: "randomized"` and never reads observational transitions (tested on an experiment-free store); the two channels are never silently mixed.
 - **Evidence is `jev-ultrafast-tcb/0.14`** as of v0.9.1 (`causal_override` transition tag); 0.13 (structured reasons, treatment-signature coordinates, signed plans) and older stores remain readable, and mixed-TCB replay pools are still rejected.
+
+## Qualification-correctness pass (unreleased)
+
+A third-pass audit targeted scientific-method defects: not authority bypasses,
+but places where the evidence could not carry the claims made on it. The
+authoritative counts for any run live in the generated report
+(`scripts/qualify.py --report-md VALIDATION.generated.md`), not in this prose.
+
+- **Node-fair action catalogues**: `snapshot.js` previously truncated the
+  DOM-order-expanded catalogue at 1,200 actions — one early 1,500-option
+  `<select>` could starve every later control before Python ranking ever saw
+  it. Options are now merged round-robin across per-node buckets before the
+  bound applies; a Node behavioral test proves a giant select loses only its
+  own deepest alternatives.
+- **A real holdout**: `improve()` selected candidates on train+validation
+  +holdout — the holdout was a second validation set. Candidates are now
+  evaluated and selected on train/validation only; the chosen candidate is
+  assessed on holdout exactly once, reported as `holdout` evidence. Test: a
+  `ReplaySimulator.evaluate` spy asserts no non-selected candidate ever
+  touches the holdout pool.
+- **No degenerate experiments**: `experiment.rate` requires
+  `0.05 ≤ rate ≤ 0.95` — `rate=1.0` assigned every run to the candidate arm
+  and could never identify a treatment effect. The floor also bounds
+  inverse-propensity weights at 20.
+- **Censoring is bounded, not assumed ignorable**: `jev-trials/7` cells record
+  censored weight per arm; estimates emit `delta_bounds` (Manski-style: all
+  censored mass re-counted as failure, then as success) and `effect_status`
+  requires the conservative bound to agree with the sequence — otherwise
+  `unresolved: censoring_bounds_cross_threshold`. Censor-rate gates remain.
+- **A real confidence sequence**: `alpha_spent_delta_ci` is replaced by
+  `delta_cs` — per-arm KL confidence bounds on self-normalized IPW statistics
+  union-bounded across looks by the summable spending schedule, so coverage
+  holds at every sample size simultaneously under unlimited peeking. Each
+  arm's two-sided bound splits its share across tails (`e^{-τ} = α_look/4`).
+  Deliberately low-power at small n: δ≈0.6 needs ~60–100/arm to establish.
+  `delta_ci` remains the fixed-sample reporting interval only.
+- **Multiplicity control**: the family error budget is Bonferroni-split over
+  the tracked hypothesis count (`hypothesis_count` per contrast) before
+  spending across looks — one hundred simultaneous null divergences share one
+  α, they do not each receive it.
+- **Operator-declared trusted input**: `JEV_INPUT_GUARANTEE=trusted` /
+  `Agent(input_guarantee="trusted")` selects the non-transactional CDP path
+  for isTrusted-gated sites and is journaled on `action_attempted`. Automatic
+  atomic→trusted escalation remains restricted to the provably-unmutated
+  `unsupported` case — a silent no-op `click()` can never be distinguished
+  from one that landed, so it is never retried; the operator declares the
+  guarantee up front.
+- **Model-routing security levels**: `JEV_MODEL_ROUTING` ∈ `local-only` /
+  `sanitized` (default) / `public`. `local-only` fails closed if any model
+  endpoint resolves off-loopback; `sanitized` runs goal text through the
+  redaction pass before it enters a request body (the raw objective no longer
+  crosses to remote backends untouched); `public` is explicit opt-in.
+- **Provenance as a gate**: Q0 verifies `MANIFEST.sig` under pinned
+  `JEV_MANIFEST_VERIFY_KEYS` (unsigned/unverifiable fails closed under
+  `--full`); Q3 adds the anchor-enforcement slice — rollback, truncation,
+  forged and missing anchors must stay fatal on both evidence store and
+  registry.
+- **Generated validation documentation**: `jev-qualify/2` reports bind
+  manifest digest, signature key identity, git commit/dirty flag, environment
+  digest, and per-stage tallies — and `--report-md` renders them. The
+  inspector no longer loads a remote stylesheet; the read-only-store test
+  skips under `euid=0` instead of failing spuriously.
 
 ## v0.9.1 post-release hardening pass
 

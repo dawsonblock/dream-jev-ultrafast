@@ -29,6 +29,13 @@ def page():
     return state
 
 
+def _candidate_rng():
+    """Deterministic roll below every supported rate → the candidate arm."""
+    rng = Mock()
+    rng.random = Mock(return_value=0.0)
+    return rng
+
+
 def choice(ids, selected):
     return {"choice": selected, "confidence": 1.0, "probabilities": {i: float(i == selected) for i in ids}}
 
@@ -162,6 +169,7 @@ def runner():
     a = loop.Agent.__new__(loop.Agent)
     a.screenshots = False
     a.pending_text = None
+    a.input_guarantee = "atomic"
     p = page()
     a.state = {
         "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
@@ -595,6 +603,104 @@ def test_ordinary_generated_text_keeps_benign_fill_autonomous(runner, monkeypatc
     assert runner.state["status"] == "ready"
 
 
+def test_input_guarantee_defaults_to_atomic_and_rejects_unknown(monkeypatch):
+    monkeypatch.delenv("JEV_INPUT_GUARANTEE", raising=False)
+    a = loop.Agent.__new__(loop.Agent)
+    a.input_guarantee = "atomic"  # what __init__ stores for the default
+    monkeypatch.setenv("JEV_INPUT_GUARANTEE", "trusted")
+    b = loop.Agent("http://x", "g")
+    assert b.input_guarantee == "trusted"
+    with pytest.raises(ValueError, match="input_guarantee"):
+        loop.Agent("http://x", "g", input_guarantee="magical")
+
+
+def test_input_guarantee_reaches_the_browser_dispatch(runner):
+    """The operator-declared guarantee is journaled and passed to act() —
+    trusted stays non-transactional, but is never auto-escalated into."""
+    runner.input_guarantee = "trusted"
+    runner.state["decision"] = decision("e3")
+    runner.state["decision"]["operation"] = "CLICK"
+    runner.state["decision"]["target"] = "2"
+    p = runner.state["page"]
+    runner.command("act", {"fingerprint": p["fingerprint"]})
+    runner.state["browser"].act.assert_called_once()
+    assert runner.state["browser"].act.call_args.kwargs["guarantee"] == "trusted"
+
+
+def test_routing_local_only_refuses_remote_decision_endpoint(monkeypatch):
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "local-only")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    with pytest.raises(ValueError, match="local-only"):
+        model.SystemOneBackend(url="https://api.example.test/v1").decide({})
+
+
+def test_routing_local_only_refuses_remote_text_endpoint(monkeypatch):
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "local-only")
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    with pytest.raises(ValueError, match="local-only"):
+        model.field_text({"goal": "x"})
+
+
+def test_routing_local_only_allows_loopback(monkeypatch):
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "local-only")
+    post = Mock(return_value={"choices": [{"message": {"content": '{"text":"Zurich"}'}}]})
+    monkeypatch.setattr(model, "post_json", post)
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.delenv("TEXT_MODEL_API_KEY", raising=False)
+    model.field_text({"goal": "where"})
+    assert post.called
+
+
+def test_routing_sanitized_redacts_goal_pii(monkeypatch):
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "sanitized")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    captured = {}
+
+    def post(_url, _key, body):
+        captured.update(body)
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "DONE"),
+            },
+        }
+
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose(page(), "Email the receipt to alice@example.com now", [])
+    wire = json.dumps(captured["questions"])
+    assert "alice@example.com" not in wire
+    assert "[REDACTED_EMAIL]" in wire
+    # Local scoring still sees the raw goal — the bound copy is outbound-only.
+    ctx = model.field_context("Ping alice@example.com", page()["actions"][0], page(), [])
+    assert ctx["goal"] == "Ping [REDACTED_EMAIL]"
+
+
+def test_routing_public_sends_goal_verbatim(monkeypatch):
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "public")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    captured = {}
+
+    def post(_url, _key, body):
+        captured.update(body)
+        return {
+            "model": "test",
+            "answers": {
+                "operation": choice(body["questions"]["operation"]["criteria"], "DONE"),
+            },
+        }
+
+    monkeypatch.setattr(model, "post_json", post)
+    model.choose(page(), "Email alice@example.com", [])
+    assert "alice@example.com" in json.dumps(captured["questions"])
+
+
+def test_routing_unknown_level_fails_closed(monkeypatch):
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "trust-me")
+    with pytest.raises(ValueError, match="JEV_MODEL_ROUTING"):
+        model.SystemOneBackend().decide({})
+
+
 def test_model_boundaries_redact_history_text(monkeypatch):
     monkeypatch.setenv("JEV_MODEL_PRIVACY", "basic")
     monkeypatch.setenv("TYPESAFE_API_KEY", "test")
@@ -690,7 +796,7 @@ def test_experiment_candidate_arm_executes_the_proposal(runner, monkeypatch, tmp
     runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())
     proposal_model = Mock()
     proposal_model.choose = Mock(return_value={"id": "e3", "kind": "click"})
-    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.experiment = {"model": proposal_model, "rate": 0.5, "rng": _candidate_rng()}
     runner.state["decision"] = decision("e1")  # the model picked the fill
     runner.state["status"] = "predicted"
     p = runner.state["page"]
@@ -701,7 +807,7 @@ def test_experiment_candidate_arm_executes_the_proposal(runner, monkeypatch, tmp
     assert runner.state["history"][-1]["action"] == "Go"
     trial = next(e for e in store.load() if e["event"] == "transition")
     assert trial["experiment"]["arm"] == "candidate"
-    assert trial["experiment"]["assignment_probability"] == 1.0
+    assert trial["experiment"]["assignment_probability"] == 0.5
     assert trial["experiment"]["model_choice_id"] == "e1"
     assert trial["experiment"]["proposal_id"] == "e3"
     assert trial["experiment"]["proposal_digest"]
@@ -738,7 +844,7 @@ def test_experiment_deviation_never_bypasses_authority(runner):
     p["fingerprint"] = fingerprint(p)
     proposal_model = Mock()
     proposal_model.choose = Mock(return_value={"id": "buy", "kind": "click"})
-    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.experiment = {"model": proposal_model, "rate": 0.5, "rng": _candidate_rng()}
     runner.state["decision"] = decision("e1")
     runner.state["status"] = "predicted"
     state = runner.command("act", {"fingerprint": p["fingerprint"]})
@@ -765,7 +871,7 @@ def test_experiment_deviated_trial_executes_the_approved_action(runner, tmp_path
     p["fingerprint"] = fingerprint(p)
     proposal_model = Mock()
     proposal_model.choose = Mock(return_value={"id": "buy", "kind": "click"})
-    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.experiment = {"model": proposal_model, "rate": 0.5, "rng": _candidate_rng()}
     runner.state["decision"] = decision("e1")
     runner.state["status"] = "predicted"
 
@@ -778,7 +884,7 @@ def test_experiment_deviated_trial_executes_the_approved_action(runner, tmp_path
     assert runner.state["browser"].act.call_args.args[0]["id"] == "buy"
     trial = next(e for e in store.load() if e["event"] == "transition")
     assert trial["experiment"]["arm"] == "candidate"
-    assert trial["experiment"]["assignment_probability"] == 1.0
+    assert trial["experiment"]["assignment_probability"] == 0.5
     assert trial["experiment"]["model_choice_id"] == "e1"
     assert trial["experiment"]["proposal_id"] == "buy"
     assert trial["selected"]["id"] == "buy"
@@ -794,6 +900,14 @@ def test_experiment_config_is_validated_before_browser_launch(monkeypatch):
         loop.Agent("https://example.test", "goal", experiment={"model": Mock(), "rate": 0})
     with pytest.raises(ValueError, match="rate"):
         loop.Agent("https://example.test", "goal", experiment={"model": Mock(), "rate": 2.0})
+    # Degenerate allocations are rejected: rate=1.0 assigns every run to the
+    # candidate (no control support — nothing causal is identifiable), and a
+    # rate below the arm floor gives the other arm essentially none.
+    for degenerate in (1.0, 0.01, 0.999):
+        with pytest.raises(ValueError, match="both arms"):
+            loop.Agent("https://example.test", "goal", experiment={
+                "model": Mock(), "rate": degenerate,
+            })
     with pytest.raises(ValueError, match="model"):
         loop.Agent("https://example.test", "goal", experiment={"rate": 0.5})
     with pytest.raises(ValueError, match="dict"):
@@ -804,7 +918,7 @@ def test_experiment_config_is_validated_before_browser_launch(monkeypatch):
 def test_experiment_only_assigns_one_trial_per_run(runner):
     proposal_model = Mock()
     proposal_model.choose = Mock(return_value={"id": "e3", "kind": "click"})
-    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.experiment = {"model": proposal_model, "rate": 0.5, "rng": _candidate_rng()}
     p = runner.state["page"]
     runner.state["decision"] = decision("e1")
     runner.state["status"] = "predicted"
@@ -841,7 +955,7 @@ def test_experiment_proposal_must_be_an_offered_action(runner, tmp_path):
     runner.exploration_policy = ExplorationPolicy(min_goal_overlap=1)
     proposal_model = Mock()
     proposal_model.choose = Mock(return_value={"id": "filtered", "kind": "click"})
-    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.experiment = {"model": proposal_model, "rate": 0.5, "rng": _candidate_rng()}
     runner.state["decision"] = decision("e3")
     runner.state["status"] = "predicted"
     state = runner.command("act", {"fingerprint": p["fingerprint"]})
@@ -876,7 +990,7 @@ def test_experiment_assignment_is_recorded_before_authority(runner, tmp_path):
     p["fingerprint"] = fingerprint(p)
     proposal_model = Mock()
     proposal_model.choose = Mock(return_value={"id": "buy", "kind": "click"})
-    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.experiment = {"model": proposal_model, "rate": 0.5, "rng": _candidate_rng()}
     runner.state["decision"] = decision("e1")
     runner.state["status"] = "predicted"
 
@@ -969,7 +1083,7 @@ def test_experiment_stamped_proposal_executes_the_plan(runner, tmp_path):
     runner.exploration_policy = ExplorationPolicy()
     p = runner.state["page"]
     stamped = _stamped_plan(runner)
-    runner.experiment = {"proposals": [stamped], "rate": 1.0}
+    runner.experiment = {"proposals": [stamped], "rate": 0.5, "rng": _candidate_rng()}
     runner.state["decision"] = decision("e1")
     runner.state["status"] = "predicted"
     runner.command("act", {"fingerprint": p["fingerprint"]})
@@ -998,7 +1112,7 @@ def _experiment_runner(runner, tmp_path, plan, monkeypatch):
     monkeypatch.setattr(
         loop, "field_text", Mock(return_value=("book", {"model": "t", "latency_ms": 1}))
     )
-    runner.experiment = {"proposals": [plan], "rate": 1.0}
+    runner.experiment = {"proposals": [plan], "rate": 0.5, "rng": _candidate_rng()}
     runner.state["decision"] = decision("e1")
     runner.state["status"] = "predicted"
     return store
@@ -1075,7 +1189,8 @@ def test_experiment_stale_plan_suppresses_live_fallback(runner, tmp_path, monkey
     store = _experiment_runner(runner, tmp_path, plan, monkeypatch)
     live = Mock()
     live.choose = Mock(return_value={"id": "e3", "kind": "click"})
-    runner.experiment = {"proposals": [plan], "model": live, "rate": 1.0}
+    runner.experiment = {"proposals": [plan], "model": live, "rate": 0.5,
+                         "rng": _candidate_rng()}
     runner.command("act", {"fingerprint": p["fingerprint"]})
     assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
     live.choose.assert_not_called()
@@ -1107,7 +1222,8 @@ def test_experiment_stamped_plan_stale_when_newer_evidence_refutes(runner, tmp_p
     refuting = Mock()
     refuting.refuted = Mock(return_value=True)
     refuting.digest = "refuting-digest"
-    runner.experiment = {"proposals": [plan], "model": refuting, "rate": 1.0}
+    runner.experiment = {"proposals": [plan], "model": refuting, "rate": 0.5,
+                         "rng": _candidate_rng()}
     runner.command("act", {"fingerprint": p["fingerprint"]})
     assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
     stale = next(e for e in store.load() if e["event"] == "experiment_plan_stale")
@@ -1160,7 +1276,8 @@ def test_experiment_stamped_plan_requires_current_model_when_configured(runner, 
     p = runner.state["page"]
     plan = _stamped_plan(runner, choice_model_digest="some-digest")
     store = _experiment_runner(runner, tmp_path, plan, monkeypatch)
-    runner.experiment = {"proposals": [plan], "rate": 1.0, "require_current_model": True}
+    runner.experiment = {"proposals": [plan], "rate": 0.5,
+                         "rng": _candidate_rng(), "require_current_model": True}
     runner.command("act", {"fingerprint": p["fingerprint"]})
     assert runner.state["browser"].act.call_args.args[0]["id"] == "e1"
     stale = next(e for e in store.load() if e["event"] == "experiment_plan_stale")
@@ -1180,7 +1297,7 @@ def test_experiment_assignment_meta_carries_itt_context(runner, tmp_path):
     runner.instance_id = "inst-7"
     proposal_model = Mock()
     proposal_model.choose = Mock(return_value={"id": "e3", "kind": "click"})
-    runner.experiment = {"model": proposal_model, "rate": 1.0}
+    runner.experiment = {"model": proposal_model, "rate": 0.5, "rng": _candidate_rng()}
     runner.state["decision"] = decision("e1")
     runner.state["status"] = "predicted"
     p = runner.state["page"]
@@ -1205,7 +1322,7 @@ def test_experiment_proposals_config_validated_in_init(monkeypatch):
     monkeypatch.setattr(loop, "Browser", browser_cls)
     # Stamped proposals alone are a valid experiment config — no model needed.
     loop.Agent("https://example.test", "goal", experiment={
-        "proposals": [{"state": "s", "proposal": {"id": "x"}}], "rate": 1.0,
+        "proposals": [{"state": "s", "proposal": {"id": "x"}}], "rate": 0.5,
     })
     with pytest.raises(ValueError, match="proposals"):
         loop.Agent("https://example.test", "goal", experiment={
@@ -1274,11 +1391,12 @@ def test_run_records_structured_abort_reason_for_crashes(runner, tmp_path):
 
 def _causal_evidence():
     """Randomized evidence: assigning the high-overlap click was beneficial
-    for the divergence premise (model picked a low-overlap click)."""
+    for the divergence premise (model picked a low-overlap click). Enough
+    per arm for the confidence sequence to establish the sign."""
     from jev_ultrafast.dream import ExplorationPolicy
 
     events = []
-    for i in range(8):
+    for i in range(24):
         for arm, success in (("candidate", True), ("control", False)):
             meta = {
                 "experiment_id": f"x{i}{arm}",
@@ -1349,12 +1467,10 @@ def test_causal_policy_canary_proposal_enters_randomized_assignment(runner, tmp_
     p = runner.state["page"]
     p["actions"] = [a for a in p["actions"] if a["id"] != "e2"]
     p["fingerprint"] = fingerprint(p)
-    import random
-
     runner.experiment = {
         "causal_policy": CausalChoicePolicy(mode="canary", trial_model=model),
-        "rng": random.Random(0),  # deterministic roll < rate
-        "rate": 1.0,
+        "rng": _candidate_rng(),  # deterministic roll < rate
+        "rate": 0.5,
     }
     runner.state["decision"] = decision("e1")
     runner.state["status"] = "predicted"

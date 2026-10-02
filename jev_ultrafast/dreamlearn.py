@@ -29,9 +29,10 @@ These are Level-1/Level-2 learners in the DREAM stack:
   produced a measured outcome are censored (with a structured termination
   reason) rather than counted as failures. Support and effect certainty are
   separate: ``support_sufficient`` is the weighted-sample floor,
-  ``effect_status`` is the sign actually established by an α-spent
-  approximate sequential interval, and differential censoring blocks
-  establishment outright.
+  ``effect_status`` is the sign established by an anytime-valid confidence
+  sequence (multiplicity-corrected across the tracked hypothesis family),
+  and censoring is handled twice — rate-imbalance gates plus Manski
+  worst/best-case bounds that must agree with the sequence.
 - Level 5 (``TrialChoiceModel``): the causal decision prior. It proposes only
   divergences whose randomized evidence *established* a beneficial effect,
   treats only established-harmful divergences as refuted, and keeps its
@@ -879,15 +880,15 @@ class UtilityWeights:
         )
 
 
-# --- trial cell layout (jev-trials/6) --------------------------------------
+# --- trial cell layout (jev-trials/7) --------------------------------------
 # Key (15): family, site, m_kind, m_effect, m_role, m_ov, m_rank, m_phase,
 #           p_kind, p_effect, p_role, p_ov, p_rank, p_phase, arm
-# Stats (9): assigned, analyzed, executed, censored,
-#            w_success, w_sum, w_sq, w_page, w_exec
+# Stats (10): assigned, analyzed, executed, censored,
+#             w_success, w_sum, w_sq, w_page, w_exec, w_censored
 # Costs (3): w_latency, w_tokens, w_approvals
 # Reasons (9): one counter per TERMINATION_REASONS entry
 _TRIAL_KEY_LEN = 15
-_TRIAL_STATS = 9
+_TRIAL_STATS = 10
 _TRIAL_COSTS = 3
 _COST_BASE = _TRIAL_KEY_LEN + _TRIAL_STATS
 _REASON_BASE = _COST_BASE + _TRIAL_COSTS
@@ -895,6 +896,12 @@ TRIAL_CELL_LEN = _REASON_BASE + len(TERMINATION_REASONS)
 # The sufficient-statistics tail stored per cell (everything after the key).
 TRIAL_COUNT_LEN = TRIAL_CELL_LEN - _TRIAL_KEY_LEN
 _COUNT_REASON_BASE = _REASON_BASE - _TRIAL_KEY_LEN
+# Historical cell arities for migration dispatch (detected by shape, not the
+# version label): v4 is the collapsed-scope format, v5 lacks the
+# indeterminate_execution reason, v6 lacks the w_censored statistic.
+_V4_CELL_LEN = 15
+_V5_CELL_LEN = 35
+_V6_CELL_LEN = 36
 
 _SIGNATURE_INDEX = {field: 2 + index for index, field in enumerate(_SIGNATURE_FIELDS)}
 _SIGNATURE_DROP_FIELDS = (
@@ -918,20 +925,19 @@ _SEQUENTIAL_SPEND = 1.0 / _ZETA_1_5
 
 
 def _sequential_alpha(looks: float, *, base: float) -> float:
-    """Alpha spent at look ``n``: a summable n^-3/2 spending sequence.
+    """Error budget spent at look ``n``: a summable n^-3/2 spending sequence.
 
-    Establishment is checked whenever a contrast is recomputed, so the
-    per-look error budget must be summable: ``α_n = base·n^-1.5/ζ(3/2)``
-    spends at most ``base`` in total over every integer look.
-
-    Honesty caveat: this spending discipline is applied to an *approximate*
-    per-look interval — a Newcombe-Wilson difference built on a
-    self-normalized IPW estimate with Kish effective sample size. That
-    interval is not an exact-coverage guarantee for the IPW estimator, so the
-    composition is an α-spent approximate sequential interval, **not** a
-    formally anytime-valid confidence sequence. Multiplicity across
-    simultaneously tracked hypotheses is likewise not corrected (documented
-    limitation); the conservative direction is always ``unresolved``.
+    A contrast is recomputed whenever evidence arrives — an unbounded number
+    of peeks — so the per-look budget must sum over all integer sample sizes:
+    ``α_n = base·n^-1.5/ζ(3/2)`` spends at most ``base`` in total. Feeding
+    this budget into *exact* per-look concentration bounds (KL/Chernoff for
+    uniform weights, Hoeffding for non-uniform) composes a formally
+    anytime-valid confidence sequence: the probability that the true
+    candidate−control difference ever leaves the reported interval is ≤ the
+    spent budget, uniformly over all sample sizes. Multiplicity across the
+    simultaneously tracked hypothesis family is Bonferroni-controlled —
+    ``CounterfactualTrials.SEQUENTIAL_ALPHA`` is split across contexts before
+    the look-wise spending is applied.
     """
     n = max(1.0, float(looks))
     return min(0.5, float(base) * _SEQUENTIAL_SPEND / (n ** 1.5))
@@ -939,6 +945,89 @@ def _sequential_alpha(looks: float, *, base: float) -> float:
 
 def _z_for_alpha(alpha: float) -> float:
     return NormalDist().inv_cdf(1.0 - float(alpha) / 2.0)
+
+
+def _bernoulli_kl(p: float, q: float) -> float:
+    """kl(Bern(p) ‖ Bern(q)) with the standard 0·log 0 = 0 conventions."""
+    if p <= 0.0:
+        return -math.log1p(-q) if q < 1.0 else math.inf
+    if p >= 1.0:
+        return -math.log(q) if q > 0.0 else math.inf
+    if q <= 0.0 or q >= 1.0:
+        return math.inf
+    return p * math.log(p / q) + (1.0 - p) * math.log((1.0 - p) / (1.0 - q))
+
+
+def _kl_bound(p_hat: float, n: int, tau: float, *, upper: bool) -> float:
+    """One side of ``{p : n·kl(p̂‖p) ≤ τ}`` — the Chernoff/KL confidence bound.
+
+    For iid Bernoulli(p) samples, P_p(p outside the one-sided bound) ≤
+    e^{-τ} at *every* n — an exact per-look guarantee, not an asymptotic
+    interval. Solved by bisection; degenerate p̂ at the boundary has a
+    closed form.
+    """
+    if n <= 0:
+        return 1.0 if upper else 0.0
+    if p_hat <= 0.0:
+        return 1.0 - math.exp(-tau / n) if upper else 0.0
+    if p_hat >= 1.0:
+        return 1.0 if upper else math.exp(-tau / n)
+    target = tau / n
+    lo, hi = (p_hat, 1.0) if upper else (0.0, p_hat)
+    for _ in range(80):
+        mid = (lo + hi) / 2.0
+        inside = _bernoulli_kl(p_hat, mid) <= target
+        if upper:
+            if inside:
+                lo = mid
+            else:
+                hi = mid
+        else:
+            if inside:
+                hi = mid
+            else:
+                lo = mid
+    return lo if upper else hi
+
+
+def _arm_confidence_bounds(
+    analyzed: int, wsum: float, wsq: float, ws: float, tau: float
+) -> tuple[float, float]:
+    """Two-sided bound on an arm's success rate, exact at tail budget e^{-τ}.
+
+    IPW weighting is a reweighting of iid Bernoulli outcomes under randomized
+    assignment — the recorded propensity decides *which* arm a run lands in,
+    not what the arm does. Uniform weights recover the exact Chernoff/KL
+    bound on the sample mean over ``analyzed`` draws; non-uniform weights
+    fall back to Hoeffding's inequality for a weighted sum of [0,1] outcomes
+    (still exact, just wider). Coverage holds at every look simultaneously
+    via the spending sequence in ``_contrast``.
+    """
+    if analyzed <= 0 or wsum <= 0:
+        return 0.0, 1.0
+    p_hat = ws / wsum
+    # All-equal weights ⇒ wsq == n·w² and wsum == n·w ⇒ wsq·analyzed == wsum².
+    uniform = abs(wsq * analyzed - wsum * wsum) <= 1e-9 * max(1.0, wsum * wsum)
+    if uniform:
+        return (
+            _kl_bound(p_hat, int(analyzed), tau, upper=False),
+            _kl_bound(p_hat, int(analyzed), tau, upper=True),
+        )
+    radius = math.sqrt(max(0.0, tau * wsq / (2.0 * wsum * wsum)))
+    return max(0.0, p_hat - radius), min(1.0, p_hat + radius)
+
+
+# Raw-cell stat accessors for the confidence-sequence math (cell layout above).
+def _arm_ws(counts) -> float:
+    return counts[4]
+
+
+def _arm_wsum(counts) -> float:
+    return counts[5]
+
+
+def _arm_wsq(counts) -> float:
+    return counts[6]
 
 
 def _newcombe(candidate: dict, control: dict, *, z: float = 1.96) -> list[float]:
@@ -1026,11 +1115,27 @@ def _migrate_v5_trial_cells(cells) -> tuple[tuple, ...]:
     ``indeterminate_execution`` between ``recorder_shutdown`` and
     ``unverified_claim``. Recorded verdicts carry over verbatim — the new
     slot starts at zero because v5 could never record the state. Detected by
-    cell arity (v5 is exactly one counter short), not the version label.
+    cell arity, not the version label.
     """
-    insert_at = _REASON_BASE + _REASON_INDEX["indeterminate_execution"]
+    insert_at = _V6_CELL_LEN - len(TERMINATION_REASONS) + _REASON_INDEX["indeterminate_execution"]
     return tuple(
         tuple(cell[:insert_at]) + (0,) + tuple(cell[insert_at:])
+        for cell in cells
+    )
+
+
+def _migrate_v6_trial_cells(cells) -> tuple[tuple, ...]:
+    """v6 cells → v7: the stats block gained ``w_censored``.
+
+    v7 records the IPW weight mass of censored assignments so Manski-style
+    worst/best-case endpoint bounds can be computed at estimate time. A v6
+    cell cannot recover that weight — it migrates as ``0.0`` (never an
+    invented value) and ``_arm_entry`` imputes a conservative fallback from
+    the analyzed-pool mean weight, flagging the bound as imputed.
+    """
+    insert_at = _TRIAL_KEY_LEN + 9
+    return tuple(
+        tuple(cell[:insert_at]) + (0.0,) + tuple(cell[insert_at:])
         for cell in cells
     )
 
@@ -1069,30 +1174,43 @@ class CounterfactualTrials:
     - ``support_sufficient`` — do both arms have enough weighted observations
       (``MIN_ESS``) to say anything at all?
     - ``effect_status`` — has the data actually established the sign of the
-      treatment effect? ``beneficial`` requires the *α-spent approximate*
-      interval to lie entirely above ``min_effect``; ``harmful`` requires it
-      to lie entirely below ``-min_effect``; a confidence interval that
-      crosses zero leaves the hypothesis ``unresolved`` and schedules more
-      evidence. "Eight observations exist" is not "we know the intervention
-      helps".
+      treatment effect? ``beneficial`` requires the confidence sequence to
+      lie entirely above ``min_effect`` *and* the censoring bounds to confirm
+      the margin could not be erased by the missing outcomes; ``harmful`` is
+      symmetric; a sequence that crosses the threshold leaves the hypothesis
+      ``unresolved`` and schedules more evidence. "Eight observations exist"
+      is not "we know the intervention helps".
 
     ``delta_ci`` is the fixed-sample Newcombe-Wilson interval for reporting;
-    ``alpha_spent_delta_ci`` is the interval establishment uses — the same
-    approximate construction widened by the α spent at this look (see
-    ``_sequential_alpha``). It is a heuristic discipline against repeated
-    peeking on a single hypothesis, **not** a formally anytime-valid
-    confidence sequence: the underlying per-look interval is an approximation
-    for an IPW estimate, and simultaneous hypotheses are not multiplicity-
-    corrected.
+    ``delta_cs`` is the interval establishment uses — a **confidence
+    sequence** for the candidate−control difference, valid at every look
+    simultaneously. It is built by spending ``SEQUENTIAL_ALPHA`` over all
+    integer looks (``_sequential_alpha``) on *exact* per-look concentration
+    bounds: the Chernoff/KL bound on a Bernoulli mean when the IPW weights
+    are uniform, Hoeffding's weighted bound when they are not. Unlike the
+    previous α-spent Newcombe approximation, the composition is formally
+    anytime-valid, and ``SEQUENTIAL_ALPHA`` is Bonferroni-split across the
+    simultaneously tracked hypothesis family (``hypothesis_count``).
 
-    Censoring is a first-class causal concern, not bookkeeping: per-arm
-    ``censor_rate`` and the ``terminations`` reason breakdown are reported,
-    and ``censoring_imbalance`` refuses to establish an effect when either
-    arm is censored at an extreme rate or the arms are censored at sharply
-    different rates — eight surviving successes must not hide forty
-    candidate-arm crashes. The taxonomy separates an operator closing the
-    session (unrelated to treatment) from a crash/timeout that the treatment
-    itself may have caused, so differential censoring stays visible.
+    Censoring is a first-class causal concern, not bookkeeping. Three
+    mechanisms handle it:
+
+    - per-arm ``censor_rate`` and the ``terminations`` reason breakdown are
+      reported, and ``censoring_imbalance`` refuses to establish when either
+      arm is censored at an extreme rate or the arms are censored at sharply
+      different rates;
+    - ``p_success_bounds`` per arm and ``delta_bounds`` for the contrast are
+      Manski worst/best-case bounds: every censored unit is re-counted as a
+      success (upper) or a failure (lower) — no ignorable-censoring
+      assumption at all;
+    - establishment requires the bounds to *agree* with the sequence: if
+      ``delta_cs`` excludes the threshold but ``delta_bounds`` still crosses
+      it, the missing outcomes could account for the apparent effect and the
+      hypothesis stays ``unresolved`` (``censoring_bounds_cross_threshold``).
+
+    The taxonomy separates an operator closing the session (unrelated to
+    treatment) from a crash/timeout that the treatment itself may have
+    caused, so differential censoring stays visible.
 
     ``p_page_changed`` remains secondary telemetry over *executed* trials —
     page movement is only defined for assignments that reached the browser —
@@ -1118,7 +1236,7 @@ class CounterfactualTrials:
     # analysis, and counting it twice would double-weight that arm. Reported
     # so corruption stays visible instead of silently biasing an estimate.
     duplicates: int = 0
-    version: str = "jev-trials/6"
+    version: str = "jev-trials/7"
 
     MIN_ESS = 8.0
     MIN_EFFECT = 0.0
@@ -1168,6 +1286,10 @@ class CounterfactualTrials:
                 cell[8] += weight
             if outcome == "censored":
                 cell[3] += 1
+                # The censored units' weight mass is kept so estimate-time
+                # worst/best-case endpoint bounds can be computed — censored
+                # outcomes are missing data, but their *mass* is not.
+                cell[9] += weight
                 cell[_COUNT_REASON_BASE + _REASON_INDEX[reason]] += 1
                 return
             cell[1] += 1  # analyzed (ITT denominator)
@@ -1175,9 +1297,9 @@ class CounterfactualTrials:
             cell[5] += weight
             cell[6] += weight * weight
             latency, tokens, approvals = run_costs
-            cell[9] += latency * weight
-            cell[10] += tokens * weight
-            cell[11] += approvals * weight
+            cell[10] += latency * weight
+            cell[11] += tokens * weight
+            cell[12] += approvals * weight
 
         for run_id, run_events in runs.items():
             run_events.sort(key=lambda e: (e.get("sequence", 0), e.get("recorded_at_ms", 0)))
@@ -1337,28 +1459,53 @@ class CounterfactualTrials:
             slot = bucket.setdefault(arm, [0] * TRIAL_COUNT_LEN)
             for i, v in enumerate(cell[_TRIAL_KEY_LEN:]):
                 slot[i] += v
+        # Multiplicity is over every tracked hypothesis, not just the ones
+        # this report happens to print — a filtered view does not shrink the
+        # family that is actually being watched.
+        hypothesis_count = len({tuple(cell[:_TRIAL_KEY_LEN - 1]) for cell in self.cells})
         for ctx, bucket in grouped.items():
-            arms["|".join(ctx)] = self._contrast(bucket)
+            arms["|".join(ctx)] = self._contrast(bucket, hypothesis_count=hypothesis_count)
         return arms
 
     @staticmethod
     def _arm_entry(counts: list) -> dict:
         """Per-arm report from the sufficient statistics (see cell layout)."""
-        assigned, analyzed, executed, censored, ws, wsum, wsq, wpage, wexec = counts[:9]
-        w_latency, w_tokens, w_approvals = counts[9:12]
+        (
+            assigned, analyzed, executed, censored,
+            ws, wsum, wsq, wpage, wexec, wcensored,
+        ) = counts[:10]
+        w_latency, w_tokens, w_approvals = counts[10:13]
         terminations = {
-            reason: int(counts[12 + index])
+            reason: int(counts[13 + index])
             for index, reason in enumerate(TERMINATION_REASONS)
-            if counts[12 + index]
+            if counts[13 + index]
         }
         ess = (wsum * wsum / wsq) if wsq else 0.0
         p_success = (ws / wsum) if wsum else 0.0
+        # Cells migrated from jev-trials/6 never recorded the censored mass's
+        # weight. Impute it conservatively — each censored unit counts at
+        # least one full observation, plus the analyzed pool's mean weight
+        # when that is heavier — and say so on the report.
+        wcensored_imputed = censored > 0 and wcensored <= 0.0
+        wcensored_eff = wcensored
+        if wcensored_imputed:
+            mean_weight = (wsum / analyzed) if analyzed else 0.0
+            wcensored_eff = censored * max(1.0, mean_weight)
+        total = wsum + wcensored_eff
         return {
             # Primary endpoint: verified run success under ITT.
             # ``p_page_changed`` is executed-trial telemetry — never a
             # treatment effect.
             "p_success": p_success,
             "p_success_ci": list(_wilson_interval(p_success, ess)),
+            # Manski bounds on the endpoint under arbitrary censored
+            # outcomes: every censored unit could have succeeded (best case)
+            # or failed (worst case). No ignorable-censoring assumption — the
+            # honest range is exactly what the missing outcomes could do.
+            "p_success_bounds": [ws / total if total else 0.0,
+                                 (ws + wcensored_eff) / total if total else 1.0],
+            "w_censored": wcensored_eff,
+            "w_censored_imputed": wcensored_imputed,
             "p_page_changed": (wpage / wexec) if wexec else None,
             "assigned": assigned,
             "trials": analyzed,
@@ -1376,15 +1523,28 @@ class CounterfactualTrials:
         }
 
     @classmethod
-    def _contrast(cls, bucket: dict[str, list], *, min_effect=None, weights=None) -> dict:
+    def _contrast(
+        cls,
+        bucket: dict[str, list],
+        *,
+        min_effect=None,
+        weights=None,
+        hypothesis_count: int = 1,
+    ) -> dict:
         """Per-arm estimates plus the candidate−control contrast.
 
         Separates *support* from *effect certainty*: ``support_sufficient`` is
         the weighted-sample floor, ``effect_status`` is the sign actually
-        established by the α-spent approximate interval. A censoring-rate
-        imbalance blocks establishment outright — the surviving subset of an
-        arm censored far more than the other is a biased sample, not a
-        smaller unbiased one.
+        established by the confidence sequence. A censoring-rate imbalance
+        blocks establishment outright — the surviving subset of an arm
+        censored far more than the other is a biased sample, not a smaller
+        unbiased one — and the Manski ``delta_bounds`` veto catches the
+        subtler case where balanced censoring could still flip the sign.
+
+        ``hypothesis_count`` is the number of simultaneously tracked
+        divergences; the family's ``SEQUENTIAL_ALPHA`` is Bonferroni-split
+        across them before the per-look spending is applied, so no fleet of
+        parallel hypotheses can inflate the false-establishment rate.
         """
         entry = {arm: cls._arm_entry(counts) for arm, counts in bucket.items()}
         if "candidate" not in entry or "control" not in entry:
@@ -1392,19 +1552,42 @@ class CounterfactualTrials:
         candidate, control = entry["candidate"], entry["control"]
         delta = candidate["p_success"] - control["p_success"]
         entry["delta"] = delta
+        # Worst/best-case difference under arbitrary censored outcomes —
+        # the honest range the unobserved endpoints could force.
+        entry["delta_bounds"] = [
+            candidate["p_success_bounds"][0] - control["p_success_bounds"][1],
+            candidate["p_success_bounds"][1] - control["p_success_bounds"][0],
+        ]
+        k = max(1, int(hypothesis_count))
+        entry["hypothesis_count"] = k
+        # The family's error budget is split over the concurrent hypotheses
+        # (Bonferroni); each hypothesis then spends its share over looks.
+        family_alpha = cls.SEQUENTIAL_ALPHA / k
         if candidate["ess"] and control["ess"]:
             entry["delta_ci"] = _newcombe(candidate, control)
-            # Establishment uses the α-spent interval: the fixed-sample
+            # Establishment uses the confidence sequence: the fixed-sample
             # interval is for reporting, not for deciding that an experiment
             # is settled after being peeked at every batch.
             looks = max(1, candidate["trials"] + control["trials"])
-            alpha = _sequential_alpha(looks, base=cls.SEQUENTIAL_ALPHA)
+            alpha = _sequential_alpha(looks, base=family_alpha)
             entry["sequential_alpha"] = alpha
-            entry["alpha_spent_delta_ci"] = _newcombe(candidate, control, z=_z_for_alpha(alpha))
+            # Per-look contrast budget is alpha; each arm gets half, and each
+            # arm's two-sided bound splits that half across its two tails —
+            # per-tail probability e^{-tau} = alpha/4.
+            tau = math.log(4.0 / alpha) if alpha > 0 else math.inf
+            cand_lo, cand_hi = _arm_confidence_bounds(
+                candidate["trials"], _arm_wsum(bucket["candidate"]),
+                _arm_wsq(bucket["candidate"]), _arm_ws(bucket["candidate"]), tau,
+            )
+            ctrl_lo, ctrl_hi = _arm_confidence_bounds(
+                control["trials"], _arm_wsum(bucket["control"]),
+                _arm_wsq(bucket["control"]), _arm_ws(bucket["control"]), tau,
+            )
+            entry["delta_cs"] = [cand_lo - ctrl_hi, cand_hi - ctrl_lo]
         else:
             entry["delta_ci"] = None
             entry["sequential_alpha"] = None
-            entry["alpha_spent_delta_ci"] = None
+            entry["delta_cs"] = None
         support = bool(candidate["support_sufficient"] and control["support_sufficient"])
         entry["support_sufficient"] = support
         imbalance = (
@@ -1414,19 +1597,32 @@ class CounterfactualTrials:
         entry["censoring_imbalance"] = imbalance
         threshold = cls.MIN_EFFECT if min_effect is None else max(0.0, float(min_effect))
         entry["min_effect"] = threshold
-        sequential = entry["alpha_spent_delta_ci"]
-        if not support or sequential is None:
+        cs = entry["delta_cs"]
+        bounds = entry["delta_bounds"]
+        if not support or cs is None:
             entry["effect_status"] = "insufficient_data"
             entry["unresolved_reason"] = None
         elif imbalance:
             entry["effect_status"] = "unresolved"
             entry["unresolved_reason"] = "censoring_imbalance"
-        elif sequential[0] > threshold:
-            entry["effect_status"] = "beneficial"
-            entry["unresolved_reason"] = None
-        elif sequential[1] < -threshold:
-            entry["effect_status"] = "harmful"
-            entry["unresolved_reason"] = None
+        elif cs[0] > threshold:
+            # The sequence says the effect is positive — but only if the
+            # censored outcomes cannot plausibly erase the whole margin is
+            # that finding allowed to stand. A bound crossing the threshold
+            # means informative censoring could account for the result.
+            if bounds[0] > threshold:
+                entry["effect_status"] = "beneficial"
+                entry["unresolved_reason"] = None
+            else:
+                entry["effect_status"] = "unresolved"
+                entry["unresolved_reason"] = "censoring_bounds_cross_threshold"
+        elif cs[1] < -threshold:
+            if bounds[1] < -threshold:
+                entry["effect_status"] = "harmful"
+                entry["unresolved_reason"] = None
+            else:
+                entry["effect_status"] = "unresolved"
+                entry["unresolved_reason"] = "censoring_bounds_cross_threshold"
         else:
             entry["effect_status"] = "unresolved"
             entry["unresolved_reason"] = "ci_crosses_zero"
@@ -1555,7 +1751,14 @@ class CounterfactualTrials:
                     # resolution simply keeps walking (and may return None).
                     continue
                 contrast = {
-                    **self._contrast(bucket, min_effect=min_effect, weights=weights),
+                    **self._contrast(
+                        bucket,
+                        min_effect=min_effect,
+                        weights=weights,
+                        hypothesis_count=len(
+                            {tuple(cell[:_TRIAL_KEY_LEN - 1]) for cell in self.cells}
+                        ),
+                    ),
                     "level": level,
                     "signature_level": signature_level,
                 }
@@ -1580,15 +1783,20 @@ class CounterfactualTrials:
             raise ValueError(f"Unknown counterfactual-trials keys: {sorted(unknown)}")
         cells = tuple(tuple(c) for c in payload.get("cells", ()))
         version = str(payload.get("version", cls.version))
-        if cells and len(cells[0]) == 15:
+        if cells and len(cells[0]) == _V4_CELL_LEN:
             # v4 evidence migrates in place; the collapsed scope is split and
             # the widened coordinates land as "unknown" wildcards.
-            cells = _migrate_v4_trial_cells(cells)
+            cells = _migrate_v6_trial_cells(_migrate_v4_trial_cells(cells))
             version = cls.version
-        elif cells and len(cells[0]) == TRIAL_CELL_LEN - 1:
+        elif cells and len(cells[0]) == _V5_CELL_LEN:
             # v5 cells are one reason counter short of v6; splice in the new
             # indeterminate_execution slot rather than rejecting the store.
-            cells = _migrate_v5_trial_cells(cells)
+            cells = _migrate_v6_trial_cells(_migrate_v5_trial_cells(cells))
+            version = cls.version
+        elif cells and len(cells[0]) == _V6_CELL_LEN:
+            # v6 cells lack the censored-weight statistic; splice a zero so
+            # the bound computation can apply its imputed fallback.
+            cells = _migrate_v6_trial_cells(cells)
             version = cls.version
         if any(len(c) != TRIAL_CELL_LEN for c in cells):
             raise ValueError("Unsupported counterfactual-trials cell arity")
@@ -1624,9 +1832,9 @@ class TrialChoiceModel:
     Two facts are kept separate, because conflating them was the v0.8.3
     defect: *having enough samples* (``support_sufficient``) is not *having
     established the effect* (``effect_status``). ``choose`` proposes only a
-    ``beneficial`` divergence — the α-spent approximate interval lies
-    entirely above the practical threshold — and ``refuted`` is true only
-    for a ``harmful`` one. A supported cell whose interval still crosses zero is
+    ``beneficial`` divergence — the confidence sequence lies entirely above
+    the practical threshold and the censoring bounds agree — and ``refuted``
+    is true only for a ``harmful`` one. A supported cell whose interval still crosses zero is
     ``unresolved``: it schedules more evidence, and it must never permanently
     suppress a potentially beneficial hypothesis or prematurely adopt one.
 
@@ -1752,7 +1960,7 @@ class TrialChoiceModel:
                 continue
             # Among established beneficial effects, prefer the strongest
             # point estimate — establishment is already gated by the
-            # α-spent approximate interval and the practical threshold.
+            # confidence sequence, the censoring bounds, and the threshold.
             if best is None or estimate["delta"] > best[0]:
                 best = (estimate["delta"], candidate, estimate)
         if best is None:
@@ -1774,7 +1982,8 @@ class TrialChoiceModel:
             "signature_level": estimate.get("signature_level"),
             "effect_status": estimate["effect_status"],
             "support_sufficient": estimate.get("support_sufficient"),
-            "alpha_spent_delta_ci": estimate.get("alpha_spent_delta_ci"),
+            "delta_cs": estimate.get("delta_cs"),
+            "delta_bounds": estimate.get("delta_bounds"),
             "delta_ci": ci,
             # Provenance: this prediction comes only from randomized evidence.
             "source": "randomized",
@@ -2071,7 +2280,7 @@ class ExperimentScheduler:
             if status in {"beneficial", "harmful"}:
                 continue
             if estimate is not None and "candidate" in estimate and "control" in estimate:
-                sequential = estimate.get("alpha_spent_delta_ci")
+                sequential = estimate.get("delta_cs")
                 width = (sequential[1] - sequential[0]) if sequential else 1.0
                 support = min(
                     estimate["candidate"]["ess"], estimate["control"]["ess"]

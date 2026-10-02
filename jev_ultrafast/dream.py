@@ -1549,9 +1549,13 @@ class PromotionGate:
     """Fail-closed replay promotion gate.
 
     A candidate must improve the training objective and avoid regressions in
-    verified success, risk, coverage, and normalized objective on every
-    available validation/holdout split. Replay approval remains provisional; a
-    bound live-canary evidence bundle is still required before activation.
+    verified success, risk, coverage, and normalized objective on the
+    validation split. The holdout check runs in a second phase only:
+    ``DreamImprover`` calls ``assess`` once more — with holdout evidence — on
+    the single already-selected candidate, so holdout can veto a promotion
+    but never influence which candidate was selected. Replay approval remains
+    provisional; a bound live-canary evidence bundle is still required before
+    activation.
     """
 
     def __init__(
@@ -1795,12 +1799,19 @@ class DreamReport:
 class DreamImprover:
     """Evaluate bounded policy variants using historical replay.
 
-    Every candidate is evaluated on train and, when available, validation and
-    holdout worlds. Selection is among candidates that pass all replay gates,
-    rather than simply picking the training winner and checking it afterward.
-    This prevents a slightly weaker but generalizing candidate from being hidden
-    by an overfit training winner.
+    Split methodology, strictly ordered: train drives the improvement gates
+    and the candidate search, validation participates in candidate selection,
+    and the holdout split is examined exactly once — after a single candidate
+    has already been selected — as a confirmatory check on that selection. No
+    candidate is ever evaluated on holdout while selection is still open: a
+    dataset that screens policies is a validation set, not a holdout, and
+    re-examining it across the search would bias selection toward whatever
+    happens to score well on that sample.
     """
+
+    # Splits that may participate in the candidate search and selection. The
+    # holdout is deliberately absent — it is read once, post-selection.
+    SELECTION_SPLITS = ("train", "validation")
 
     def __init__(self, *, weights: ObjectiveWeights | None = None, gate: PromotionGate | None = None):
         self.weights = weights or ObjectiveWeights()
@@ -1808,8 +1819,9 @@ class DreamImprover:
 
     @staticmethod
     def _robust_gain(base_results: dict[str, ReplayResult | None], candidate_results: dict[str, ReplayResult | None]):
+        """Worst-case per-world gain over the *selection* splits only."""
         deltas = []
-        for name in ("train", "validation", "holdout"):
+        for name in DreamImprover.SELECTION_SPLITS:
             base_result, candidate_result = base_results.get(name), candidate_results.get(name)
             if base_result is not None and candidate_result is not None and base_result.metrics.worlds:
                 deltas.append(candidate_result.metrics.score_per_world - base_result.metrics.score_per_world)
@@ -1876,7 +1888,7 @@ class DreamImprover:
 
         def robust_estimated_gain(candidate_results):
             deltas = []
-            for name in ("train", "validation", "holdout"):
+            for name in self.SELECTION_SPLITS:
                 base_result, candidate_result = base_results.get(name), candidate_results.get(name)
                 if (
                     base_result is None
@@ -1893,8 +1905,12 @@ class DreamImprover:
             return min(deltas) if deltas else None
 
         evaluated = []
-        passing: list[tuple[float, float, float, ExplorationPolicy, PromotionDecision]] = []
+        # Each entry carries the candidate's selection-split replay results so
+        # the one post-selection holdout examination can reuse them.
+        passing: list[tuple[float, float, float, ExplorationPolicy, PromotionDecision, dict]] = []
         for policy in mutate_policies(base):
+            # The search touches train + validation only. The holdout
+            # simulator exists but is never handed a candidate here.
             candidate_results = {
                 name: (
                     sim.evaluate(
@@ -1903,6 +1919,7 @@ class DreamImprover:
                     ) if sim else None
                 )
                 for name, sim in simulators.items()
+                if name in self.SELECTION_SPLITS
             }
             if policy.behavior_digest == base.behavior_digest:
                 decision = PromotionDecision(
@@ -1917,13 +1934,11 @@ class DreamImprover:
                     candidate_results["train"],
                     validation_baseline=base_results["validation"],
                     validation_candidate=candidate_results["validation"],
-                    holdout_baseline=base_results["holdout"],
-                    holdout_candidate=candidate_results["holdout"],
                 )
             robust_gain = self._robust_gain(base_results, candidate_results)
             average_gain = fmean([
                 candidate_results[name].metrics.score_per_world - base_results[name].metrics.score_per_world
-                for name in ("train", "validation", "holdout")
+                for name in self.SELECTION_SPLITS
                 if base_results[name] is not None and candidate_results[name] is not None
             ])
             estimated_gain = robust_estimated_gain(candidate_results)
@@ -1935,7 +1950,9 @@ class DreamImprover:
                 "validation": (
                     asdict(candidate_results["validation"].metrics) if candidate_results["validation"] else None
                 ),
-                "holdout": asdict(candidate_results["holdout"].metrics) if candidate_results["holdout"] else None,
+                # Not evaluated during selection — backfilled once, after the
+                # winner is chosen, when a holdout split exists.
+                "holdout": None,
                 "replay_approved": decision.approved,
                 "reason": decision.reason,
                 "robust_gain_per_world": robust_gain,
@@ -1986,13 +2003,42 @@ class DreamImprover:
                     }
             evaluated.append(entry)
             if decision.approved:
-                passing.append((robust_gain, average_gain, estimated_gain or float("-inf"), policy, decision))
+                passing.append(
+                    (robust_gain, average_gain, estimated_gain or float("-inf"), policy, decision, candidate_results)
+                )
 
         if passing:
             passing.sort(
                 key=lambda item: (item[0], item[1], item[2], item[3].digest), reverse=True
             )
-            _robust, _average, _estimated, selected, promotion = passing[0]
+            _robust, _average, _estimated, selected, promotion, selected_results = passing[0]
+            # The one holdout examination of the whole run: the already-
+            # selected candidate against the incumbent, once, as a
+            # confirmatory check on the selection. If it fails, the report
+            # rejects — the search does not reopen with holdout knowledge,
+            # which would silently turn it back into a second validation set.
+            holdout_sim = simulators["holdout"]
+            if holdout_sim is not None:
+                holdout_candidate = holdout_sim.evaluate(
+                    selected,
+                    cost_model=cost_model,
+                    outcome_model=outcome_model,
+                    choice_model=choice_model,
+                    trial_model=trial_model,
+                )
+                promotion = self.gate.assess(
+                    base_results["train"],
+                    selected_results["train"],
+                    validation_baseline=base_results["validation"],
+                    validation_candidate=selected_results["validation"],
+                    holdout_baseline=base_results["holdout"],
+                    holdout_candidate=holdout_candidate,
+                )
+                for entry in evaluated:
+                    if entry["digest"] == selected.digest:
+                        entry["holdout"] = asdict(holdout_candidate.metrics)
+                        entry["holdout_examined"] = "post_selection"
+                        break
         else:
             selected = base
             base_train = base_results["train"]

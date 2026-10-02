@@ -6,6 +6,7 @@ import base64
 import hashlib
 import inspect
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -37,6 +38,14 @@ from .signing import verify_keys_from_env
 from .trace import DreamTraceRecorder, compact_candidate
 
 TERMINAL_STATUSES = {"claimed_done", "done", "blocked"}
+
+# Minimum randomized-allocation share for each experiment arm. A candidate-
+# vs-control contrast needs nonzero support on *both* arms to identify an
+# effect at all: rate=1.0 (or 0.0) makes every assignment the same arm, which
+# produces trial-looking evidence that can never estimate a treatment effect.
+# The small floor additionally keeps the thinner arm's IPW weights bounded
+# (propensity >= 0.05 ⇒ weight <= 20) so the confidence sequence stays sane.
+MIN_EXPERIMENT_ARM_RATE = 0.05
 
 
 def _abort_reason(exc: BaseException) -> str:
@@ -104,12 +113,28 @@ class Agent:
         instance_id=None,
         experiment=None,
         experiment_verify_keys=None,
+        input_guarantee=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
             raise ValueError("Supply a task")
         plan = [task]
         self.pending_text = None
+        # Execution guarantee for browser input. "atomic" (default) validates
+        # and mutates in one isolated-world turn; "trusted" dispatches real CDP
+        # input under pre-press/pre-release revalidation. Automatic escalation
+        # happens ONLY after the atomic path provably did not mutate — a silent
+        # no-op synthetic click on an isTrusted-gated site is indistinguishable
+        # from one that landed, so it is never retried; the operator selects
+        # trusted input up front for those sites (JEV_INPUT_GUARANTEE).
+        guarantee = input_guarantee if input_guarantee is not None else os.environ.get(
+            "JEV_INPUT_GUARANTEE", "atomic"
+        )
+        if guarantee not in {"atomic", "trusted"}:
+            raise ValueError(
+                "input_guarantee must be 'atomic' or 'trusted'"
+            )
+        self.input_guarantee = guarantee
         self.decision_backend = decision_backend
         self.verifier = verifier
         self.policy = DefaultActionPolicy() if policy is None else policy
@@ -136,8 +161,14 @@ class Agent:
                 rate = float(experiment.get("rate", 0.0) or 0.0)
             except (TypeError, ValueError):
                 raise ValueError("experiment rate must be a number") from None
-            if not 0.0 < rate <= 1.0:
-                raise ValueError("experiment rate must be in (0, 1]")
+            if not MIN_EXPERIMENT_ARM_RATE <= rate <= 1.0 - MIN_EXPERIMENT_ARM_RATE:
+                raise ValueError(
+                    "experiment rate must keep both arms supported: "
+                    f"{MIN_EXPERIMENT_ARM_RATE} <= rate <= "
+                    f"{1.0 - MIN_EXPERIMENT_ARM_RATE}. A degenerate allocation "
+                    "(rate=1.0 assigns every run to the candidate) produces "
+                    "trial evidence that cannot estimate a causal effect."
+                )
             proposals = experiment.get("proposals")
             if proposals is not None and not isinstance(proposals, (list, tuple)):
                 raise ValueError("experiment proposals must be a list of stamped plans")
@@ -779,7 +810,7 @@ class Agent:
                 trial_model = experiment.get("model")
                 causal_policy = experiment.get("causal_policy")
                 rate = float(experiment.get("rate", 0.0) or 0.0)
-                if 0.0 < rate <= 1.0:
+                if MIN_EXPERIMENT_ARM_RATE <= rate <= 1.0 - MIN_EXPERIMENT_ARM_RATE:
                     offered_now, goal_tokens = self._annotated_offered()
                     # A stamped DreamReport experiment plan is immutable: it
                     # executes only when every stamped binding still verifies
@@ -1117,10 +1148,13 @@ class Agent:
                     selected=action.get("id"),
                     kind=action.get("kind"),
                     effect=classify_effect(action).value,
+                    guarantee=self.input_guarantee,
                     experiment=experiment_meta,
                 )
             try:
-                state["browser"].act(action, page, text=text)
+                state["browser"].act(
+                    action, page, text=text, guarantee=self.input_guarantee
+                )
             except StalePage:
                 # Provably pre-mutation: safe to re-perceive — say so in the
                 # journal instead of leaving the attempt dangling.

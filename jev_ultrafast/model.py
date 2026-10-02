@@ -12,7 +12,15 @@ from urllib.parse import urlparse
 
 import httpx
 
-from .privacy import action_goal_overlap, redact_text, sanitize_action, sanitize_page, tokenize
+from .privacy import (
+    action_goal_overlap,
+    assert_endpoint_allowed,
+    outbound_text,
+    redact_text,
+    sanitize_action,
+    sanitize_page,
+    tokenize,
+)
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
 CLIENT = httpx.Client(http2=True, timeout=float(os.environ.get("JEV_MODEL_TIMEOUT", "25")))
@@ -47,6 +55,9 @@ class SystemOneBackend:
 
     def decide(self, body):
         url = self.url or os.environ.get("JEV_DECISION_BASE_URL", "https://api.typesafe.ai/v1/systemone")
+        # Routing level binds before the request is even assembled: a
+        # local-only run refuses a remote endpoint outright.
+        assert_endpoint_allowed(url)
         key = self.api_key or os.environ.get("JEV_DECISION_API_KEY") or os.environ.get("TYPESAFE_API_KEY")
         host = (urlparse(url).hostname or "").lower()
         if not key and host not in {"127.0.0.1", "localhost", "::1"}:
@@ -252,8 +263,15 @@ def choose(state, goal, history, backend=None, exploration_policy=None, percepti
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
     operations.update(DONE="Every requirement is visibly satisfied.", BLOCKED="No supported operation can progress.")
+    # The goal leaves the machine only at the routing level's discretion:
+    # local scoring uses the raw text, the request body carries the bound copy.
+    sent_goal = outbound_text(goal)
     questions = {
-        "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
+        "operation": {
+            "type": "choice",
+            "criteria": operations,
+            "instructions": {"goal": sent_goal, "rules": NEXT_ACTION},
+        }
     }
     for operation, candidates_for_operation in targets.items():
         criteria = {}
@@ -267,7 +285,7 @@ def choose(state, goal, history, backend=None, exploration_policy=None, percepti
         questions[operation.lower() + "_target"] = {
             "type": "choice",
             "criteria": criteria,
-            "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
+            "instructions": {"goal": sent_goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
         }
     body = {
         "model": os.environ.get("JEV_DECISION_MODEL", os.environ.get("TYPESAFE_MODEL", "jev-latest")),
@@ -338,7 +356,7 @@ def choose(state, goal, history, backend=None, exploration_policy=None, percepti
 def field_context(goal, action, page, history):
     clean = sanitize_action(action)
     return {
-        "goal": goal,
+        "goal": outbound_text(goal),
         "field": {k: clean.get(k) for k in ("label", "role", "value")},
         "page": sanitize_page(page),
         "recent_actions": [
@@ -350,6 +368,7 @@ def field_context(goal, action, page, history):
 
 def field_text(context):
     base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+    assert_endpoint_allowed(base)
     key = os.environ.get("TEXT_MODEL_API_KEY")
     host = (urlparse(base).hostname or "").lower()
     if not key and host not in {"127.0.0.1", "localhost", "::1"}:

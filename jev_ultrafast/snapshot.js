@@ -125,7 +125,15 @@
       clip(e.getAttribute('href'),1024),clip(scope?.innerText,2000)];
   };
 
-  const actions=[];
+  // Actions are collected per observed node, then merged round-robin across
+  // nodes. A native <select> expands into one action per option, so a single
+  // giant dropdown in DOM order could otherwise consume the entire bounded
+  // catalogue before later controls are ever represented — the 1200-cap below
+  // would truncate them away before Python's goal-aware ranking could see
+  // them. Interleaving guarantees every node contributes its first action
+  // before any node contributes its second, so the cap starves a node's
+  // deep alternative list instead of whole controls behind it.
+  const buckets=[];
   for (const e of document.querySelectorAll(selector)) {
     if (!safe(e) || !visible(e) || e.matches(':disabled') || e.closest('[aria-disabled="true"]')) continue;
     const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2, rname=role(e);
@@ -141,21 +149,32 @@
 
     if (e.tagName==='SELECT' && !e.multiple) {
       const current=[...e.selectedOptions].map(o=>clip(o.label,256)).join(', ');
+      const bucket=[];
       for (let optionIndex=0; optionIndex<e.options.length; optionIndex++) {
         const o=e.options[optionIndex];
         if (o.selected || o.disabled || o.closest('optgroup[disabled]')) continue;
         const optionLabel=clip(o.label,256), optionValue=clip(o.value,512);
-        actions.push({...base,kind:'select',value:optionValue,option_index:optionIndex,
+        bucket.push({...base,kind:'select',value:optionValue,option_index:optionIndex,
           option_label:optionLabel,current_value:clip(current,512),label:clip(base.label+' → '+optionLabel,256)});
       }
+      if (bucket.length) buckets.push(bucket);
     } else if (e.tagName!=='SELECT') {
       const editable=!e.readOnly && e.getAttribute('aria-readonly')!=='true' &&
         (['textbox','searchbox','spinbutton'].includes(rname) ||
           (rname==='combobox' && ['INPUT','TEXTAREA'].includes(e.tagName)));
       const value='value' in e ? clip(e.value,512) :
         e.isContentEditable || rname==='combobox' ? clip(e.innerText,512) : '';
-      actions.push({...base,kind:editable?'fill':'click',value});
-      if (editable) actions.push({...base,kind:'click',value,label:clip('Open '+base.label,256)});
+      const bucket=[{...base,kind:editable?'fill':'click',value}];
+      if (editable) bucket.push({...base,kind:'click',value,label:clip('Open '+base.label,256)});
+      buckets.push(bucket);
+    }
+  }
+  const actions=[];
+  const heads=buckets.map(()=>0);
+  for (let active=true; active;) {
+    active=false;
+    for (let b=0; b<buckets.length; b++) {
+      if (heads[b]<buckets[b].length) { actions.push(buckets[b][heads[b]++]); active=true; }
     }
   }
 
@@ -173,7 +192,10 @@
   const text=words.join('\n').slice(0,6000), height=document.documentElement.scrollHeight;
 
   // Bound the browser-to-Python catalogue before it becomes part of the semantic
-  // marker. Goal-aware ranking and the 250-model-candidate budget happen in Python.
+  // marker. The round-robin merge above keeps the cut *node-fair*: truncation now
+  // removes a node's deepest alternatives (e.g. a 1500-option dropdown's tail)
+  // rather than controls that merely appeared after it. Goal-aware ranking and
+  // the 250-model-candidate budget still happen in Python.
   const raw_total=actions.length;
   actions.splice(1200);
   const page_key=cache.pageKey(), guards={};

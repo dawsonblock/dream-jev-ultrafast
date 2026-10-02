@@ -960,9 +960,9 @@ def test_counterfactual_trials_ipw_estimates():
         lo, hi = arms[arm]["p_success_ci"]
         assert lo <= arms[arm]["p_success"] <= hi
     assert arms["delta_ci"][0] <= arms["delta"] <= arms["delta_ci"][1]
-    # The α-spent interval is never narrower than the fixed-sample one.
-    assert arms["alpha_spent_delta_ci"][0] <= arms["delta_ci"][0]
-    assert arms["alpha_spent_delta_ci"][1] >= arms["delta_ci"][1]
+    # The confidence sequence is never narrower than the fixed-sample one.
+    assert arms["delta_cs"][0] <= arms["delta_ci"][0]
+    assert arms["delta_cs"][1] >= arms["delta_ci"][1]
 
 
 def test_counterfactual_trials_require_recorded_propensity():
@@ -1047,16 +1047,16 @@ def test_counterfactual_trials_itt_counts_unexecuted_assignments():
     from jev_ultrafast.dreamlearn import CounterfactualTrials
 
     events = []
-    for i in range(8):
+    for i in range(24):
         # Assigned candidate → authority stopped it → run still finished
         # (blocked) with no transition ever recorded for the trial.
         events += _trial_run(f"c{i}", "candidate", executed=False, success=False)
         events += _trial_run(f"k{i}", "control", success=True)
     arms = CounterfactualTrials.fit(events).estimate()[_trial_key()]
     candidate = arms["candidate"]
-    assert candidate["assigned"] == 8
+    assert candidate["assigned"] == 24
     assert candidate["executed"] == 0  # no transition — yet still analyzed
-    assert candidate["trials"] == 8
+    assert candidate["trials"] == 24
     assert candidate["p_success"] < 0.01  # every assigned-candidate run failed
     assert candidate["p_page_changed"] is None  # no step ever moved a page
     assert arms["control"]["p_success"] > 0.99
@@ -1352,12 +1352,12 @@ def test_trials_site_fallback_survives_family_indexing():
     events += _trial_run("t2", "control", success=True, task_family="flights",
                          site="other.example")
     # Strong site evidence at target.example: clearly positive.
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"s{i}", "candidate", success=True, site="target.example")
         events += _trial_run(f"k{i}", "control", success=False, site="target.example")
     # Strong unrelated-site evidence: negative, and it would dominate a naive
     # pooled fallback.
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"o{i}", "candidate", success=False, site="other.example")
         events += _trial_run(f"p{i}", "control", success=True, site="other.example")
     resolved = CounterfactualTrials.fit(events).resolve(
@@ -1375,7 +1375,7 @@ def test_trials_resolve_family_stratum_wins_when_reliable():
     """Adequate family support beats pooled — the specific estimate is the
     honest answer for that task family."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"fc{i}", "candidate", success=True, task_family="flights")
         events += _trial_run(f"fk{i}", "control", success=False, task_family="flights")
     resolved = CounterfactualTrials.fit(events).resolve(
@@ -1387,13 +1387,13 @@ def test_trials_resolve_family_stratum_wins_when_reliable():
 
 
 def test_trials_resolve_thin_scope_falls_through_to_pooled():
-    """A 2-assignment family stratum cannot hide a 40-assignment pooled
+    """A 2-assignment family stratum cannot hide a 60-assignment pooled
     refutation — resolution keeps walking until a stratum is supported."""
     events = []
     for i in range(2):
         events += _trial_run(f"fc{i}", "candidate", success=True, task_family="flights")
         events += _trial_run(f"fk{i}", "control", success=False, task_family="flights")
-    for i in range(20):
+    for i in range(30):
         events += _trial_run(f"c{i}", "candidate", success=False, task_family="banking")
         events += _trial_run(f"k{i}", "control", success=True, task_family="banking")
     resolved = CounterfactualTrials.fit(events).resolve(
@@ -1436,7 +1436,7 @@ def test_trial_choice_model_proposes_reliable_positive_delta():
     reliable positive ITT effect — a hypothesis randomized evidence already
     supports."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True)
         events += _trial_run(f"k{i}", "control", success=False)
     model = TrialChoiceModel.fit(events)
@@ -1471,7 +1471,7 @@ def test_trial_choice_model_refuted_blocks_settled_divergences():
     """A reliable non-positive delta means the hypothesis was tested and
     failed; unreliable evidence refutes nothing."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=False)
         events += _trial_run(f"k{i}", "control", success=True)
     model = TrialChoiceModel.fit(events)
@@ -1489,7 +1489,7 @@ def test_trial_choice_model_family_scope_isolates_effects():
     """The same divergence can be supported under one family and refuted
     under another — family-scoped estimates keep those truths separate."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"fc{i}", "candidate", success=True, task_family="flights")
         events += _trial_run(f"fk{i}", "control", success=False, task_family="flights")
         events += _trial_run(f"bc{i}", "candidate", success=False, task_family="banking")
@@ -1524,7 +1524,7 @@ def test_trial_choice_model_never_generalizes_across_effect_classes():
     purchase click must not bless a same-shaped delete, and the same
     effect-class divergence must still resolve."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True,
                              proposal_effect="purchase", model_effect="search")
         events += _trial_run(f"k{i}", "control", success=False,
@@ -1549,7 +1549,7 @@ def test_effect_floor_matrix(stored_effect):
     """T-226 matrix: evidence measured under one semantic effect class can
     never qualify a divergence under another, for every sensitive pairing."""
     events = []
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True,
                              proposal_effect=stored_effect, model_effect="navigate",
                              proposal_role="button", model_role="link")
@@ -1663,8 +1663,9 @@ def test_null_simulation_never_establishes_effect():
 
 def test_true_effect_simulation_establishes_benefit():
     """Positive control: a large real effect must establish once the evidence
-    base is adequate — n=30/arm at delta 0.6 resolves beneficial ~80%+ of the
-    time (the α-spent interval is deliberately low-power at canary scale)."""
+    base is adequate — n=100/arm at delta 0.6 resolves beneficial for nearly
+    every sequence (the anytime-valid sequence is deliberately low-power at
+    canary scale — the price of a guarantee that survives unlimited peeking)."""
     from jev_ultrafast.dreamlearn import CounterfactualTrials
 
     rng = __import__("random").Random(11)
@@ -1672,7 +1673,7 @@ def test_true_effect_simulation_establishes_benefit():
     sequences = 150
     for seq in range(sequences):
         events = []
-        for i in range(30):
+        for i in range(100):
             events += _trial_run(f"s{seq}c{i}", "candidate",
                                  success=rng.random() < 0.8)
             events += _trial_run(f"s{seq}k{i}", "control",
@@ -1681,7 +1682,7 @@ def test_true_effect_simulation_establishes_benefit():
         resolved = trials.resolve(model_kind="click", proposal_kind="click")
         if resolved and resolved.get("effect_status") == "beneficial":
             established += 1
-    assert established > sequences * 0.5, f"only {established}/{sequences} detected"
+    assert established > sequences * 0.8, f"only {established}/{sequences} detected"
 
 
 def test_assignment_propensity_matches_configured_rate():
@@ -1705,7 +1706,7 @@ def test_trial_choice_model_serialization_roundtrip():
     clone = TrialChoiceModel.from_dict(model.to_dict())
     assert clone.digest == model.digest
     assert clone.version == "jev-causal/2"
-    assert clone.trials.version == "jev-trials/6"
+    assert clone.trials.version == "jev-trials/7"
 
 
 def test_improve_suppresses_trial_refuted_proposals(tmp_path):
@@ -1718,7 +1719,7 @@ def test_improve_suppresses_trial_refuted_proposals(tmp_path):
     choice_model = ChoiceModel.fit(events)
     # The observational divergence is low(overlap 0) -> high(overlap 3).
     # Randomized trials measured it and the candidate arm kept losing.
-    for i in range(8):
+    for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=False, overlap=3)
         events += _trial_run(f"k{i}", "control", success=True, overlap=3)
     trials = CounterfactualTrials.fit(events)
@@ -1767,7 +1768,7 @@ def test_trials_cli_summarizes_and_resolves(tmp_path, capsys):
     assert main(["trials", str(path)]) == 0
     bare = json.loads(capsys.readouterr().out)
     assert bare["trials"]["cells"] > 0
-    assert bare["trials"]["version"] == "jev-trials/6"
+    assert bare["trials"]["version"] == "jev-trials/7"
     assert "resolved" not in bare  # no query asked, no pooled guess printed
 
     assert main([
