@@ -5,11 +5,11 @@ below comes from the run that produced this file.
 
 - schema: `jev-qualify/2` / mode: `bounded`
 - overall: **passed**
-- generated_at_ms: 1790981210316
+- generated_at_ms: 1790983736583
 
 ## Provenance
 
-- manifest_digest: `3588d9bcda65f19999880868088977e267413da31d0bd064524a6b01e85a0217`
+- manifest_digest: `ca37fa1c105b5eb8017c46730dea84d440a9a6b4fc6590101fa21a683a16791f`
 - manifest_signed: False
 - signature_key_id: `None`
 - signature_verified: skipped
@@ -19,18 +19,18 @@ below comes from the run that produced this file.
 
 - os: Darwin arm64 (kernel 25.2.0)
 - python: 3.12.9 · node: v24.16.0 · chrome: Chrome/154.0.8037.93
-- git_commit: `57079349197acf20b1e5d90bd4ee940f4dc47f11` (dirty: True)
-- tree_digest: `25d95b09b51197db672821964c7fc5ff1d4a382a0302052ffe4493985b9f6947`
+- git_commit: `131f1820e757b775023f74e3f7cf6d0f8a2a68c9` (dirty: True)
+- tree_digest: `8a91e56964916c0e5260245fa1e337f495f87cb4208eadebd4584e1d7783c9e4`
 - lock_digest: `8ee55088451f489c6ff9e9703615c6fbcc86d8673f759454e671335a1f5570ab`
-- test_suite_digest: `11572a7126c720bbfe7c0adb45bf3d732fa3be82f046aac6360a9a95ebd809bb`
-- env_digest: `ba74193ba4c9c59a43ae6a89ccefd887e90ecd7629e341a99010a76aeb396003`
+- test_suite_digest: `8195d71da6ce6d842011b1a3b6cc5200b577736985e7868996727d561ae9e071`
+- env_digest: `7757edd5a56120999791e280dca7b0683714814e94aff718a81259b579154a9f`
 
 ## Stages
 
 | stage | status | detail |
 |---|---|---|
 | Q0-static | passed | 8 checks ran, 1 skipped — manifest, compile, lint, syntax, lock, build, reproducibility |
-| Q1-offline | passed | 1 check ran — 445 passed |
+| Q1-offline | passed | 1 check ran — 446 passed |
 | Q2-browser | passed | 2 checks ran — live Chrome guard suite + E2E scenario |
 | Q3-adversarial | passed | 7 checks ran — 6 passed |
 | Q4-statistical | passed | 1 check ran — causal grid + propensity |
