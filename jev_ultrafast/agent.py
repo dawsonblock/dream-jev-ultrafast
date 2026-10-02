@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .browser import Browser, BrowserError, StalePage
+from .browser import Browser, BrowserError, IndeterminateMutation, StalePage
 from .dream import (
     ExperienceStore,
     ExplorationPolicy,
@@ -53,6 +53,11 @@ def _abort_reason(exc: BaseException) -> str:
         return "network_failure"
     if isinstance(exc, BrowserError):
         return "browser_crash"
+    if isinstance(exc, IndeterminateMutation):
+        # The browser may have executed the mutation before the run died —
+        # neither a clean "not executed" nor a measured failure. Its own
+        # reason keeps that distinguishable in censoring analysis.
+        return "indeterminate_execution"
     return "agent_exception"
 
 
@@ -326,8 +331,17 @@ class Agent:
         recorder stored.
         """
         goal_tokens = set(tokenize(redact_text(self.state["goal"], 4096)))
+        # Each offered candidate carries its deterministic effect class — the
+        # causal layer keys treatment signatures on it, so a click that
+        # purchases can never be answered by evidence about a click that
+        # navigates. Classification happens here, on the raw action, while the
+        # full structural context (role/ctx) is still present.
         offered = [
-            {**c, "goal_overlap": action_goal_overlap(c, goal_tokens)}
+            {
+                **c,
+                "goal_overlap": action_goal_overlap(c, goal_tokens),
+                "effect": classify_effect(c).value,
+            }
             for c in self._perception()[0]
         ]
         return offered, goal_tokens
@@ -346,6 +360,7 @@ class Agent:
             "id": selected,
             "kind": action.get("kind"),
             "role": action.get("role"),
+            "effect": classify_effect(action).value,
             "goal_overlap": next(
                 (c.get("goal_overlap") for c in offered_now if c.get("id") == selected),
                 None,
@@ -450,6 +465,18 @@ class Agent:
                         reasons.append("choice_model")
                 elif getattr(trial_model, "digest", None) != plan["choice_model_digest"]:
                     reasons.append("choice_model")
+            # Freshness is checked against the *live* signature: the offered
+            # catalogue digest already binds the candidates, so their live
+            # effect/role/overlap classification is the honest basis for the
+            # refuted query. Stamped values only fill what the live catalogue
+            # cannot supply (a plan may outlive the fields it was stamped with).
+            live_choice = next(
+                (a for a in offered_now if a.get("id") == model_choice_id), None
+            ) or {}
+            live_proposal = next(
+                (a for a in offered_now if a.get("id") == (proposal or {}).get("id")),
+                None,
+            ) or {}
             if (
                 trial_model is not None
                 and isinstance(proposal, dict)
@@ -457,11 +484,16 @@ class Agent:
                 and _model_call(
                     trial_model.refuted,
                     kind=str(proposal.get("kind") or "unknown"),
-                    goal_overlap=None,
+                    goal_overlap=live_proposal.get("goal_overlap"),
                     model_kind=str(historical.get("kind") or "unknown"),
                     model_overlap=historical.get("goal_overlap"),
+                    model_effect=live_choice.get("effect", historical.get("effect")),
+                    model_role=live_choice.get("role", historical.get("role")),
                     model_rank=historical.get("offered_rank"),
+                    proposal_effect=live_proposal.get("effect", proposal.get("effect")),
+                    proposal_role=live_proposal.get("role", proposal.get("role")),
                     proposal_rank=plan.get("proposal_offered_rank"),
+                    phase=plan.get("step"),
                     task_family=getattr(self, "task_family", None),
                     site=_page_site(page),
                 )
@@ -552,6 +584,10 @@ class Agent:
                         ),
                         "role": next(
                             (a.get("role") for a in offered_now if a.get("id") == choice_id),
+                            None,
+                        ),
+                        "effect": next(
+                            (a.get("effect") for a in offered_now if a.get("id") == choice_id),
                             None,
                         ),
                         "goal_overlap": next(
@@ -700,6 +736,7 @@ class Agent:
                         "id": selected,
                         "kind": action.get("kind"),
                         "role": action.get("role"),
+                        "effect": classify_effect(action).value,
                         "goal_overlap": next(
                             (c.get("goal_overlap") for c in offered_now if c.get("id") == selected),
                             None,
@@ -817,7 +854,10 @@ class Agent:
                                 kind=action.get("kind"),
                                 goal_overlap=offered_now[selected_rank].get("goal_overlap", 0),
                                 rank=selected_rank,
+                                proposal_effect=classify_effect(action).value,
+                                proposal_role=action.get("role"),
                                 task_family=getattr(self, "task_family", None),
+                                site=_page_site(page),
                             )
                             if (
                                 isinstance(baseline_pred, dict)
@@ -1068,7 +1108,96 @@ class Agent:
                 # ones it offered. The offered catalogue is what the model saw.
                 observed_candidates = page["actions"]
                 offered_candidates = self._perception()[0]
-            state["browser"].act(action, page, text=text)
+                # Journal the dispatch BEFORE the mutation crosses into the
+                # page: a crash between dispatch and acknowledgement must never
+                # erase the fact that a mutation was attempted at all.
+                self.dream_recorder.event(
+                    "action_attempted",
+                    state=page.get("fingerprint"),
+                    selected=action.get("id"),
+                    kind=action.get("kind"),
+                    effect=classify_effect(action).value,
+                    experiment=experiment_meta,
+                )
+            try:
+                state["browser"].act(action, page, text=text)
+            except StalePage:
+                # Provably pre-mutation: safe to re-perceive — say so in the
+                # journal instead of leaving the attempt dangling.
+                if getattr(self, "dream_recorder", None):
+                    self.dream_recorder.event(
+                        "action_not_executed",
+                        state=page.get("fingerprint"),
+                        selected=action.get("id"),
+                        experiment=experiment_meta,
+                    )
+                raise
+            except IndeterminateMutation as exc:
+                # The mutation may already have run. This is a terminal,
+                # non-retryable outcome — deliberately NOT a StalePage, so the
+                # tick loop cannot re-perceive and silently retry a click that
+                # may have landed. The run aborts as censored evidence.
+                state["elapsed_ms"] = self._elapsed()
+                state["history"].append(
+                    {
+                        "step": len(state["history"]) + 1,
+                        "action": action.get("label"),
+                        "kind": action["kind"],
+                        "choice": selected,
+                        "probability": decision["probabilities"].get(selected),
+                        "confidence": decision["confidence"],
+                        "latency_ms": decision["latency_ms"],
+                        "text": text,
+                        "text_helper": helper["model"] if helper else None,
+                        "text_latency_ms": helper["latency_ms"] if helper else 0,
+                        "operation": decision["operation"],
+                        "target": decision["target"],
+                        "page_changed": None,
+                        "execution": "indeterminate",
+                        "url": page["url"],
+                        "usage": decision["usage"],
+                        "executed_ms": state["elapsed_ms"],
+                        "elapsed_ms": state["elapsed_ms"],
+                    }
+                )
+                if getattr(self, "dream_recorder", None):
+                    self.dream_recorder.event(
+                        "action_indeterminate",
+                        state=page.get("fingerprint"),
+                        selected=action.get("id"),
+                        kind=action.get("kind"),
+                        effect=classify_effect(action).value,
+                        experiment=experiment_meta,
+                        reason=str(exc),
+                    )
+                # Terminal for this run: close() records the aborted run under
+                # its own censoring reason — the step is neither a measured
+                # failure nor a clean retry.
+                state["abort_reason"] = "indeterminate_execution"
+                raise
+            except (BrowserError, OSError, ConnectionError) as exc:
+                # The transport died around dispatch: the mutation's fate is
+                # unknowable (it may have been delivered), so the journal must
+                # not claim a clean outcome.
+                if getattr(self, "dream_recorder", None):
+                    self.dream_recorder.event(
+                        "action_indeterminate",
+                        state=page.get("fingerprint"),
+                        selected=action.get("id"),
+                        kind=action.get("kind"),
+                        effect=classify_effect(action).value,
+                        experiment=experiment_meta,
+                        reason=f"{type(exc).__name__}: {exc}",
+                    )
+                raise
+            if getattr(self, "dream_recorder", None):
+                self.dream_recorder.event(
+                    "action_confirmed",
+                    state=page.get("fingerprint"),
+                    selected=action.get("id"),
+                    kind=action.get("kind"),
+                    experiment=experiment_meta,
+                )
             self.pending_text = None
             state["elapsed_ms"] = self._elapsed()
             state["history"].append(
@@ -1086,6 +1215,7 @@ class Agent:
                     "operation": decision["operation"],
                     "target": decision["target"],
                     "page_changed": None,
+                    "execution": "executed",
                     "url": page["url"],
                     "usage": decision["usage"],
                     "executed_ms": self._elapsed(),

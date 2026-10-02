@@ -29,8 +29,9 @@ These are Level-1/Level-2 learners in the DREAM stack:
   produced a measured outcome are censored (with a structured termination
   reason) rather than counted as failures. Support and effect certainty are
   separate: ``support_sufficient`` is the weighted-sample floor,
-  ``effect_status`` is the sign actually established by a sequentially valid
-  interval, and differential censoring blocks establishment outright.
+  ``effect_status`` is the sign actually established by an α-spent
+  approximate sequential interval, and differential censoring blocks
+  establishment outright.
 - Level 5 (``TrialChoiceModel``): the causal decision prior. It proposes only
   divergences whose randomized evidence *established* a beneficial effect,
   treats only established-harmful divergences as refuted, and keeps its
@@ -241,6 +242,7 @@ TERMINATION_REASONS = (
     "network_failure",
     "timeout",
     "recorder_shutdown",
+    "indeterminate_execution",
     "unverified_claim",
     "unknown_abort",
 )
@@ -877,13 +879,13 @@ class UtilityWeights:
         )
 
 
-# --- trial cell layout (jev-trials/5) --------------------------------------
+# --- trial cell layout (jev-trials/6) --------------------------------------
 # Key (15): family, site, m_kind, m_effect, m_role, m_ov, m_rank, m_phase,
 #           p_kind, p_effect, p_role, p_ov, p_rank, p_phase, arm
 # Stats (9): assigned, analyzed, executed, censored,
 #            w_success, w_sum, w_sq, w_page, w_exec
 # Costs (3): w_latency, w_tokens, w_approvals
-# Reasons (8): one counter per TERMINATION_REASONS entry
+# Reasons (9): one counter per TERMINATION_REASONS entry
 _TRIAL_KEY_LEN = 15
 _TRIAL_STATS = 9
 _TRIAL_COSTS = 3
@@ -899,13 +901,15 @@ _SIGNATURE_DROP_FIELDS = (
     ("phase", ("m_phase", "p_phase")),
     ("rank", ("m_rank", "p_rank")),
     ("role", ("m_role", "p_role")),
-    ("effect", ("m_effect", "p_effect")),
     ("overlap", ("m_ov", "p_ov")),
 )
-# ``kind`` is the signature floor: it is never dropped. A click's measured
-# effect must not answer a fill proposal just because every other coordinate
-# was too thin — operation kind is always known and semantically meaningful,
-# so evidence never generalizes across it.
+# ``kind`` and ``effect class`` are the signature floor: neither is ever
+# dropped. Operation kind is always known and semantically meaningful, and the
+# effect class is an authority coordinate — a measured ``purchase`` must not
+# answer a ``search``/``delete``/``disclosure`` divergence merely because both
+# were ``click`` operations. Evidence never generalizes across either floor;
+# a query carrying a known effect only ever resolves against cells recorded
+# under the same effect class.
 
 # Summable alpha-spending constant: sum over integer looks of
 # SPEND·n^-1.5 equals 1 (ζ(3/2) normalizes the sequence).
@@ -917,13 +921,17 @@ def _sequential_alpha(looks: float, *, base: float) -> float:
     """Alpha spent at look ``n``: a summable n^-3/2 spending sequence.
 
     Establishment is checked whenever a contrast is recomputed, so the
-    per-look error budget must be summable: with ``α_n = base·n^-1.5/ζ(3/2)``
-    the union bound over every integer look gives an anytime-valid guarantee —
-    the probability that a single fixed hypothesis is *ever* established at
-    the wrong sign is at most ``base``, no matter how often it is peeked at.
-    Multiplicity across simultaneously tracked hypotheses is not corrected by
-    this bound (documented limitation); the conservative direction is always
-    ``unresolved``.
+    per-look error budget must be summable: ``α_n = base·n^-1.5/ζ(3/2)``
+    spends at most ``base`` in total over every integer look.
+
+    Honesty caveat: this spending discipline is applied to an *approximate*
+    per-look interval — a Newcombe-Wilson difference built on a
+    self-normalized IPW estimate with Kish effective sample size. That
+    interval is not an exact-coverage guarantee for the IPW estimator, so the
+    composition is an α-spent approximate sequential interval, **not** a
+    formally anytime-valid confidence sequence. Multiplicity across
+    simultaneously tracked hypotheses is likewise not corrected (documented
+    limitation); the conservative direction is always ``unresolved``.
     """
     n = max(1.0, float(looks))
     return min(0.5, float(base) * _SEQUENTIAL_SPEND / (n ** 1.5))
@@ -955,10 +963,11 @@ def _signature_masks(known: list[str]) -> list[tuple[str, tuple[str, ...]]]:
 
     Each mask names the coordinates still enforced; the rest are wildcards
     merged by summation. The order is most specific first, dropping phase,
-    rank, role, effect class, and overlap — a bounded, auditable hierarchy
-    that lets thin signature cells borrow support from coarser ones without
-    ever mixing unrelated strata or inventing values. ``kind`` is the floor:
-    it is never dropped, so click evidence can never answer a fill proposal.
+    rank, role, and overlap — a bounded, auditable hierarchy that lets thin
+    signature cells borrow support from coarser ones without ever mixing
+    unrelated strata or inventing values. ``kind`` and ``effect`` are the
+    floor: neither is ever dropped, so click evidence can never answer a fill
+    proposal and purchase evidence can never answer a search proposal.
     """
     enforced = list(known)
     masks = [("full", tuple(enforced))]
@@ -1009,6 +1018,23 @@ def _migrate_v4_trial_cells(cells) -> tuple[tuple, ...]:
     return tuple(sorted(migrated))
 
 
+def _migrate_v5_trial_cells(cells) -> tuple[tuple, ...]:
+    """v5 cells → v6: the reasons tail gained ``indeterminate_execution``.
+
+    v5 stored eight reason counters ending
+    ``[…, recorder_shutdown, unverified_claim, unknown_abort]``; v6 inserts
+    ``indeterminate_execution`` between ``recorder_shutdown`` and
+    ``unverified_claim``. Recorded verdicts carry over verbatim — the new
+    slot starts at zero because v5 could never record the state. Detected by
+    cell arity (v5 is exactly one counter short), not the version label.
+    """
+    insert_at = _REASON_BASE + _REASON_INDEX["indeterminate_execution"]
+    return tuple(
+        tuple(cell[:insert_at]) + (0,) + tuple(cell[insert_at:])
+        for cell in cells
+    )
+
+
 @dataclass(frozen=True)
 class CounterfactualTrials:
     """Intention-to-treat estimates from randomized arm *assignments*.
@@ -1043,7 +1069,7 @@ class CounterfactualTrials:
     - ``support_sufficient`` — do both arms have enough weighted observations
       (``MIN_ESS``) to say anything at all?
     - ``effect_status`` — has the data actually established the sign of the
-      treatment effect? ``beneficial`` requires the *sequentially valid*
+      treatment effect? ``beneficial`` requires the *α-spent approximate*
       interval to lie entirely above ``min_effect``; ``harmful`` requires it
       to lie entirely below ``-min_effect``; a confidence interval that
       crosses zero leaves the hypothesis ``unresolved`` and schedules more
@@ -1051,9 +1077,13 @@ class CounterfactualTrials:
       helps".
 
     ``delta_ci`` is the fixed-sample Newcombe-Wilson interval for reporting;
-    ``sequential_delta_ci`` is the anytime-valid interval establishment uses
-    (see ``_sequential_alpha``), so repeatedly peeking after every batch
-    cannot inflate the error rate of a single hypothesis.
+    ``alpha_spent_delta_ci`` is the interval establishment uses — the same
+    approximate construction widened by the α spent at this look (see
+    ``_sequential_alpha``). It is a heuristic discipline against repeated
+    peeking on a single hypothesis, **not** a formally anytime-valid
+    confidence sequence: the underlying per-look interval is an approximation
+    for an IPW estimate, and simultaneous hypotheses are not multiplicity-
+    corrected.
 
     Censoring is a first-class causal concern, not bookkeeping: per-arm
     ``censor_rate`` and the ``terminations`` reason breakdown are reported,
@@ -1088,7 +1118,7 @@ class CounterfactualTrials:
     # analysis, and counting it twice would double-weight that arm. Reported
     # so corruption stays visible instead of silently biasing an estimate.
     duplicates: int = 0
-    version: str = "jev-trials/5"
+    version: str = "jev-trials/6"
 
     MIN_ESS = 8.0
     MIN_EFFECT = 0.0
@@ -1351,7 +1381,7 @@ class CounterfactualTrials:
 
         Separates *support* from *effect certainty*: ``support_sufficient`` is
         the weighted-sample floor, ``effect_status`` is the sign actually
-        established by the sequentially valid interval. A censoring-rate
+        established by the α-spent approximate interval. A censoring-rate
         imbalance blocks establishment outright — the surviving subset of an
         arm censored far more than the other is a biased sample, not a
         smaller unbiased one.
@@ -1364,17 +1394,17 @@ class CounterfactualTrials:
         entry["delta"] = delta
         if candidate["ess"] and control["ess"]:
             entry["delta_ci"] = _newcombe(candidate, control)
-            # Establishment uses the anytime-valid interval: the fixed-sample
+            # Establishment uses the α-spent interval: the fixed-sample
             # interval is for reporting, not for deciding that an experiment
             # is settled after being peeked at every batch.
             looks = max(1, candidate["trials"] + control["trials"])
             alpha = _sequential_alpha(looks, base=cls.SEQUENTIAL_ALPHA)
             entry["sequential_alpha"] = alpha
-            entry["sequential_delta_ci"] = _newcombe(candidate, control, z=_z_for_alpha(alpha))
+            entry["alpha_spent_delta_ci"] = _newcombe(candidate, control, z=_z_for_alpha(alpha))
         else:
             entry["delta_ci"] = None
             entry["sequential_alpha"] = None
-            entry["sequential_delta_ci"] = None
+            entry["alpha_spent_delta_ci"] = None
         support = bool(candidate["support_sufficient"] and control["support_sufficient"])
         entry["support_sufficient"] = support
         imbalance = (
@@ -1384,7 +1414,7 @@ class CounterfactualTrials:
         entry["censoring_imbalance"] = imbalance
         threshold = cls.MIN_EFFECT if min_effect is None else max(0.0, float(min_effect))
         entry["min_effect"] = threshold
-        sequential = entry["sequential_delta_ci"]
+        sequential = entry["alpha_spent_delta_ci"]
         if not support or sequential is None:
             entry["effect_status"] = "insufficient_data"
             entry["unresolved_reason"] = None
@@ -1452,12 +1482,13 @@ class CounterfactualTrials:
            and pooling unrelated tasks must not override it.
         2. **Treatment signature** — within a stratum, the full signature is
            tried first, then coordinates are dropped in order (phase, rank,
-           role, effect class, overlap) until a mask has both arms with
-           support. ``kind`` is never dropped: it is the signature floor, so
-           evidence about one operation kind can never answer for another.
-           Coordinates the caller does not know are wildcards from
-           the start; unknown *stored* values only match once their coordinate
-           is dropped.
+           role, overlap) until a mask has both arms with support. ``kind``
+           and ``effect`` are never dropped: they are the signature floor, so
+           evidence about one operation kind or one authority class can never
+           answer for another. Coordinates the caller does not know are
+           wildcards from the start; unknown *stored* values only match once
+           their coordinate is dropped (or, for the floor coordinates, only
+           match a caller that is itself unknown).
 
         When no stratum supports a contrast, the most specific estimate that
         exists is returned, flagged ``effect_status: insufficient_data``, so
@@ -1548,12 +1579,17 @@ class CounterfactualTrials:
         if unknown:
             raise ValueError(f"Unknown counterfactual-trials keys: {sorted(unknown)}")
         cells = tuple(tuple(c) for c in payload.get("cells", ()))
-        version = str(payload.get("version", "jev-trials/5"))
+        version = str(payload.get("version", cls.version))
         if cells and len(cells[0]) == 15:
             # v4 evidence migrates in place; the collapsed scope is split and
             # the widened coordinates land as "unknown" wildcards.
             cells = _migrate_v4_trial_cells(cells)
-            version = "jev-trials/5"
+            version = cls.version
+        elif cells and len(cells[0]) == TRIAL_CELL_LEN - 1:
+            # v5 cells are one reason counter short of v6; splice in the new
+            # indeterminate_execution slot rather than rejecting the store.
+            cells = _migrate_v5_trial_cells(cells)
+            version = cls.version
         if any(len(c) != TRIAL_CELL_LEN for c in cells):
             raise ValueError("Unsupported counterfactual-trials cell arity")
         # Coordinates are join-delimiter-free by construction at fit time;
@@ -1588,9 +1624,9 @@ class TrialChoiceModel:
     Two facts are kept separate, because conflating them was the v0.8.3
     defect: *having enough samples* (``support_sufficient``) is not *having
     established the effect* (``effect_status``). ``choose`` proposes only a
-    ``beneficial`` divergence — the sequentially valid interval lies entirely
-    above the practical threshold — and ``refuted`` is true only for a
-    ``harmful`` one. A supported cell whose interval still crosses zero is
+    ``beneficial`` divergence — the α-spent approximate interval lies
+    entirely above the practical threshold — and ``refuted`` is true only
+    for a ``harmful`` one. A supported cell whose interval still crosses zero is
     ``unresolved``: it schedules more evidence, and it must never permanently
     suppress a potentially beneficial hypothesis or prematurely adopt one.
 
@@ -1716,7 +1752,7 @@ class TrialChoiceModel:
                 continue
             # Among established beneficial effects, prefer the strongest
             # point estimate — establishment is already gated by the
-            # sequentially valid interval and the practical threshold.
+            # α-spent approximate interval and the practical threshold.
             if best is None or estimate["delta"] > best[0]:
                 best = (estimate["delta"], candidate, estimate)
         if best is None:
@@ -1738,7 +1774,7 @@ class TrialChoiceModel:
             "signature_level": estimate.get("signature_level"),
             "effect_status": estimate["effect_status"],
             "support_sufficient": estimate.get("support_sufficient"),
-            "sequential_delta_ci": estimate.get("sequential_delta_ci"),
+            "alpha_spent_delta_ci": estimate.get("alpha_spent_delta_ci"),
             "delta_ci": ci,
             # Provenance: this prediction comes only from randomized evidence.
             "source": "randomized",
@@ -1965,7 +2001,7 @@ class ExperimentScheduler:
       prior's predicted delta when no estimate exists yet), floored at
       ``min_importance`` so statistically-positive-but-irrelevant differences
       do not consume the trial budget;
-    - **remaining uncertainty** — the width of the sequentially valid
+    - **remaining uncertainty** — the width of the α-spent approximate
       interval, discounted as support accumulates (``width / (1 + support)``);
     - **evidence coverage** — a mild penalty for families already sampled
       heavily, so the budget spreads across contexts instead of over-fitting
@@ -2012,7 +2048,11 @@ class ExperimentScheduler:
                         "goal_overlap",
                         hypothesis.get("model_choice_overlap", hypothesis.get("model_overlap")),
                     ),
-                    model_role=historical.get("role"),
+                    model_effect=historical.get(
+                        "effect",
+                        hypothesis.get("model_choice_effect", hypothesis.get("model_effect")),
+                    ),
+                    model_role=historical.get("role", hypothesis.get("model_choice_role")),
                     model_rank=historical.get("offered_rank"),
                     proposal_kind=str(
                         proposal.get("kind")
@@ -2022,7 +2062,8 @@ class ExperimentScheduler:
                     proposal_overlap=proposal.get(
                         "goal_overlap", hypothesis.get("proposal_overlap")
                     ),
-                    proposal_role=proposal.get("role"),
+                    proposal_effect=proposal.get("effect", hypothesis.get("proposal_effect")),
+                    proposal_role=proposal.get("role", hypothesis.get("proposal_role")),
                     proposal_rank=hypothesis.get("proposal_offered_rank"),
                     phase=hypothesis.get("step"),
                 )
@@ -2030,7 +2071,7 @@ class ExperimentScheduler:
             if status in {"beneficial", "harmful"}:
                 continue
             if estimate is not None and "candidate" in estimate and "control" in estimate:
-                sequential = estimate.get("sequential_delta_ci")
+                sequential = estimate.get("alpha_spent_delta_ci")
                 width = (sequential[1] - sequential[0]) if sequential else 1.0
                 support = min(
                     estimate["candidate"]["ess"], estimate["control"]["ess"]

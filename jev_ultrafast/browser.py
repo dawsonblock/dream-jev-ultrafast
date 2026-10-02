@@ -19,6 +19,20 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+class IndeterminateMutation(RuntimeError):
+    """A mutation was dispatched but its outcome cannot be confirmed.
+
+    Raised only when execution may already have crossed the mutation point —
+    e.g. ``e.click()`` fired a ``click`` handler that synchronously navigated
+    and destroyed the evaluation context before the result returned. This is
+    the third outcome beside "provably not executed" (``StalePage`` — safe to
+    re-perceive and retry) and confirmed success: the caller must treat it as
+    a terminal, non-retryable state, because retrying could double-apply the
+    mutation. It deliberately does not subclass ``StalePage``, so the
+    recoverable re-perception path cannot swallow it.
+    """
+
+
 class BrowserError(RuntimeError):
     """The browser connection or CDP session itself failed.
 
@@ -229,24 +243,42 @@ def browser_operation(request):
     def call(method, **params):
         return cdp(method, session_id=session, **params)
 
-    def evaluate(expression):
+    def evaluate(expression, *, mutating=False):
         params = {"expression": expression, "returnByValue": True}
         if context_id is not None:
             params["contextId"] = context_id
         try:
             result = call("Runtime.evaluate", **params)
         except RuntimeError as exc:
+            # A mutating evaluation that never returned its acknowledgement is
+            # NOT a StalePage: the page may already have executed the mutation
+            # and then navigated, destroying the context on the way back. The
+            # outcome is indeterminate — retrying could double-apply it.
             if operation == "act" and request.get("action", {}).get("kind") == "select":
-                raise RuntimeError("Dropdown execution was interrupted; inspect before retrying.") from exc
+                raise IndeterminateMutation(
+                    "Dropdown execution was interrupted; inspect before retrying."
+                ) from exc
+            if mutating:
+                raise IndeterminateMutation(
+                    "Mutation evaluation was interrupted after the mutation may "
+                    "already have run; the outcome is unknown and must not be "
+                    "retried. Re-observe and reconcile the page state."
+                ) from exc
             message = str(exc).lower()
             if context_id is not None and any(word in message for word in ("context", "destroyed", "navigation")):
                 raise StalePage("Document changed during evaluation") from exc
             raise
         if result.get("exceptionDetails"):
             if operation == "act" and request["action"]["kind"] == "select":
-                raise RuntimeError("Dropdown execution was interrupted; inspect before retrying.")
+                raise IndeterminateMutation("Dropdown execution was interrupted; inspect before retrying.")
             details = result["exceptionDetails"]
             reason = (details.get("exception") or {}).get("description") or details.get("text") or "unknown"
+            if mutating:
+                raise IndeterminateMutation(
+                    "Mutation evaluation was interrupted after the mutation may "
+                    f"already have run ({reason.splitlines()[0][:200]}); the "
+                    "outcome is unknown and must not be retried."
+                )
             raise StalePage(f"Document changed during evaluation: {reason.splitlines()[0][:200]}")
         return result.get("result", {}).get("value")
 
@@ -327,15 +359,29 @@ def browser_operation(request):
                 "action": action, "expected": expected,
                 "guarantee": guarantee, "text": request.get("text") or "",
             }
-            target = evaluate(guarded + json.dumps(payload) + ")")
+            # The guarded script mutates only at the end: select writes the
+            # option unconditionally; click/fill mutate under "atomic" inside
+            # the same turn. Under "trusted" the script only validates and
+            # reports coordinates — no mutation — so interruption stays a
+            # recoverable StalePage there.
+            target = evaluate(
+                guarded + json.dumps(payload) + ")",
+                mutating=kind == "select" or guarantee == "atomic",
+            )
             if not target or target.get("error"):
-                # The guarded script only mutates in its final statement, so every
-                # explicit {error: ...} return is provably pre-mutation and safe to
-                # retry after re-observing. A missing result or an interrupted
-                # evaluation (handled in evaluate()) remains non-retryable.
-                if kind == "select" and target is None:
-                    raise RuntimeError("Dropdown execution returned no result; inspect before retrying.")
-                if guarantee == "atomic" and (target or {}).get("error") == "unsupported":
+                # Every explicit {error: ...} return is provably pre-mutation
+                # and safe to retry after re-observing. A *missing* result on a
+                # mutating call is different: nothing distinguishes "validated
+                # and returned nothing" from "mutated, then the result was
+                # lost" — so it is non-retryable, not stale.
+                if target is None:
+                    raise IndeterminateMutation(
+                        "Dropdown execution returned no result; inspect before retrying."
+                        if kind == "select"
+                        else "Mutation evaluation returned no result; the outcome is "
+                             "unknown and must not be retried."
+                    )
+                if guarantee == "atomic" and target.get("error") == "unsupported":
                     # Programmatic control is unavailable; nothing was mutated.
                     # Escalate to the trusted-input path for this element.
                     guarantee = "trusted"
@@ -383,16 +429,35 @@ def browser_operation(request):
                 if not evaluate(precheck):
                     raise StalePage("Target failed pre-press identity check. Observe again.")
                 call("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button="left", clickCount=1)
-                if not evaluate(precheck):
-                    # A press already left the process; restore pointer state at
-                    # the same point, then fail closed to re-perception.
-                    call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=1)
-                    raise StalePage("Target changed between press and release; click aborted.")
-                call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=1)
+                # The press already left the process — mousedown handlers may
+                # have run. From here on nothing can be called "not executed":
+                # a failed or interrupted pre-release check, a lost release,
+                # or a destroyed context all leave the click outcome unknown,
+                # so every post-press failure is indeterminate. The release is
+                # dispatched for pointer hygiene under finally so an exception
+                # in the re-check can never strand the mouse button.
+                try:
+                    recheck = evaluate(precheck) is True
+                except Exception:
+                    recheck = False
+                finally:
+                    try:
+                        call("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button="left", clickCount=1)
+                    except Exception:
+                        recheck = False
+                if not recheck:
+                    raise IndeterminateMutation(
+                        "Trusted-input press was dispatched but the click outcome "
+                        "could not be confirmed; the mutation is indeterminate and "
+                        "must not be retried."
+                    )
                 if kind == "fill":
                     # Focus verification and text insertion in one evaluation:
                     # Input.insertText cannot be bound to the target, so typing
                     # happens in-world, atomically with the focus check.
+                    # execCommand('insertText') may fire input handlers that
+                    # navigate before the result returns — mutating=True keeps
+                    # an interrupted evaluation indeterminate, never stale.
                     inserted = evaluate(
                         """((input) => {
                           const {action,expected,text}=input, c=globalThis.__jevFastV2;
@@ -418,10 +483,16 @@ def browser_operation(request):
                             return {error:'insert'};
                           const value = 'value' in e ? String(e.value) : String(e.innerText || '');
                           return {inserted:true, matched:value===text, value:value.slice(0,1024)};
-                        })(""" + json.dumps({"action": action, "expected": expected, "text": request["text"]}) + ")"
+                        })(""" + json.dumps({"action": action, "expected": expected, "text": request["text"]}) + ")",
+                        mutating=True,
                     )
-                    if not inserted or inserted.get("error"):
-                        raise StalePage(f"Text insertion failed before mutation: {(inserted or {}).get('error')}")
+                    if inserted is None:
+                        raise IndeterminateMutation(
+                            "Text insertion evaluation returned no result; the "
+                            "outcome is unknown and must not be retried."
+                        )
+                    if inserted.get("error"):
+                        raise StalePage(f"Text insertion failed before mutation: {inserted.get('error')}")
                     if not inserted.get("matched"):
                         # The insert already ran — a mismatch means the mutation
                         # did not land as authorized. This is not retryable.

@@ -25,6 +25,18 @@ from jev_ultrafast.model import candidate_actions
 from jev_ultrafast.trace import DreamTraceRecorder
 
 
+@pytest.fixture(autouse=True)
+def _unbound_metrics_flag(monkeypatch):
+    """Compatibility-path tests opt into the feature-gated escape hatch.
+
+    ``promote(..., allow_unbound_metrics=True)`` now additionally requires
+    ``JEV_ALLOW_UNBOUND_METRICS=1`` in the environment; tests that exercise
+    the compatibility path declare the opt-in here, and the fail-closed
+    regression tests delete it explicitly.
+    """
+    monkeypatch.setenv("JEV_ALLOW_UNBOUND_METRICS", "1")
+
+
 def _append_run(store, run_id, goal, transitions, *, status, verified, policy=None, extra=None):
     key = task_key(goal)
     policy = policy or ExplorationPolicy()
@@ -326,7 +338,9 @@ def test_agent_emits_replayable_trace_without_changing_executor_contract(tmp_pat
     agent.close()
 
     events = ExperienceStore(path).load()
-    assert [event["event"] for event in events] == ["run_started", "transition", "run_finished"]
+    assert [event["event"] for event in events] == [
+        "run_started", "action_attempted", "action_confirmed", "transition", "run_finished",
+    ]
     worlds = ReplayWorld.from_events(events)
     replay = ReplaySimulator(worlds).evaluate(ExplorationPolicy())
     assert replay.metrics.verified_successes == 1
@@ -422,7 +436,10 @@ def test_canary_evidence_is_paired_and_bound_to_store_head(tmp_path):
     assert evidence.paired_task_families == 4
     assert evidence.ties == 4
     assert evidence.event_head_hash == store.head_hash()
-    assert CanaryGate().assess(evidence.baseline, evidence.candidate, evidence=evidence).approved
+    # All-tied evidence cannot pass the default sign-test floor; this test
+    # exercises pairing/binding mechanics, not significance.
+    assert CanaryGate(max_pair_sign_p=None).assess(
+        evidence.baseline, evidence.candidate, evidence=evidence).approved
 
 
 def test_registry_promotes_only_bound_paired_canary_evidence(tmp_path):
@@ -432,10 +449,179 @@ def test_registry_promotes_only_bound_paired_canary_evidence(tmp_path):
     registry = PolicyRegistry(tmp_path / "bound-policy.json")
     staged = registry.stage(report)
     store = _canary_pair_store(tmp_path, baseline, report.selected)
-    active = registry.promote_from_store(store, baseline_policy_digest=baseline.digest)
+    active = registry.promote_from_store(
+        store, baseline_policy_digest=baseline.digest,
+        # The fixture pairs are all ties (identical outcomes): the test binds
+        # evidence mechanics, so the sign-test floor is explicitly waived.
+        gate=CanaryGate(max_pair_sign_p=None),
+    )
     assert active["digest"] == staged["digest"]
     assert active["canary"]["paired_task_families"] == 4
     assert active["canary"]["event_head_hash"] == store.head_hash()
+
+
+def test_default_gate_enforces_paired_significance():
+    """The default gate is a significance check, not a non-regression check:
+    paired evidence that cannot show improvement (all ties, p=1.0) fails
+    promotion even though every aggregate floor passes."""
+    baseline = CanaryMetrics(tasks=12, verified_successes=12, task_families=4)
+    candidate = CanaryMetrics(tasks=12, verified_successes=12, task_families=4)
+    evidence = CanaryEvidence(
+        baseline=baseline,
+        candidate=candidate,
+        paired_task_families=4,
+        candidate_wins=0,
+        baseline_wins=0,
+        ties=4,
+        event_head_hash="h" * 64,
+        evidence_digest="d" * 64,
+        paired_instances=4,
+        sign_test_p_value=1.0,
+    )
+    decision = CanaryGate().assess(baseline, candidate, evidence=evidence)
+    assert not decision.approved
+    assert "sign test" in decision.reason
+    # The explicit waiver keeps the old non-regression semantics available.
+    waived = CanaryGate(max_pair_sign_p=None).assess(baseline, candidate, evidence=evidence)
+    assert waived.approved
+
+
+def test_default_gate_passes_a_significant_paired_canary():
+    """Six non-tied pairs all won by the candidate gives p=0.03125 ≤ 0.05:
+    the minimum meaningful canary is larger than the 12-run floor — the gate
+    demands demonstrated improvement, honestly."""
+    baseline = CanaryMetrics(tasks=12, verified_successes=6, task_families=4)
+    candidate = CanaryMetrics(tasks=12, verified_successes=12, task_families=4)
+    evidence = CanaryEvidence(
+        baseline=baseline,
+        candidate=candidate,
+        paired_task_families=4,
+        candidate_wins=6,
+        baseline_wins=0,
+        ties=0,
+        event_head_hash="h" * 64,
+        evidence_digest="d" * 64,
+        paired_instances=6,
+        sign_test_p_value=0.03125,
+    )
+    assert CanaryGate().assess(baseline, candidate, evidence=evidence).approved
+
+
+def test_unbound_promotion_fails_closed_without_env_flag(tmp_path, monkeypatch):
+    """allow_unbound_metrics alone is not enough: without
+    JEV_ALLOW_UNBOUND_METRICS=1 the compatibility path fails closed even
+    before checking whether a policy is staged."""
+    monkeypatch.delenv("JEV_ALLOW_UNBOUND_METRICS", raising=False)
+    registry = PolicyRegistry(tmp_path / "unbound.json")
+    metrics = CanaryMetrics(tasks=12, verified_successes=12, task_families=4)
+    with pytest.raises(ValueError, match="JEV_ALLOW_UNBOUND_METRICS"):
+        registry.promote(metrics, metrics, allow_unbound_metrics=True)
+
+
+def test_sign_test_exact_p_values():
+    """Section-36 table: the exact two-sided binomial tail, verified against
+    an independent computation."""
+    import math
+
+    from jev_ultrafast.dream import _sign_test_p_value
+
+    def expected(wins, losses):
+        n = wins + losses
+        k = min(wins, losses)
+        return min(1.0, 2 * sum(math.comb(n, i) for i in range(k + 1)) / 2**n) if n else 1.0
+
+    cases = [(0, 0), (1, 0), (4, 0), (5, 0), (6, 0), (8, 4), (6, 6), (4, 8),
+             (12, 0), (10, 2), (2, 10)]
+    for wins, losses in cases:
+        assert _sign_test_p_value(wins, losses) == pytest.approx(expected(wins, losses))
+    # The decision boundary the default gate uses.
+    assert _sign_test_p_value(5, 0) == pytest.approx(0.0625)   # not significant
+    assert _sign_test_p_value(6, 0) == pytest.approx(0.03125)  # ≤ 0.05
+    assert _sign_test_p_value(12, 0) < 0.001
+    assert _sign_test_p_value(8, 4) == pytest.approx(0.3876953125)
+
+
+def test_serialization_fuzz_rejects_malformed_payloads(tmp_path):
+    """Section-41 boundary: structured parsers and the event log must reject
+    malformed input cleanly — never downgrade authority or corrupt state."""
+    # Unknown keys are rejected; missing values fall back to known defaults.
+    with pytest.raises(ValueError):
+        ExplorationPolicy.from_dict({"name": "x", "injected": True})
+    policy = ExplorationPolicy.from_dict(ExplorationPolicy().to_dict())
+    assert policy.digest == ExplorationPolicy().digest
+
+    # Malformed serialized events mid-chain break verification at the record.
+    # (A truncated *final* line is legal torn-tail recovery by design, so the
+    # mutations corrupt a middle record where corruption must stay fatal.)
+    store = ExperienceStore(tmp_path / "fuzz.jsonl")
+    _append_run(store, "ok-1", "goal a", _single_transition(),
+                status="done", verified=True)
+    _append_run(store, "ok-2", "goal a", _single_transition(),
+                status="done", verified=True)
+    _append_run(store, "ok-3", "goal a", _single_transition(),
+                status="done", verified=True)
+    good = store.load()
+    assert len(good) >= 6
+
+    lines = (tmp_path / "fuzz.jsonl").read_text().splitlines()
+    middle = next(i for i, raw in enumerate(lines)
+                  if '"event":"transition"' in raw and '"run_id":"ok-1"' in raw)
+    line = lines[middle]
+    assert '"page_changed":true' in line  # mutations below must actually hit
+    for mutation in (
+        line.replace('"page_changed"', '"pageChange"'),              # renamed key
+        line.replace('"page_changed":true', '"page_changed":"yes"'),  # type swap
+        line.replace('"run_id":"ok-1"', '"run_id":"ok-9"'),           # payload swap
+        line.replace('"sequence":2', '"sequence":-999'),              # extreme value
+        line[:-2],                                                    # mid-chain truncation
+        '{"event":"transition","run_id":"ok-1","event_hash":"' + "0" * 64 + '"}',
+        # forged record with a plausible-looking hash
+    ):
+        target = tmp_path / "mutated.jsonl"
+        target.write_text("\n".join(lines[:middle] + [mutation] + lines[middle + 1:]) + "\n")
+        with pytest.raises(Exception):
+            ExperienceStore(target).load()
+
+    # NaN/Infinity/out-of-range literals are rejected by policy validation.
+    policy_dict = ExplorationPolicy().to_dict()
+    for mutated in (
+        dict(policy_dict, model_action_limit=float("nan")),
+        dict(policy_dict, goal_overlap_weight=float("inf")),
+        dict(policy_dict, click_quota=-1),
+        dict(policy_dict, overlap_exponent=99.0),
+        dict(policy_dict, version=0),
+        dict(policy_dict, name=""),
+    ):
+        with pytest.raises(ValueError):
+            ExplorationPolicy.from_dict(mutated)
+
+
+def test_experience_store_serializes_thread_writers(tmp_path):
+    """Section-23, in-process variant: concurrent threads append through the
+    same store — no lost records, no split heads, chain stays valid."""
+    import threading
+
+    store = ExperienceStore(tmp_path / "threads.jsonl")
+    errors = []
+
+    def writer(tag):
+        try:
+            for i in range(25):
+                store.append({"event": "transition", "run_id": f"{tag}-{i}",
+                              "task_key": "t", "state": "S", "next_state": "D"})
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(f"t{n}",)) for n in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert not errors
+    assert not any(thread.is_alive() for thread in threads)
+    verification = store.verify()
+    assert verification["events"] == 400
+    assert verification["head_hash"] != "0" * 64
 
 
 def test_canary_pairing_is_namespaced_by_task_family(tmp_path):
@@ -463,7 +649,10 @@ def _signed_registry(tmp_path, signer, verify_keys=None, name="signed-policy.jso
     registry = PolicyRegistry(tmp_path / name, signer=signer, verify_keys=verify_keys)
     registry.stage(report)
     store = _canary_pair_store(tmp_path, baseline, report.selected, name=f"canary-{name}.jsonl")
-    active = registry.promote_from_store(store, baseline_policy_digest=baseline.digest)
+    active = registry.promote_from_store(
+        store, baseline_policy_digest=baseline.digest,
+        gate=CanaryGate(max_pair_sign_p=None),
+    )
     return registry, report, active
 
 
@@ -551,7 +740,10 @@ def test_rollback_preserves_signed_authority(tmp_path):
     registry.stage(second)
     store2 = _canary_pair_store(tmp_path, report.selected, second.selected,
                                 name="canary-second.jsonl")
-    registry.promote_from_store(store2, baseline_policy_digest=report.selected.digest)
+    registry.promote_from_store(
+        store2, baseline_policy_digest=report.selected.digest,
+        gate=CanaryGate(max_pair_sign_p=None),
+    )
     target = registry.rollback()
     assert target["digest"] == report.selected.digest
     assert target["attestation"]["candidate_digest"] == report.selected.digest
@@ -749,6 +941,7 @@ def test_promotion_binds_candidate_evidence_to_staging_time(tmp_path, monkeypatc
     permissive = CanaryGate(
         min_tasks=1, min_baseline_tasks=1, min_task_families=1,
         min_paired_task_families=1, min_pair_coverage=0.0,
+        max_pair_sign_p=None,
     )
     active = registry.promote_from_store(store, gate=permissive)
     assert active["canary"]["baseline"]["tasks"] == 1
@@ -774,6 +967,7 @@ def test_promote_bound_rejects_unbound_evidence_digests(tmp_path):
     staged = registry.stage(report)
     permissive = CanaryGate(
         min_tasks=1, min_baseline_tasks=1, min_task_families=0, min_paired_task_families=0,
+        max_pair_sign_p=None,
     )
     metrics = CanaryMetrics(12, 12, task_families=4)
     evidence = CanaryEvidence(
@@ -861,7 +1055,10 @@ def test_health_gate_can_suspend_drifted_active_policy(tmp_path):
     registry = PolicyRegistry(tmp_path / "health-policy.json")
     registry.stage(report)
     canary_store = _canary_pair_store(tmp_path, baseline, report.selected)
-    registry.promote_from_store(canary_store, baseline_policy_digest=baseline.digest)
+    registry.promote_from_store(
+        canary_store, baseline_policy_digest=baseline.digest,
+        gate=CanaryGate(max_pair_sign_p=None),
+    )
 
     transition = [{
         "state": "S", "next_state": "D", "selected": {"id": "go", "kind": "click"},
@@ -1435,7 +1632,10 @@ def test_rollback_attestation_chains_to_the_replaced_head(tmp_path):
     registry.stage(second)
     store2 = _canary_pair_store(
         tmp_path, report.selected, second.selected, name="canary-chain.jsonl")
-    registry.promote_from_store(store2, baseline_policy_digest=report.selected.digest)
+    registry.promote_from_store(
+        store2, baseline_policy_digest=report.selected.digest,
+        gate=CanaryGate(max_pair_sign_p=None),
+    )
     before = json.loads((tmp_path / "signed-policy.json").read_text())
     target = registry.rollback()
     att = target["rollback_attestation"]

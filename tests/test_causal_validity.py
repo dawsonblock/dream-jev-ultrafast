@@ -145,7 +145,7 @@ def test_ci_crossing_zero_is_unresolved_not_beneficial():
     assert arms["support_sufficient"] is True
     assert arms["effect_status"] == "unresolved"
     assert arms["unresolved_reason"] == "ci_crosses_zero"
-    assert arms["sequential_delta_ci"][0] <= 0 <= arms["sequential_delta_ci"][1]
+    assert arms["alpha_spent_delta_ci"][0] <= 0 <= arms["alpha_spent_delta_ci"][1]
     model = TrialChoiceModel.fit(events)
     assert model.choose(
         [{"id": "m", "kind": "click", "goal_overlap": 0},
@@ -192,7 +192,7 @@ def test_established_signs_still_establish():
 
 def test_sequential_establishment_is_stricter_than_fixed_sample():
     """Optional stopping: a fixed-sample interval that excludes zero is not
-    enough. Establishment uses the anytime-valid interval, so data that
+    enough. Establishment uses the α-spent approximate interval, so data that
     merely looks favorable at one peek stays unresolved."""
     events = []
     for i in range(8):
@@ -201,8 +201,8 @@ def test_sequential_establishment_is_stricter_than_fixed_sample():
     arms = _cell(events)
     assert arms["delta_ci"][0] > 0  # a single fixed-sample look excludes zero
     assert arms["effect_status"] == "unresolved"  # the sequential rule does not
-    assert arms["sequential_delta_ci"][0] < 0
-    assert arms["sequential_delta_ci"][0] <= arms["delta_ci"][0]
+    assert arms["alpha_spent_delta_ci"][0] < 0
+    assert arms["alpha_spent_delta_ci"][0] <= arms["delta_ci"][0]
     assert arms["sequential_alpha"] < CounterfactualTrials.SEQUENTIAL_ALPHA
 
 
@@ -331,14 +331,13 @@ def test_treatment_signature_backoff_reports_its_level():
         proposal_kind="click", proposal_overlap=1, proposal_effect="navigate")
     assert exact["signature_level"] == "full"
     assert exact["effect_status"] == "beneficial"
-    # A *different* effect class only matches once the effect coordinate is
-    # dropped, and the answer says so.
+    # A *different* effect class never matches: effect is a signature floor —
+    # it is not dropped under backoff, so evidence about "navigate" proposals
+    # cannot answer a "form_edit" divergence merely because both were clicks.
     backoff = trials.resolve(
         model_kind="click", model_overlap=0, model_effect="form_edit",
         proposal_kind="click", proposal_overlap=1, proposal_effect="form_edit")
-    assert backoff["signature_level"] != "full"
-    assert "effect" in backoff["signature_level"]
-    assert backoff["effect_status"] == "beneficial"
+    assert backoff is None
 
 
 def test_never_randomized_action_class_is_flagged_not_assumed():
@@ -352,13 +351,19 @@ def test_never_randomized_action_class_is_flagged_not_assumed():
     model = TrialChoiceModel.fit(events)
     candidates = [
         {"id": "m", "kind": "click", "goal_overlap": 0},
+        # Same treatment *class* (kind + effect) as the measured evidence —
+        # role/rank/phase may back off, but a different effect class could
+        # never inherit this estimate.
         {"id": "never-randomized-before", "kind": "click", "goal_overlap": 1,
-         "effect": "form_edit"},
+         "effect": "navigate"},
     ]
     ranked = model.rank(candidates, model_choice={"id": "m", "kind": "click", "goal_overlap": 0})
     assert ranked and ranked[0]["id"] == "never-randomized-before"
     assert ranked[0]["source"] == "randomized"
-    assert ranked[0]["signature_level"] != "full"  # class-level, not exact
+    # The action ID was never randomized, but its full treatment signature is
+    # exactly the measured class — kind + effect is the identity the estimate
+    # generalizes over, so this answers at "full" with randomized provenance.
+    assert ranked[0]["signature_level"] == "full"
     assert ranked[0]["effect_status"] == "beneficial"
 
     shadow = CausalChoicePolicy(mode="shadow", trial_model=model)
@@ -443,13 +448,40 @@ def test_v4_cells_migrate_to_split_coordinates():
         10, 8, 8, 2, 6.0, 8.0, 8.0, 8.0, 8.0,
     )
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/4", "cells": [v4]})
-    assert trials.version == "jev-trials/5"
+    assert trials.version == "jev-trials/6"
     cell = trials.cells[0]
     assert cell[0] == "flights" and cell[1] == ""
     assert cell[3] == "unknown" and cell[6] == "unknown"  # effect/rank wildcards
     assert cell[-1] == 2  # unknown_abort count survived
     entry = trials.estimate()[next(iter(trials.estimate()))]["candidate"]
     assert entry["assigned"] == 10 and entry["trials"] == 8 and entry["censored"] == 2
+
+
+def test_v5_cells_migrate_with_zeroed_indeterminate_counter():
+    """v5 cells (8 reason counters) migrate to the v6 layout: the new
+    ``indeterminate_execution`` slot splices in as zero and every recorded
+    verdict — including the unverified_claim counter that used to sit at the
+    same tail position — keeps its count."""
+    from jev_ultrafast.dreamlearn import TERMINATION_REASONS, TRIAL_CELL_LEN
+
+    reasons_v5 = [0, 1, 0, 0, 0, 0, 3, 2]  # v5 tail order, ending unverified/unknown
+    key = ("flights", "example.test", "click", "navigate", "button", "0", "0-4", "0-2",
+           "click", "navigate", "link", "1", "0-4", "0-2", "candidate")
+    stats = [10, 8, 8, 2, 6.0, 8.0, 8.0, 8.0, 8.0]
+    v5 = (*key, *stats, 1.0, 2.0, 0.5, *reasons_v5)
+    assert len(v5) == TRIAL_CELL_LEN - 1
+    trials = CounterfactualTrials.from_dict({"version": "jev-trials/5", "cells": [v5]})
+    assert trials.version == "jev-trials/6"
+    cell = trials.cells[0]
+    assert len(cell) == TRIAL_CELL_LEN
+    tail = cell[-len(TERMINATION_REASONS):]
+    names = list(TERMINATION_REASONS)
+    assert tail[names.index("indeterminate_execution")] == 0
+    assert tail[names.index("unverified_claim")] == 3
+    assert tail[names.index("unknown_abort")] == 2
+    assert tail[names.index("browser_crash")] == 1
+    entry = trials.estimate()[next(iter(trials.estimate()))]["candidate"]
+    assert entry["terminations"]["unverified_claim"] == 3
 
 
 def test_censoring_reason_taxonomy_roundtrips():
@@ -501,7 +533,7 @@ def test_minimum_effect_boundary_is_strict():
     trials = CounterfactualTrials.fit(events)
     resolved = trials.resolve(
         model_kind="click", model_overlap=0, proposal_kind="click", proposal_overlap=1)
-    lower = resolved["sequential_delta_ci"][0]
+    lower = resolved["alpha_spent_delta_ci"][0]
     assert lower > 0
     at_boundary = trials.resolve(
         model_kind="click", model_overlap=0, proposal_kind="click", proposal_overlap=1,

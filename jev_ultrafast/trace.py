@@ -22,8 +22,15 @@ def compact_candidate(candidate: dict, goal_tokens) -> dict:
         "id": candidate.get("id"),
         "kind": candidate.get("kind"),
         "node": candidate.get("node"),
+        "role": clean.get("role"),
         "label": clean.get("label", ""),
         "value": clean.get("value", clean.get("current_value", "")),
+        # The deterministic effect class is recorded at compaction time —
+        # the compact view drops ``ctx``, so re-classifying the projection
+        # offline would silently lose the structural signals (form membership,
+        # sensitive field kinds) that drove the live classification. An
+        # already-compacted candidate keeps its recorded effect verbatim.
+        "effect": candidate.get("effect") or classify_effect(candidate).value,
         "goal_overlap": action_goal_overlap(candidate, goal_tokens, clean=clean),
     }
 

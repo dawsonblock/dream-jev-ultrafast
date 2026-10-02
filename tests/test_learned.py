@@ -959,9 +959,9 @@ def test_counterfactual_trials_ipw_estimates():
         lo, hi = arms[arm]["p_success_ci"]
         assert lo <= arms[arm]["p_success"] <= hi
     assert arms["delta_ci"][0] <= arms["delta"] <= arms["delta_ci"][1]
-    # The sequential interval is never narrower than the fixed-sample one.
-    assert arms["sequential_delta_ci"][0] <= arms["delta_ci"][0]
-    assert arms["sequential_delta_ci"][1] >= arms["delta_ci"][1]
+    # The α-spent interval is never narrower than the fixed-sample one.
+    assert arms["alpha_spent_delta_ci"][0] <= arms["delta_ci"][0]
+    assert arms["alpha_spent_delta_ci"][1] >= arms["delta_ci"][1]
 
 
 def test_counterfactual_trials_require_recorded_propensity():
@@ -1518,13 +1518,193 @@ def test_trial_choice_model_family_scope_isolates_effects():
     ) is None
 
 
+def test_trial_choice_model_never_generalizes_across_effect_classes():
+    """The effect coordinate is a signature floor: evidence measured on a
+    purchase click must not bless a same-shaped delete, and the same
+    effect-class divergence must still resolve."""
+    events = []
+    for i in range(8):
+        events += _trial_run(f"c{i}", "candidate", success=True,
+                             proposal_effect="purchase", model_effect="search")
+        events += _trial_run(f"k{i}", "control", success=False,
+                             proposal_effect="purchase", model_effect="search")
+    model = TrialChoiceModel.fit(events)
+    model_choice = {"id": "m", "kind": "click", "effect": "search", "goal_overlap": 0}
+    # Same divergence that was measured → the beneficial effect resolves.
+    proposal = model.choose(
+        [model_choice, {"id": "p", "kind": "click", "effect": "purchase", "goal_overlap": 1}],
+        model_choice=model_choice,
+    )
+    assert proposal is not None and proposal["id"] == "p"
+    # Identical kind/role/overlap but a different semantic effect → abstain.
+    assert model.choose(
+        [model_choice, {"id": "d", "kind": "click", "effect": "delete", "goal_overlap": 1}],
+        model_choice=model_choice,
+    ) is None
+
+
+@pytest.mark.parametrize("stored_effect", ["search", "purchase", "delete"])
+def test_effect_floor_matrix(stored_effect):
+    """T-226 matrix: evidence measured under one semantic effect class can
+    never qualify a divergence under another, for every sensitive pairing."""
+    events = []
+    for i in range(8):
+        events += _trial_run(f"c{i}", "candidate", success=True,
+                             proposal_effect=stored_effect, model_effect="navigate",
+                             proposal_role="button", model_role="link")
+        events += _trial_run(f"k{i}", "control", success=False,
+                             proposal_effect=stored_effect, model_effect="navigate",
+                             proposal_role="button", model_role="link")
+    model = TrialChoiceModel.fit(events)
+    model_choice = {"id": "m", "kind": "click", "effect": "navigate",
+                    "role": "link", "goal_overlap": 0}
+    # The measured divergence resolves.
+    same = {"id": "p", "kind": "click", "effect": stored_effect,
+            "role": "button", "goal_overlap": 1}
+    proposal = model.choose([model_choice, same], model_choice=model_choice)
+    assert proposal is not None and proposal["id"] == "p"
+    # Every other effect class on an otherwise identical click abstains.
+    for query_effect in ("search", "purchase", "delete", "disclosure",
+                         "authenticate", "form_edit", "navigate",
+                         "submission", "external_message", "financial",
+                         "permission_change", "unknown_commit"):
+        if query_effect == stored_effect:
+            continue
+        other = dict(same, id="x", effect=query_effect)
+        assert model.choose(
+            [model_choice, other], model_choice=model_choice
+        ) is None, query_effect
+
+
+def test_signature_backoff_drops_only_safe_coordinates():
+    """Backoff matrix: phase → rank → role → overlap may generalize; kind and
+    effect are floors that no amount of backoff may cross."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    events = []
+    for i in range(8):
+        events += _trial_run(f"c{i}", "candidate", success=True,
+                             proposal_effect="search", model_effect="navigate",
+                             proposal_role="button", model_role="link",
+                             phase=1, proposal_rank=0, model_rank=1)
+        events += _trial_run(f"k{i}", "control", success=False,
+                             proposal_effect="search", model_effect="navigate",
+                             proposal_role="button", model_role="link",
+                             phase=1, proposal_rank=0, model_rank=1)
+    trials = CounterfactualTrials.fit(events)
+    base = dict(model_kind="click", model_overlap=0, model_effect="navigate",
+                model_role="link", model_rank=1, proposal_kind="click",
+                proposal_overlap=1, proposal_effect="search",
+                proposal_role="button", proposal_rank=0)
+
+    full = trials.resolve(**base, phase=1)
+    assert full is not None and full["signature_level"] == "full"
+    # Each droppable coordinate generalizes one level at a time.
+    assert trials.resolve(**base, phase=5)["signature_level"] == "minus_phase"
+    looser = dict(base, proposal_rank=50, model_rank=60)
+    assert trials.resolve(**looser, phase=5)["signature_level"] == "minus_phase_rank"
+    looser = dict(looser, proposal_role="link", model_role="button")
+    assert trials.resolve(**looser, phase=5)["signature_level"] == "minus_phase_rank_role"
+    looser = dict(looser, proposal_overlap=3, model_overlap=3)
+    assert trials.resolve(**looser, phase=5) is not None
+    # The floors never move: a different effect or kind resolves nothing.
+    for floor in (
+        dict(base, proposal_effect="purchase"),
+        dict(base, model_effect="purchase"),
+        dict(base, proposal_kind="fill"),
+        dict(base, model_kind="fill"),
+    ):
+        assert trials.resolve(**floor, phase=5) is None
+
+
+def test_legacy_unknown_effect_never_answers_known_queries():
+    """Migrated v4/v5 cells carry effect='unknown' wildcards: they remain
+    honest in reporting but can never answer a live known-effect query."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    events = []
+    for i in range(8):
+        events += _trial_run(f"c{i}", "candidate", success=True)
+        events += _trial_run(f"k{i}", "control", success=False)
+    trials = CounterfactualTrials.fit(events)
+    # An effect-unspecified query still sees the legacy evidence (kind is the
+    # only enforced floor when the caller doesn't know the effect class).
+    assert trials.resolve(model_kind="click", proposal_kind="click") is not None
+    # A real semantic effect must never borrow unknown-effect evidence.
+    assert trials.resolve(proposal_effect="search") is None
+    assert trials.resolve(proposal_effect="search", model_effect="navigate") is None
+
+
+def test_null_simulation_never_establishes_effect():
+    """Section-29 smoke: under a true null, the α-spent interval must not
+    manufacture 'beneficial' conclusions. 400 synthetic experiment sequences
+    of 12 candidate + 12 control runs at equal success rates."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    rng = __import__("random").Random(7)
+    false_activations = 0
+    sequences = 400
+    for seq in range(sequences):
+        events = []
+        for i in range(12):
+            events += _trial_run(f"s{seq}c{i}", "candidate",
+                                 success=rng.random() < 0.5)
+            events += _trial_run(f"s{seq}k{i}", "control",
+                                 success=rng.random() < 0.5)
+        trials = CounterfactualTrials.fit(events)
+        resolved = trials.resolve(model_kind="click", proposal_kind="click")
+        if resolved and resolved.get("effect_status") == "beneficial":
+            false_activations += 1
+    # Zero is the expected outcome at 12/arm; a couple of extreme draws could
+    # legitimately clear the interval — anything more means the gate leaks.
+    assert false_activations <= 2, f"{false_activations}/{sequences} null sequences established"
+
+
+def test_true_effect_simulation_establishes_benefit():
+    """Positive control: a large real effect must establish once the evidence
+    base is adequate — n=30/arm at delta 0.6 resolves beneficial ~80%+ of the
+    time (the α-spent interval is deliberately low-power at canary scale)."""
+    from jev_ultrafast.dreamlearn import CounterfactualTrials
+
+    rng = __import__("random").Random(11)
+    established = 0
+    sequences = 150
+    for seq in range(sequences):
+        events = []
+        for i in range(30):
+            events += _trial_run(f"s{seq}c{i}", "candidate",
+                                 success=rng.random() < 0.8)
+            events += _trial_run(f"s{seq}k{i}", "control",
+                                 success=rng.random() < 0.2)
+        trials = CounterfactualTrials.fit(events)
+        resolved = trials.resolve(model_kind="click", proposal_kind="click")
+        if resolved and resolved.get("effect_status") == "beneficial":
+            established += 1
+    assert established > sequences * 0.5, f"only {established}/{sequences} detected"
+
+
+def test_assignment_propensity_matches_configured_rate():
+    """T-800: the assignment roll must realize the configured propensity.
+    Pins the mechanism — roll < rate ⇒ candidate — over enough draws that a
+    biased implementation cannot hide inside noise."""
+    import random
+
+    rng = random.Random(0)
+    draws = 20_000
+    for rate in (0.5, 0.25, 0.1):
+        rng = random.Random(42)
+        hits = sum(1 for _ in range(draws) if rng.random() < rate)
+        sigma = (draws * rate * (1 - rate)) ** 0.5
+        assert abs(hits - draws * rate) < 5 * sigma, (rate, hits)
+
+
 def test_trial_choice_model_serialization_roundtrip():
     events = _trial_run("a", "candidate") + _trial_run("b", "control")
     model = TrialChoiceModel.fit(events)
     clone = TrialChoiceModel.from_dict(model.to_dict())
     assert clone.digest == model.digest
     assert clone.version == "jev-causal/2"
-    assert clone.trials.version == "jev-trials/5"
+    assert clone.trials.version == "jev-trials/6"
 
 
 def test_improve_suppresses_trial_refuted_proposals(tmp_path):

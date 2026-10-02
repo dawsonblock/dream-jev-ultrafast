@@ -28,7 +28,7 @@ Give it one goal. Every observation produces an indexed table of the page's actu
 [Watch the MP4](docs/demo.mp4) · [Measurements](docs/performance.md) · [Read the loop](jev_ultrafast/agent.py)
 
 > [!NOTE]
-> **v0.9.x makes the learning layer statistically honest.** Randomized in-browser trials are analyzed intention-to-treat with structured censoring; effects are called `beneficial`/`harmful` only when a *sequentially valid* interval clears a practical threshold — "we observed it" and "we established it" are different claims. Experiment plans are digested, signed, and stale-proof. See the [changelog](CHANGELOG.md) and [VALIDATION.md](VALIDATION.md) for the full history.
+> **v0.9.x makes the learning layer statistically honest.** Randomized in-browser trials are analyzed intention-to-treat with structured censoring; effects are called `beneficial`/`harmful` only when an *α-spent approximate* interval clears a practical threshold — "we observed it" and "we established it" are different claims. Experiment plans are digested, signed, and stale-proof. See the [changelog](CHANGELOG.md) and [VALIDATION.md](VALIDATION.md) for the full history.
 
 ## How it works
 
@@ -194,7 +194,7 @@ uv run jev-dream improve .jev/experience.jsonl \
 - **`--cost-model`** fits a linear `CostModel` of tokens/latency against offered-candidate count — it only re-orders which *passing* candidate gets staged.
 - **`--outcome-model`** fits a bucketed, Beta-smoothed `P(page_changed)` prior per `(kind, overlap, offered-rank)` cell.
 - **`--choice-model`** fits an uncertainty-aware counterfactual prior labeled by each run's *verified terminal outcome* — page churn inside failed runs teaches it nothing — with posterior stddev and explicit abstention on sparse cells.
-- **`CounterfactualTrials` + `TrialChoiceModel`** (always fitted) consume only randomized `experiment_assigned` evidence: intention-to-treat arms, structured censoring with an imbalance gate, sequentially valid effect intervals over a practical threshold, and hierarchical `family+site → site → family → pooled` resolution against a bounded treatment signature (`kind` is a floor — click evidence never answers a fill proposal).
+- **`CounterfactualTrials` + `TrialChoiceModel`** (always fitted) consume only randomized `experiment_assigned` evidence: intention-to-treat arms, structured censoring with an imbalance gate, α-spent approximate effect intervals over a practical threshold, and hierarchical `family+site → site → family → pooled` resolution against a bounded treatment signature (`kind` and effect class are floors — click evidence never answers a fill proposal, and `PURCHASE` evidence never answers a `SEARCH`/`DELETE` divergence).
 - **`ExperimentScheduler`** ranks which unresolved hypothesis is worth the next real run; **`CausalChoicePolicy`** exposes `shadow` → `canary` → `active` modes under operator control, tagging every entry `observational` / `randomized` / `pooled_randomized`.
 
 Learned models annotate and prioritize only. A counterfactual proposal is a hypothesis — never an outcome, never evidence, never a gate input. Anything a model prefers must still qualify through real executions and bound live canaries.
@@ -211,7 +211,7 @@ uv run jev-dream promote .jev/experience.jsonl --registry .jev/policy-registry.j
 uv run jev-dream health  .jev/experience.jsonl --registry .jev/policy-registry.json --recent-tasks 20
 ```
 
-Staging is not activation: promotion requires matched baseline/candidate canaries (≥12 runs each across ≥4 task families by default), no verified-success/risk regression, ≤25% latency/action/token regression, and an exact two-sided sign-test over `(task_family, instance_id)` pairs. See [DREAM-Jev design](docs/dream-rsi-integration.md).
+Staging is not activation: promotion requires matched baseline/candidate canaries (≥12 runs each across ≥4 task families by default), no verified-success/risk regression, ≤25% latency/action/token regression, and an exact two-sided sign-test over `(task_family, instance_id)` pairs at p ≤ 0.05 by default — which in practice demands more than the minimum canary, since four pairs cannot reach significance. See [DREAM-Jev design](docs/dream-rsi-integration.md).
 
 ## Why it moves
 

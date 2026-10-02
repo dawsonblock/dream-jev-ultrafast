@@ -2,11 +2,12 @@
 torn-tail evidence recovery, and signing-key rotation."""
 
 import json
+from pathlib import Path
 
 import pytest
 
 from jev_ultrafast import browser
-from jev_ultrafast.browser import StalePage, browser_operation
+from jev_ultrafast.browser import IndeterminateMutation, StalePage, browser_operation
 from jev_ultrafast.dream import ExperienceStore
 from jev_ultrafast.policy import (
     DefaultActionPolicy,
@@ -153,15 +154,16 @@ def test_pre_press_identity_failure_blocks_input(monkeypatch):
     assert not any(m == "Input.dispatchMouseEvent" for m, _ in calls)
 
 
-def test_pre_release_failure_still_releases_pointer(monkeypatch):
+def test_pre_release_failure_is_indeterminate_and_releases_pointer(monkeypatch):
     calls = []
     # resolve → {x,y}; pre-press → True; pre-release → False
     monkeypatch.setattr(browser, "cdp", _fake_cdp(calls, [{"x": 5, "y": 5}, True, False]))
-    with pytest.raises(StalePage, match="press and release"):
+    with pytest.raises(IndeterminateMutation, match="indeterminate"):
         browser_operation(_op({"id": "e", "kind": "click", "node": 1}))
     events = [kw.get("type") for m, kw in calls if m == "Input.dispatchMouseEvent"]
     # Both halves of the gesture were dispatched: press landed, the release is
-    # sent for input-state hygiene, and the operation still reports aborted.
+    # sent for input-state hygiene under finally, and the outcome is reported
+    # indeterminate — the press may already have run, so it is not retryable.
     assert events == ["mousePressed", "mouseReleased"]
 
 
@@ -245,6 +247,33 @@ def test_complete_record_missing_newline_is_sealed(tmp_path):
     assert len(ExperienceStore(path).load()) == 1
     ExperienceStore(path).append(_minimal_event())
     assert len(ExperienceStore(path, strict=True).load()) == 2
+
+
+def test_append_tail_check_never_reads_whole_file(tmp_path, monkeypatch):
+    """Scale guard (qualification §52): the per-append torn-tail check inspects
+    only the tail bytes. A whole-file ``read_bytes`` made every append O(log
+    size) and the store O(n²) — ~4.5 min for 100k events where the fast path
+    is under 30s."""
+    path = tmp_path / "bounded-tail.jsonl"
+    store = ExperienceStore(path)
+    store.append(_minimal_event())
+    store.append(_minimal_event())
+    original = Path.read_bytes
+
+    def no_full_reads(self):  # Path.read_bytes reads the whole file by design
+        raise AssertionError("append performed a whole-file read")
+
+    monkeypatch.setattr(Path, "read_bytes", no_full_reads)
+    store.append(_minimal_event())  # healthy tail: last-byte check only
+    monkeypatch.setattr(Path, "read_bytes", original)
+
+    # Boundary cases still work: a fragment spanning chunk reads and a tail
+    # that IS the whole file (no newline at all).
+    path.write_bytes(path.read_bytes()[:-1])  # complete record, newline lost
+    monkeypatch.setattr(Path, "read_bytes", no_full_reads)
+    store.append(_minimal_event())  # backward fragment scan + separator seal
+    monkeypatch.setattr(Path, "read_bytes", original)
+    assert len(ExperienceStore(path, strict=True).load()) == 4
 
 
 def test_key_rotation_and_domain_separation(tmp_path):

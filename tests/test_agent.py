@@ -9,7 +9,7 @@ import pytest
 
 from jev_ultrafast import agent as loop
 from jev_ultrafast import model
-from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
+from jev_ultrafast.browser import IndeterminateMutation, StalePage, browser_operation, fingerprint
 
 
 def page():
@@ -489,8 +489,69 @@ def test_approved_execution_marks_risk_events_in_trace(runner, tmp_path):
     runner.command("approve")
     events = ExperienceStore(tmp_path / "approval.jsonl").load()
     kinds = [event["event"] for event in events]
-    assert kinds == ["approval_required", "transition"]
+    # The mutation journal brackets the dispatch: attempted before execution,
+    # confirmed after, then the observed transition.
+    assert kinds == ["approval_required", "action_attempted", "action_confirmed", "transition"]
     assert events[-1]["risk_events"] == 1
+
+
+def test_indeterminate_mutation_is_journaled_and_never_retried(runner, tmp_path):
+    """An interrupted mutation may already have crossed its mutation point —
+    the journal must record the attempt AND its indeterminate outcome, the run
+    aborts under its own censoring reason, and the action is never retried."""
+    from jev_ultrafast.dream import ExperienceStore
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    path = tmp_path / "run.jsonl"
+    runner.dream_recorder = DreamTraceRecorder(ExperienceStore(path), goal="Find a book")
+    runner.state["browser"].act.side_effect = IndeterminateMutation(
+        "press acknowledged, result lost"
+    )
+    runner.state["decision"] = decision("e3")
+    p = runner.state["page"]
+    with pytest.raises(IndeterminateMutation):
+        runner.command("act", {"fingerprint": p["fingerprint"]})
+    runner.browser = runner.state["browser"]
+    runner.close()
+
+    runner.state["browser"].act.assert_called_once()  # no retry, no re-observe
+    assert runner.state["abort_reason"] == "indeterminate_execution"
+    assert runner.state["history"][-1]["execution"] == "indeterminate"
+    assert runner.state["history"][-1]["page_changed"] is None
+
+    events = ExperienceStore(path).load()
+    kinds = [event["event"] for event in events]
+    assert "action_attempted" in kinds
+    assert "action_indeterminate" in kinds
+    assert "action_confirmed" not in kinds
+    assert "transition" not in kinds
+    final = events[-1]
+    assert final["event"] == "run_finished"
+    assert final["status"] == "aborted"
+    assert final["reason"] == "indeterminate_execution"
+
+
+def test_premutation_stale_is_journaled_as_not_executed(runner, tmp_path):
+    """A provably pre-mutation StalePage stays recoverable, but the journal
+    must still close the attempt: attempted, then not_executed — never left
+    dangling and never claimed indeterminate."""
+    from jev_ultrafast.dream import ExperienceStore
+    from jev_ultrafast.trace import DreamTraceRecorder
+
+    path = tmp_path / "run.jsonl"
+    runner.dream_recorder = DreamTraceRecorder(ExperienceStore(path), goal="Find a book")
+    runner.state["browser"].act.side_effect = StalePage("Target changed")
+    runner.state["decision"] = decision("e3")
+    p = runner.state["page"]
+    with pytest.raises(StalePage):
+        runner.command("act", {"fingerprint": p["fingerprint"]})
+
+    events = ExperienceStore(path).load()
+    kinds = [event["event"] for event in events]
+    assert "action_attempted" in kinds
+    assert "action_not_executed" in kinds
+    assert "action_indeterminate" not in kinds
+    assert "action_confirmed" not in kinds
 
 
 def test_sensitive_generated_text_escalates_a_benign_field(runner, monkeypatch):
@@ -1225,10 +1286,14 @@ def _causal_evidence():
                 "assignment_probability": 0.5,
                 "proposal_id": "e3",
                 "proposal_kind": "click",
+                "proposal_effect": "search",
+                "proposal_role": "button",
                 "proposal_overlap": 0,
                 "proposal_offered_rank": 1,
                 "model_choice_id": "e1",
                 "model_choice_kind": "fill",
+                "model_choice_effect": "form_edit",
+                "model_choice_role": "textbox",
                 "model_choice_overlap": 0,
                 "model_choice_offered_rank": 0,
                 "task_key": "t",

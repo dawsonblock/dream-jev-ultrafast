@@ -8,7 +8,7 @@ import pytest
 
 from jev_ultrafast import agent as loop
 from jev_ultrafast import browser, model
-from jev_ultrafast.browser import StalePage, browser_operation, fingerprint
+from jev_ultrafast.browser import IndeterminateMutation, StalePage, browser_operation, fingerprint
 from jev_ultrafast.policy import DefaultActionPolicy
 from jev_ultrafast.privacy import redact_text, sanitize_action, sanitize_url
 
@@ -423,3 +423,150 @@ def test_select_guard_normalizes_option_value_like_snapshot():
     src = Path(browser.__file__).read_text()
     assert "String(o.value).replace(" in src
     assert "String(o.label).replace(" in src
+
+
+def test_atomic_click_lost_result_is_indeterminate_not_stale(monkeypatch):
+    """e.click() can navigate before Runtime.evaluate replies — the context is
+    destroyed on the way back, so a lost result is NOT 'not executed'. The
+    outcome is indeterminate and must never be retried as a clean stale."""
+    calls = []
+
+    def fake_cdp(method, session_id=None, **kwargs):
+        calls.append(method)
+        if method == "Runtime.evaluate":
+            raise RuntimeError("Execution context was destroyed")
+        return {}
+
+    monkeypatch.setattr(browser, "cdp", fake_cdp)
+    with pytest.raises(IndeterminateMutation):
+        browser_operation({
+            "operation": "act",
+            "session": "s",
+            "context_id": 42,
+            "expected": {"page_key": [1], "guard": [1]},
+            "action": {"id": "e1", "kind": "click", "node": 1},
+            "guarantee": "atomic",
+        })
+    assert calls == ["Runtime.evaluate"]  # one dispatch, no retry
+
+
+def test_atomic_mutation_missing_result_is_indeterminate(monkeypatch):
+    """A mutating evaluation that returns no value at all cannot prove the
+    mutation did not run — 'validated and returned nothing' is
+    indistinguishable from 'mutated, then the result was lost'."""
+    monkeypatch.setattr(browser, "cdp", Mock(return_value={"result": {}}))
+    with pytest.raises(IndeterminateMutation):
+        browser_operation({
+            "operation": "act",
+            "session": "s",
+            "context_id": 42,
+            "expected": {"page_key": [1], "guard": [1]},
+            "action": {"id": "e1", "kind": "click", "node": 1},
+            "guarantee": "atomic",
+        })
+
+
+def test_atomic_fill_lost_result_is_indeterminate(monkeypatch):
+    """execCommand('insertText') may fire handlers that navigate before the
+    evaluation returns; same indeterminate class as click."""
+    monkeypatch.setattr(
+        browser, "cdp", Mock(side_effect=RuntimeError("Execution context destroyed"))
+    )
+    with pytest.raises(IndeterminateMutation):
+        browser_operation({
+            "operation": "act",
+            "session": "s",
+            "context_id": 42,
+            "expected": {"page_key": [1], "guard": [1]},
+            "action": {"id": "e1", "kind": "fill", "node": 1},
+            "text": "secret",
+            "guarantee": "atomic",
+        })
+
+
+def test_trusted_prerelease_exception_still_dispatches_release(monkeypatch):
+    """After mousePressed the pointer must never be stranded: a pre-release
+    check that throws still attempts mouseReleased under finally, and the
+    click outcome is indeterminate — not a clean retry."""
+    calls = []
+
+    def fake_cdp(method, session_id=None, **kwargs):
+        calls.append(method)
+        if method == "Runtime.evaluate":
+            n = sum(1 for name in calls if name == "Runtime.evaluate")
+            if n == 1:
+                return {"result": {"value": {"x": 5, "y": 5}}}  # validation
+            if n == 2:
+                return {"result": {"value": True}}  # pre-press identity check
+            raise RuntimeError("Execution context destroyed")  # pre-release dies
+        return {}
+
+    monkeypatch.setattr(browser, "cdp", fake_cdp)
+    with pytest.raises(IndeterminateMutation):
+        browser_operation({
+            "operation": "act",
+            "session": "s",
+            "context_id": 42,
+            "expected": {"page_key": [1], "guard": [1]},
+            "action": {"id": "e1", "kind": "click", "node": 1},
+            "guarantee": "trusted",
+        })
+    # Press dispatched once; the cleanup release was still attempted.
+    assert calls.count("Input.dispatchMouseEvent") == 2
+
+
+def test_trusted_release_dispatch_failure_is_indeterminate(monkeypatch):
+    """If the release itself is lost after a validated press, the click
+    outcome is unknowable — indeterminate, never a transport crash or stale."""
+    calls = []
+
+    def fake_cdp(method, session_id=None, **kwargs):
+        calls.append(method)
+        if method == "Runtime.evaluate":
+            n = sum(1 for name in calls if name == "Runtime.evaluate")
+            if n == 1:
+                return {"result": {"value": {"x": 5, "y": 5}}}
+            return {"result": {"value": True}}  # both identity checks pass
+        if method == "Input.dispatchMouseEvent" and kwargs.get("type") == "mouseReleased":
+            raise RuntimeError("socket closed")
+        return {}
+
+    monkeypatch.setattr(browser, "cdp", fake_cdp)
+    with pytest.raises(IndeterminateMutation):
+        browser_operation({
+            "operation": "act",
+            "session": "s",
+            "context_id": 42,
+            "expected": {"page_key": [1], "guard": [1]},
+            "action": {"id": "e1", "kind": "click", "node": 1},
+            "guarantee": "trusted",
+        })
+
+
+def test_trusted_insert_lost_result_is_indeterminate(monkeypatch):
+    """Trusted-path text insertion mutates inside the evaluation; a lost
+    result means the fill may already have happened."""
+    calls = []
+
+    def fake_cdp(method, session_id=None, **kwargs):
+        calls.append(method)
+        if method == "Runtime.evaluate":
+            n = sum(1 for name in calls if name == "Runtime.evaluate")
+            if n == 1:
+                return {"result": {"value": {"x": 5, "y": 5}}}
+            if n <= 3:
+                return {"result": {"value": True}}  # pre-press/pre-release pass
+            return {"result": {}}  # insert evaluation returns no value
+        return {}
+
+    monkeypatch.setattr(browser, "cdp", fake_cdp)
+    with pytest.raises(IndeterminateMutation):
+        browser_operation({
+            "operation": "act",
+            "session": "s",
+            "context_id": 42,
+            "expected": {"page_key": [1], "guard": [1]},
+            "action": {"id": "e1", "kind": "fill", "node": 1},
+            "text": "secret",
+            "guarantee": "trusted",
+        })

@@ -63,7 +63,13 @@ SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", "jev-dream/3", SCHEMA_VERSION
 # so an overridden step is evidence of scheduler influence, not an on-policy
 # choice the observational priors may fit — pools that predate the tag would
 # read that step as the recorded policy's own selection.
-TCB_VERSION = "jev-ultrafast-tcb/0.14"
+# 0.15 adds the mutation execution journal (action_attempted before dispatch,
+# action_confirmed / action_indeterminate after) and the
+# ``indeterminate_execution`` censoring reason: a mutation whose
+# acknowledgement was lost is recorded as unknowable, never as a retryable
+# stale page — pools that predate it cannot distinguish a press that may have
+# landed from a click that provably never ran.
+TCB_VERSION = "jev-ultrafast-tcb/0.15"
 SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.3",
     "jev-ultrafast-tcb/0.4",
@@ -76,6 +82,7 @@ SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.11",
     "jev-ultrafast-tcb/0.12",
     "jev-ultrafast-tcb/0.13",
+    "jev-ultrafast-tcb/0.14",
     TCB_VERSION,
 }
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
@@ -657,10 +664,27 @@ class ExperienceStore:
         """
         if not self.path.exists() or self.path.stat().st_size == 0:
             return False
-        data = self.path.read_bytes()
-        if data.endswith(b"\n"):
-            return False
-        frag = data.rsplit(b"\n", 1)[-1]
+        size = self.path.stat().st_size
+        with self.path.open("rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) == b"\n":
+                return False
+            # The fragment is the bytes after the last newline — scan backward
+            # in chunks so the healthy-tail check stays O(fragment), not
+            # O(file); only a fragment spanning the whole file degrades to a
+            # full read, which is the worst case either way.
+            pos = size
+            frag = b""
+            while pos > 0:
+                take = min(65536, pos)
+                pos -= take
+                handle.seek(pos)
+                chunk = handle.read(take)
+                nl = chunk.rfind(b"\n")
+                if nl >= 0:
+                    frag = chunk[nl + 1:] + frag
+                    break
+                frag = chunk + frag
         stripped = frag.strip()
         try:
             parsed = json.loads(frag) if stripped else None
@@ -672,7 +696,7 @@ class ExperienceStore:
             return True
         if parsed is not None or (stripped and stripped != b"{" and not stripped.startswith(b'{"')):
             raise ValueError("Unrecoverable DREAM store tail: not a torn event prefix")
-        offset = len(data) - len(frag)
+        offset = size - len(frag)
         with self.path.open("r+b") as handle:
             handle.truncate(offset)
             handle.flush()
@@ -1133,6 +1157,20 @@ class ReplaySimulator:
                                 ),
                                 None,
                             ),
+                            # The effect class recorded when the transition was
+                            # compacted (full structural context); older stores
+                            # carry none and resolve as an honest wildcard —
+                            # never re-classify a compacted candidate whose ctx
+                            # is gone, a degraded class could match the wrong
+                            # signature cell instead of matching everything.
+                            "effect": next(
+                                (
+                                    c.get("effect")
+                                    for c in transition.candidate_actions
+                                    if c.get("id") == transition.selected_id
+                                ),
+                                None,
+                            ),
                             "goal_overlap": selected_overlap,
                         },
                         task_family=world.family_key,
@@ -1156,7 +1194,39 @@ class ReplaySimulator:
                             goal_overlap=proposal_overlap,
                             model_kind=transition.selected_kind,
                             model_overlap=selected_overlap,
+                            model_effect=next(
+                                (
+                                    c.get("effect")
+                                    for c in transition.candidate_actions
+                                    if c.get("id") == transition.selected_id
+                                ),
+                                None,
+                            ),
+                            model_role=next(
+                                (
+                                    c.get("role")
+                                    for c in transition.candidate_actions
+                                    if c.get("id") == transition.selected_id
+                                ),
+                                None,
+                            ),
                             model_rank=offered_rank,
+                            proposal_effect=next(
+                                (
+                                    c.get("effect")
+                                    for c in offered
+                                    if c.get("id") == proposal["id"]
+                                ),
+                                None,
+                            ),
+                            proposal_role=next(
+                                (
+                                    c.get("role")
+                                    for c in offered
+                                    if c.get("id") == proposal["id"]
+                                ),
+                                None,
+                            ),
                             proposal_rank=next(
                                 (
                                     i
@@ -1204,11 +1274,49 @@ class ReplaySimulator:
                             "historical": {
                                 "id": transition.selected_id,
                                 "kind": transition.selected_kind,
+                                "effect": next(
+                                    (
+                                        c.get("effect")
+                                        for c in transition.candidate_actions
+                                        if c.get("id") == transition.selected_id
+                                    ),
+                                    None,
+                                ),
+                                "role": next(
+                                    (
+                                        c.get("role")
+                                        for c in transition.candidate_actions
+                                        if c.get("id") == transition.selected_id
+                                    ),
+                                    None,
+                                ),
                                 "goal_overlap": selected_overlap,
                                 "offered_rank": offered_rank,
                                 "propensity": transition.selected_propensity,
                             },
-                            "proposal": proposal,
+                            # The stamped proposal carries the recorded
+                            # signature coordinates — the scheduler and any
+                            # later refutation query resolve against exactly
+                            # the treatment class this plan was stamped under.
+                            "proposal": {
+                                **proposal,
+                                "effect": next(
+                                    (
+                                        c.get("effect")
+                                        for c in offered
+                                        if c.get("id") == proposal["id"]
+                                    ),
+                                    proposal.get("effect"),
+                                ),
+                                "role": next(
+                                    (
+                                        c.get("role")
+                                        for c in offered
+                                        if c.get("id") == proposal["id"]
+                                    ),
+                                    proposal.get("role"),
+                                ),
+                            },
                             "proposal_offered_rank": next(
                                 (
                                     i
@@ -2251,7 +2359,18 @@ class CanaryDecision:
 
 
 class CanaryGate:
-    """Require matched real executions before replay-selected policy activation."""
+    """Require matched real executions before replay-selected policy activation.
+
+    The default gate is a paired-evidence requirement, not just a
+    non-regression check: alongside the aggregate floors it demands an exact
+    two-sided sign test over ``(task_family, instance_id)`` outcome pairs with
+    ``max_pair_sign_p`` — promotion needs *demonstrated* improvement, not
+    merely "no worse". Because a sign test ignores ties, p ≤ 0.05 needs at
+    least six non-tied pairs all won by the candidate, so the bound evidence
+    must exceed the raw task minimums before promotion can pass. Setting
+    ``max_pair_sign_p=None`` explicitly waives the significance check for
+    controlled testing; leaving the field unset keeps it on.
+    """
 
     def __init__(
         self,
@@ -2268,7 +2387,7 @@ class CanaryGate:
         max_latency_regression_ratio: float = 0.25,
         max_action_regression_ratio: float = 0.25,
         max_token_regression_ratio: float = 0.25,
-        max_pair_sign_p: float | None = None,
+        max_pair_sign_p: float | None = 0.05,
     ):
         self.min_tasks = min_tasks
         self.min_baseline_tasks = min_baseline_tasks
@@ -2900,6 +3019,16 @@ class PolicyRegistry:
     ) -> dict:
         if not allow_unbound_metrics:
             raise ValueError("Unbound canary metrics are disabled; use promote_from_store()")
+        # Compatibility escape hatch, feature-gated twice: the caller must
+        # pass the flag AND the environment must explicitly opt in, so no code
+        # path can reach unbound promotion silently. The gate fails closed —
+        # absent or empty JEV_ALLOW_UNBOUND_METRICS rejects the call.
+        if os.environ.get("JEV_ALLOW_UNBOUND_METRICS") != "1":
+            raise ValueError(
+                "Unbound canary metrics require JEV_ALLOW_UNBOUND_METRICS=1 in the "
+                "environment; normal activation is promote_from_store() with "
+                "bound paired evidence."
+            )
         payload = self.load()
         staged = payload.get("staged")
         if not staged:
@@ -2940,7 +3069,10 @@ class PolicyRegistry:
             max_latency_regression_ratio=(gate.max_latency_regression_ratio if gate else 0.25),
             max_action_regression_ratio=(gate.max_action_regression_ratio if gate else 0.25),
             max_token_regression_ratio=(gate.max_token_regression_ratio if gate else 0.25),
-            max_pair_sign_p=(gate.max_pair_sign_p if gate else None),
+            # Unbound evidence contains no outcome pairs, so a sign test could
+            # never pass here; the compatibility path deliberately skips it —
+            # the significance floor applies to bound paired evidence only.
+            max_pair_sign_p=None,
         )
         return self._promote_bound(evidence, permissive)
 

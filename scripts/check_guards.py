@@ -2,7 +2,7 @@
 
 from urllib.parse import quote
 
-from jev_ultrafast.browser import Browser, StalePage
+from jev_ultrafast.browser import Browser, IndeterminateMutation, StalePage
 
 HTML = """<!doctype html><title>Guard checks</title>
 <style>body{margin:30px}button{width:180px;height:50px}#outside{position:absolute;top:3000px}</style>
@@ -177,7 +177,9 @@ def main():
 
         # A page-injected listener fires during the trusted press itself; each of
         # these must abort at the pre-release identity check and never hit the
-        # target. (Atomic execution has no press/release window — see below.)
+        # target. The press already left the process, so the outcome is
+        # indeterminate — never a retryable StalePage. (Atomic execution has no
+        # press/release window — see below.)
         # handler: page JS run during mousePressed; clicks_expected: whether the
         # hygiene release can still complete a click on the same physical
         # element (navigation changes page identity without detaching the node).
@@ -200,7 +202,7 @@ def main():
             )
             try:
                 browser.act(adv, page, guarantee="trusted")
-            except StalePage:
+            except IndeterminateMutation:
                 pass
             else:
                 raise AssertionError(f"{label}: input executed")
@@ -224,6 +226,63 @@ def main():
         assert browser.evaluate("window.sabotage") == 0  # no press was dispatched at all
         assert browser.evaluate("window.evil") == 0
         passed.append("atomic click has no press window for mid-event sabotage")
+
+        # An atomic click whose onclick navigates can destroy the execution
+        # context before Runtime.evaluate returns its result. Whatever the
+        # outcome, it must never surface as a retryable StalePage — either the
+        # mutation was confirmed or the result is indeterminate.
+        reset_adv()
+        browser.evaluate(
+            "document.querySelector('#adv').onclick=()=>{window.hits=(window.hits||0)+1;"
+            "location.replace('about:blank')}"
+        )
+        page = browser.observe(screenshot=False)
+        adv = next(a for a in page["actions"] if a["label"] == "Continue")
+        try:
+            browser.act(adv, page)
+        except StalePage:
+            raise AssertionError("navigating click reported as retryable stale")
+        except IndeterminateMutation:
+            pass
+        passed.append("navigating atomic click is confirmed or indeterminate, never stale")
+
+        # The same discipline for every other mutation channel: synchronous
+        # document teardown inside input/change/mousedown handlers must classify
+        # as confirmed or indeterminate — never a retryable stale page.
+        nav_cases = [
+            ("atomic fill oninput navigation",
+             '<label>Site<input id="nf" oninput="location.replace(\'about:blank\')"></label>',
+             "fill", {}, "x"),
+            ("trusted fill oninput navigation",
+             '<label>Site<input id="nf" oninput="location.replace(\'about:blank\')"></label>',
+             "fill", {"guarantee": "trusted"}, "x"),
+            ("select onchange navigation",
+             '<select aria-label="Nav" onchange="location.replace(\'about:blank\')">'
+             "<option>All</option><option>Go</option></select>",
+             "select", {}, None),
+            ("atomic click document.write",
+             '<button id="adv" onclick="window.hits=(window.hits||0)+1;'
+             "document.open();document.write('<p>gone</p>');document.close()\">Continue</button>",
+             "click", {}, None),
+            ("trusted press mousedown navigation",
+             '<button id="adv" onmousedown="location.replace(\'about:blank\')" '
+             'onclick="window.hits=(window.hits||0)+1">Continue</button>',
+             "click", {"guarantee": "trusted"}, None),
+        ]
+        for label, html, kind, extra, text in nav_cases:
+            browser.evaluate("document.body.innerHTML=" + repr(html))
+            page = browser.observe(screenshot=False)
+            action = next(a for a in page["actions"] if a["kind"] == kind)
+            try:
+                if text is None:
+                    browser.act(action, page, **extra)
+                else:
+                    browser.act(action, page, text=text, **extra)
+            except StalePage:
+                raise AssertionError(f"{label}: ambiguous mutation reported as retryable stale")
+            except IndeterminateMutation:
+                pass
+            passed.append(f"{label} is confirmed or indeterminate, never stale")
 
         # The aborted press must leave clean pointer state: a later legitimate
         # trusted click still works.
