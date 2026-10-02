@@ -239,6 +239,52 @@ def test_corrupt_tail_and_mid_chain_stay_fatal(tmp_path):
         ExperienceStore(path2).load()
 
 
+def test_broken_prev_hash_link_stays_fatal(tmp_path):
+    """A record carrying the wrong ``prev_hash`` is a spliced or truncated
+    history — the link check must catch it even when every record's own hash
+    is self-consistent."""
+    path = tmp_path / "store.jsonl"
+    store = ExperienceStore(path)
+    store.append(_minimal_event())
+    store.append(_minimal_event())
+    lines = path.read_text().splitlines()
+    spliced = json.loads(lines[1])
+    spliced["prev_hash"] = "f" * 64
+    spliced["event_hash"] = ExperienceStore._event_hash(spliced)
+    path.write_text("\n".join([lines[0], json.dumps(spliced)]) + "\n")
+    with pytest.raises(ValueError, match="predecessor mismatch"):
+        ExperienceStore(path).load()
+
+
+def test_require_signatures_rejects_unsigned_evidence(tmp_path):
+    """``require_signatures``/``JEV_REQUIRE_SIGNED_EVIDENCE`` is a hard gate:
+    a valid unsigned chain must fail closed, not load quietly."""
+    path = tmp_path / "store.jsonl"
+    ExperienceStore(path).append(_minimal_event())  # unsigned by construction
+    with pytest.raises(ValueError, match="signatures required"):
+        ExperienceStore(path, require_signatures=True).load()
+    # And a signed record under an unknown key still cannot launder through.
+    signer = EvidenceSigner.from_hex("cc" * 32)
+    path2 = tmp_path / "signed.jsonl"
+    ExperienceStore(path2, signer=signer).append(_minimal_event())
+    with pytest.raises(ValueError, match="unexpected key"):
+        ExperienceStore(
+            path2, verify_keys={EvidenceSigner.from_hex("dd" * 32).key_id}
+        ).load()
+
+
+def test_reserved_chain_keys_cannot_be_forged(tmp_path):
+    """Appends carrying ``prev_hash``/``event_hash``/``signature``/schema
+    keys are an attempt to fabricate chain position — always refused."""
+    path = tmp_path / "store.jsonl"
+    store = ExperienceStore(path)
+    for key in ("prev_hash", "event_hash", "signature", "key_id", "schema",
+                "tcb_version", "recorded_at_ms"):
+        with pytest.raises(ValueError, match="reserved chain keys"):
+            store.append({**_minimal_event(), key: "f" * 64})
+    assert not path.exists() or not path.read_text().strip()  # nothing written
+
+
 def test_complete_record_missing_newline_is_sealed(tmp_path):
     path = tmp_path / "store.jsonl"
     store = ExperienceStore(path)
@@ -420,6 +466,24 @@ def test_chain_head_anchor_detects_truncated_tail(tmp_path):
         path, verify_keys={signer.key_id}, anchor_path=tmp_path / "store.head")
     with pytest.raises(ValueError, match="anchor"):
         reader.load()
+
+
+def test_anchor_digest_tamper_stays_fatal(tmp_path):
+    """Tampering with anchor material (even a field the head/sequence check
+    does not compare) must fail on the digest — the anchor cannot be edited
+    in place to launder a different checkpoint."""
+    signer = EvidenceSigner.from_hex("33" * 32)
+    path, _ = _two_event_store(tmp_path, signer)
+    anchor_path = tmp_path / "store.head"
+    anchor = json.loads(anchor_path.read_text())
+    anchor["signed_at_ms"] += 1  # material change; head+sequence untouched
+    anchor_path.write_text(json.dumps(anchor) + "\n")
+    reader = ExperienceStore(
+        path, verify_keys={signer.key_id}, anchor_path=anchor_path)
+    with pytest.raises(ValueError, match="anchor digest mismatch"):
+        reader.load()
+    with pytest.raises(ValueError, match="anchor digest mismatch"):
+        reader.append(_minimal_event())
 
 
 def test_anchor_detects_signed_tail_disguised_as_torn_write(tmp_path):

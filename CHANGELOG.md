@@ -27,6 +27,9 @@ A second-pass audit found four defects that mattered precisely because everythin
 - **Failure-mode tests**: signer failure (KMS/HSM) never falls back to unsigned; mid-chain signer death preserves the existing chain; read-only store refuses the append; a backward clock cannot corrupt the hash-linked chain; replay fits are digest-deterministic.
 - **`scripts/fuzz_check.py`** runs 1,000,000 structured cases over the parse surfaces: joined treatment signatures can never inject the `|` delimiter, event serialization is injective under hostile payloads, and every line-level chain mutation is either fail-closed or a strict prefix of the original.
 - **Crash injection at volume**: `scripts/crash_check.py --segment` rotates stores so per-kill verification stays bounded; the 1,000-kill run recovered to a verified chain after every SIGKILL (2.78M events across 40 segments).
+- **`scripts/mutate_check.py`** is the bounded §55 sweep: 12 curated TCB mutants, each must turn the suite red — the first pass exposed four real gaps (required-signing enforcement, `prev_hash` link integrity, reserved-key forgery, anchor-digest tamper), now covered by dedicated tests; the sweep is 12/12 killed.
+- **`scripts/sign_manifest.py`** signs/verifies the manifest digest under a domain-separated Ed25519 key (`jev-manifest-sig/1`), and consecutive `uv build` runs are byte-identical — the signed-reproducible-release artifacts exist.
+- **`scripts/qualify.py`** is the staged §64 pipeline (Q0→Q4, `jev-qualify/1` report; unrunnable legs report `skipped`, never `passed`) and **`scripts/soak_check.py`** runs the probes under a wall-clock deadline for the 24h gate. The suite also passes under Python 3.12.9, matching 3.13.
 - **Coverage floor**: the offline suite now runs under `--cov-fail-under=80` (suite at 86%; the browser-execution paths it can't reach are covered by the live Chrome guards). `hypothesis` and `pytest-cov` join the dev group.
 
 ## v0.9.1 — causal-evidence hardening
