@@ -11,10 +11,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, macos-13]
+        os: [ubuntu-latest, macos-latest]
         python: ["3.12", "3.13"]
-        # macos-13 is Intel x86_64; macos-latest is arm64 — together with
-        # ubuntu-latest this covers the supported OS/arch/Python surface.
+        # macos-13 (Intel) runners are retired — they queue indefinitely and
+        # never schedule. macOS x86_64 remains an ops-side leg outside CI.
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
