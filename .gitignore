@@ -13,3 +13,5 @@ dist/
 .coverage
 coverage.xml
 htmlcov/
+mutants/
+setup.cfg

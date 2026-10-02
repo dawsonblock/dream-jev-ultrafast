@@ -39,6 +39,12 @@ jobs:
     # Real-browser execution-guard regressions. v0.4.0 shipped a mutation bug
     # that passed mocked tests and broke only in Chrome; this job gates that
     # class of regression with no model calls and no external websites.
+    # §3 axis: run the same suite on the runner's current stable AND a pinned
+    # previous major — CDP/atomic-mutation behavior must not be version-locked.
+    strategy:
+      fail-fast: false
+      matrix:
+        chrome: ["runner", "140"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,9 +52,18 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --frozen
+      - name: Install pinned Chrome
+        if: matrix.chrome != 'runner'
+        id: chrome
+        uses: browser-actions/setup-chrome@v2
+        with:
+          chrome-version: ${{ matrix.chrome }}
+          install-dependencies: true
       - name: Launch headless Chrome with CDP
+        env:
+          CHROME_BIN: ${{ matrix.chrome == 'runner' && 'google-chrome' || steps.chrome.outputs.chrome-path }}
         run: |
-          google-chrome --headless=new --remote-debugging-port=9222 \
+          "$CHROME_BIN" --headless=new --remote-debugging-port=9222 \
             --user-data-dir="$RUNNER_TEMP/jev-guard-chrome" --no-first-run \
             --no-sandbox --disable-gpu about:blank &
           for i in $(seq 1 30); do
