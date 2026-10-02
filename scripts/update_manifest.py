@@ -91,17 +91,24 @@ def _tracked_files(root: Path) -> tuple[list[str], bool]:
     except (OSError, subprocess.CalledProcessError):
         files = []
     if files:
-        # .gitignore keeps the signature out of the normal enumeration, but a
-        # force-added MANIFEST.sig would ship tracked yet uncovered — fail
-        # closed rather than silently dropping it from the file set.
-        tracked_sig = subprocess.run(
+        # Only a *tracked* signature is the fail-closed condition — an
+        # untracked MANIFEST.sig beside the manifest is the normal signed
+        # state and stays excluded. ``--error-unmatch`` reports tracked
+        # status regardless of .gitignore; an inconclusive check aborts
+        # rather than passing on unknown state.
+        sig = subprocess.run(
             ["git", "ls-files", "--error-unmatch", "--", SIG_FILE],
-            cwd=root, capture_output=True,
+            cwd=root, capture_output=True, text=True,
         )
-        if tracked_sig.returncode == 0:
+        if sig.returncode == 0:
             raise SystemExit(
                 f"{SIG_FILE} is tracked by git — it must never enter the "
                 "release set it authenticates (git rm --cached it)"
+            )
+        if "did not match" not in sig.stderr:
+            raise SystemExit(
+                f"cannot verify {SIG_FILE} is untracked: "
+                f"{sig.stderr.strip() or 'git ls-files failed'}"
             )
         return sorted(name for name in files if name not in _EXCLUDED), True
     manifest = root / MANIFEST
