@@ -35,6 +35,9 @@ jobs:
       # evidence. Browser-free, so the whole OS×Python matrix exercises them.
       - run: uv run python scripts/fuzz_check.py --cases 20000
       - run: uv run python scripts/crash_check.py --iterations 3 --writers 2
+      # §61: key-compromise/rotation drill — sub-second, browser-free, so the
+      # new-epoch semantics gate every push on every matrix leg.
+      - run: uv run python scripts/keydrill_check.py
       - run: node --check jev_ultrafast/snapshot.js
       - run: node --check jev_ultrafast/static/app.js
       - run: uv build
