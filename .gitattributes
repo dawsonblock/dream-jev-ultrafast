@@ -1,0 +1,5 @@
+# Line endings are content: MANIFEST.sha256 hashes file bytes, so a CRLF
+# checkout (the Windows default under core.autocrlf) would make every tracked
+# file hash differently and fail the integrity manifest. Pin LF for text
+# files on every platform; binary blobs are untouched by text=auto.
+* text=auto eol=lf

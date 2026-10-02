@@ -1,9 +1,13 @@
 """Staged qualification pipeline (qualification §64).
 
-Runs the qualification gates in layer order and emits a ``jev-qualify/1``
-report — the single artifact a release decision reads.
+Runs the qualification gates in layer order and emits a ``jev-qualify/2``
+report — the single artifact a release decision reads. ``--sign``/``JEV_QUALIFY_SIGNING_KEY``
+binds it to a release authority (``jev-qualify-sig/1``); ``--verify-report``
+checks a signed report fail-closed under pinned keys.
 
     uv run python scripts/qualify.py [--full] [--out report.json]
+        [--report-md VALIDATION.generated.md] [--sign SEED_HEX]
+    uv run python scripts/qualify.py --verify-report report.json --key PUB_HEX
 
 Layers:
     Q0  static integrity      manifest, compile, ruff, JS syntax, lock, build,
@@ -33,6 +37,17 @@ import time
 import urllib.request
 from pathlib import Path
 
+# Report signing/verification is deliberately self-contained: it uses the
+# cryptography package directly and never imports jev_ultrafast, so
+# --verify-report on an untrusted artifact cannot execute package code from
+# the tree being qualified.
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
 ROOT = Path(__file__).resolve().parent.parent
 PY = [sys.executable]
 _TALLY = re.compile(r"(\d+)\s+(passed|failed|skipped|deselected|xpassed|xfailed)")
@@ -49,25 +64,19 @@ def _report_digest(report: dict) -> str:
 
 
 def _sign_report(report: dict, seed_hex: str) -> dict:
-    sys.path.insert(0, str(ROOT))
-    from jev_ultrafast.signing import EvidenceSigner
-
-    signer = EvidenceSigner.from_hex(seed_hex.strip())
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed_hex.strip()))
     digest = _report_digest(report)
     report["signature"] = {
         "schema": REPORT_SIG_SCHEMA,
         "kind": "qualification_report_signature",
         "report_digest": digest,
-        "key_id": signer.key_id,
-        "signature": signer.sign_hex(digest, domain=REPORT_SIG_DOMAIN),
+        "key_id": key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex(),
+        "signature": key.sign(REPORT_SIG_DOMAIN + digest.encode("ascii")).hex(),
     }
     return report
 
 
 def _verify_report(path: Path, keys: set[str]) -> int:
-    sys.path.insert(0, str(ROOT))
-    from jev_ultrafast.signing import verify_signature
-
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -86,8 +95,14 @@ def _verify_report(path: Path, keys: set[str]) -> int:
     if sig.get("key_id") not in keys:
         print("report signed by an unexpected key", file=sys.stderr)
         return 1
-    if not verify_signature(sig["key_id"], digest, str(sig.get("signature")),
-                            domain=REPORT_SIG_DOMAIN):
+    try:
+        Ed25519PublicKey.from_public_bytes(
+            bytes.fromhex(sig["key_id"])
+        ).verify(
+            bytes.fromhex(str(sig.get("signature"))),
+            REPORT_SIG_DOMAIN + digest.encode("ascii"),
+        )
+    except (InvalidSignature, ValueError):
         print("report signature verification failure", file=sys.stderr)
         return 1
     print(f"report verified under key {str(sig['key_id'])[:16]}…")
@@ -115,6 +130,51 @@ def _run(cmd: list[str], timeout: int = 1800) -> dict:
     except subprocess.TimeoutExpired:
         return {"cmd": " ".join(cmd), "status": "failed", "exit": "timeout",
                 "seconds": timeout, "tail": []}
+
+
+def _double_build() -> dict:
+    """Reproducibility: two consecutive ``uv build`` runs must produce
+    byte-identical artifacts. Implemented in-process rather than shelling to
+    ``sha256sum``/``shasum`` so the gate runs identically on macOS, Linux,
+    and Windows checkouts."""
+    t0 = time.monotonic()
+
+    def build_once() -> dict | None:
+        shutil.rmtree(ROOT / "dist", ignore_errors=True)
+        try:
+            proc = subprocess.run(["uv", "build", "-q"], cwd=ROOT,
+                                  capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0:
+            return None
+        dist = ROOT / "dist"
+        try:
+            return {
+                p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted(dist.iterdir()) if p.is_file()
+            }
+        except OSError:
+            return None
+
+    first = build_once()
+    if first is None:
+        return {"cmd": "uv build ×2 compare", "status": "failed", "exit": 1,
+                "seconds": round(time.monotonic() - t0, 1),
+                "tail": ["first uv build failed"]}
+    second = build_once()
+    if second is None:
+        return {"cmd": "uv build ×2 compare", "status": "failed", "exit": 1,
+                "seconds": round(time.monotonic() - t0, 1),
+                "tail": ["second uv build failed"]}
+    diff = sorted(k for k in set(first) | set(second)
+                  if first.get(k) != second.get(k))
+    return {"cmd": "uv build ×2 compare",
+            "status": "passed" if not diff else "failed",
+            "exit": 0 if not diff else 1,
+            "seconds": round(time.monotonic() - t0, 1),
+            "tail": [f"{len(first)} artifacts byte-identical" if not diff
+                     else f"nondeterministic artifacts: {diff}"]}
 
 
 def _env_digest() -> dict:
@@ -149,6 +209,10 @@ def _manifest_provenance() -> dict:
             block["signature_key_id"] = sig_block.get("key_id")
             if not os.environ.get("JEV_MANIFEST_VERIFY_KEYS", "").strip():
                 block["signature_verified"] = "skipped — no pinned verify keys"
+            else:
+                # The Q0 gate runs sign_manifest --verify under the pinned
+                # keys; the stage's own check record is the verdict.
+                block["signature_verified"] = "delegated to Q0 gate"
         except (OSError, json.JSONDecodeError):
             block["signature_verified"] = "unreadable"
     return block
@@ -209,22 +273,34 @@ def _write_markdown(report: dict, path: Path) -> None:
     ]
     for s in report["stages"]:
         tally = s.get("test_tally") or {}
+        checks = s.get("checks", ())
+        ran = sum(1 for c in checks if c.get("status") != "skipped")
+        skipped = sum(1 for c in checks if c.get("status") == "skipped")
+        checks_note = (
+            f"{ran} check{'s' if ran != 1 else ''} ran"
+            + (f", {skipped} skipped" if skipped else "")
+        )
         detail = " ".join(f"{v} {k}" for k, v in sorted(tally.items()))
-        lines.append(f"| {s['stage']} | {s['status']} | {detail or s['description']} |")
+        lines.append(
+            f"| {s['stage']} | {s['status']} | {checks_note} — {detail or s['description']} |"
+        )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _stage(name: str, description: str, checks: list[dict]) -> dict:
     results = []
     for check in checks:
+        display = check["cmd"] if isinstance(check["cmd"], str) else " ".join(check["cmd"])
         if check.get("skip"):
-            results.append({"cmd": check["cmd"], "status": "skipped",
+            results.append({"cmd": display, "status": "skipped",
                             "reason": check["skip"]})
-            print(f"    skip   {' '.join(check['cmd'])[:72]} "
-                  f"({check['skip']})", flush=True)
+            print(f"    skip   {display[:72]} ({check['skip']})", flush=True)
             continue
-        print(f"    run    {' '.join(check['cmd'])[:72]}", flush=True)
-        results.append(_run(check["cmd"], check.get("timeout", 1800)))
+        print(f"    run    {display[:72]}", flush=True)
+        if "fn" in check:
+            results.append(check["fn"]())
+        else:
+            results.append(_run(check["cmd"], check.get("timeout", 1800)))
         print(f"    {results[-1]['status']:6} ({results[-1]['seconds']}s)",
               flush=True)
     status = ("failed" if any(r["status"] == "failed" for r in results)
@@ -297,9 +373,8 @@ def main() -> int:
         {"cmd": ["uv", "lock", "--check"]},
         {"cmd": ["uv", "build", "-q"]},
         # Reproducibility: two consecutive builds must be byte-identical.
-        {"cmd": ["sh", "-c",
-                 "rm -rf dist && uv build -q && sha256sum dist/* > /tmp/jev-b1.sha && "
-                 "rm -rf dist && uv build -q && sha256sum -c /tmp/jev-b1.sha"]},
+        # In-process so the gate needs no coreutils/BSD shasum on the host.
+        {"cmd": "uv build ×2 compare", "fn": _double_build},
     ]
     stages.append(_stage("Q0-static", "manifest, compile, lint, syntax, lock, "
                          "build, reproducibility", q0))

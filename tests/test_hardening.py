@@ -634,6 +634,7 @@ class El {
     this.value = this.attrs.value || '';
     this.name = this.attrs.name || '';
     this.id = this.attrs.id || '';
+    this.target = this.attrs.target || '';
     this.labels = [];
     this.childNodes = [];
     this.isConnected = true;
@@ -668,7 +669,11 @@ class El {
 }
 
 const els = spec.map(s => {
-  const e = new El(s.tag, {type: s.type, 'aria-label': s.label});
+  const e = new El(s.tag, {
+    type: s.type, 'aria-label': s.label, autocomplete: s.autocomplete,
+    name: s.name, id: s.id, href: s.href, target: s.target, role: s.role,
+    ...(s.download ? {download: s.download} : {}),
+  });
   if (s.tag === 'select') {
     e.options = [];
     for (let i = 0; i < s.options; i++) {
@@ -678,6 +683,17 @@ const els = spec.map(s => {
     e.selectedOptions = e.options.filter(o => o.selected);
     e.selectedIndex = 0;
     e.multiple = false;
+  }
+  // Optional form association: enough DOM truth for ctxOf to compute submit
+  // semantics, form method/origin, and the scoped sensitive-field inventory.
+  if (s.form) {
+    const form = new El('form', {method: s.form_method || 'post',
+      action: s.form_action || null, role: s.form_role || null});
+    const markers = s.scope_markers || [];
+    form.querySelector = sel => markers.some(m => sel.includes(m)) ? form : null;
+    e.form = form;
+    e.closest = sel =>
+      sel.split(',').map(x => x.trim()).includes('form') ? form : null;
   }
   return e;
 });
@@ -764,3 +780,102 @@ def test_catalogue_stays_complete_below_the_cap(tmp_path):
     assert ("click", "Go") in kinds
     # Both non-selected options are represented before the catalogue ends.
     assert [a["option_index"] for a in actions if a["kind"] == "select"] == [1, 2]
+
+
+def _node_guard(page):
+    """The recorded execution guard for the page's first action."""
+    return page["guards"][str(page["actions"][0]["node"])]
+
+
+def test_execution_guard_binds_authority_context(tmp_path):
+    """classify_effect() reads ctxOf() — form membership, submit semantics,
+    field class, scoped sensitive inventory, messaging/external/download —
+    and the pre-mutation guard must change when any of it does. Otherwise a
+    page could flip authority-relevant attributes between the policy
+    decision and dispatch, and the same authorized action would execute
+    under a weaker classification than its real semantics."""
+    def guard(spec):
+        return _node_guard(_run_snapshot_js(spec, tmp_path))
+
+    # Identity invariance: the same DOM produces the same guard.
+    text = guard([{"tag": "input", "type": "text", "label": "Note"}])
+    assert guard([{"tag": "input", "type": "text", "label": "Note"}]) == text
+
+    # Target field class: text -> email / otp / money all change authority.
+    email = guard([{"tag": "input", "type": "email", "label": "Note"}])
+    otp = guard([{"tag": "input", "type": "text", "label": "Note",
+                  "autocomplete": "one-time-code"}])
+    money = guard([{"tag": "input", "type": "text", "label": "Note",
+                    "name": "card_number"}])
+    assert len({json.dumps(g, sort_keys=True) for g in (text, email, otp, money)}) == 4
+
+    # Submit semantics: the auditor's exact bypass — a form button whose
+    # type flips from button to submit must not keep the old guard.
+    benign = guard([{"tag": "button", "type": "button", "label": "Continue", "form": True}])
+    submit = guard([{"tag": "button", "type": "submit", "label": "Continue", "form": True}])
+    assert benign != submit
+
+    # Form method and destination origin are authority context too.
+    get_form = guard([{"tag": "button", "type": "submit", "label": "Continue",
+                       "form": True, "form_method": "get"}])
+    cross = guard([{"tag": "button", "type": "submit", "label": "Continue",
+                    "form": True, "form_action": "https://evil.example/"}])
+    assert benign != get_form and benign != cross
+
+    # A sensitive sibling field appearing in the scope is context.
+    with_pw = guard([{"tag": "button", "type": "submit", "label": "Continue",
+                      "form": True, "scope_markers": ["password"]}])
+    assert with_pw != benign
+
+    # Messaging / external / download destinations.
+    link = guard([{"tag": "a", "href": "https://t.test/docs", "label": "Open"}])
+    mailto = guard([{"tag": "a", "href": "mailto:a@example.com", "label": "Open"}])
+    blank = guard([{"tag": "a", "href": "https://t.test/docs", "label": "Open",
+                    "target": "_blank"}])
+    download = guard([{"tag": "a", "href": "https://t.test/f", "label": "Open",
+                       "download": "f"}])
+    assert len({json.dumps(g, sort_keys=True) for g in (link, mailto, blank, download)}) == 4
+
+
+def test_sanitize_url_strips_userinfo_and_path_secrets(monkeypatch):
+    """A credential in URL userinfo or a token in the path must not cross
+    the model boundary while the run claims redaction."""
+    monkeypatch.setenv("JEV_MODEL_PRIVACY", "basic")
+    out = sanitize_url("https://alice:secret@example.test/home")
+    assert "alice" not in out and "secret" not in out
+    assert "example.test/home" in out
+    # Secret-shaped and email-shaped path segments.
+    assert "sk-abcdefghijklmnop1234" not in sanitize_url(
+        "https://example.test/reset/sk-abcdefghijklmnop1234")
+    assert "alice@example.com" not in sanitize_url(
+        "https://example.test/users/alice@example.com")
+    # A bare opaque token segment (no keyword prefix, mixed letters+digits).
+    assert "a1b2c3d4e5f6a1b2c3d4e5f6" not in sanitize_url(
+        "https://example.test/session/a1b2c3d4e5f6a1b2c3d4e5f6")
+    # Ordinary slugs survive — the token mask only fires on opaque segments.
+    assert sanitize_url("https://example.test/docs/getting-started") == \
+        "https://example.test/docs/getting-started"
+    # Query-param redaction is unchanged.
+    out = sanitize_url("https://example.test/cb?token=abc12345&q=flights")
+    assert "token=%5BREDACTED%5D" in out and "q=flights" in out
+    # An encoded '?' inside a path must not re-enter the emitted URL as a
+    # real query boundary carrying unredacted key=value material.
+    out = sanitize_url("https://example.test/r%3Ftoken%3Dsupersecretvalue")
+    assert "supersecretvalue" not in out and "token=[REDACTED]" in out
+    # The same mask applies to sensitive key=value pairs written plainly in a
+    # path segment, in a fragment (OAuth-style tokens), and nested inside a
+    # query parameter's decoded value.
+    assert "hunter2" not in sanitize_url("https://example.test/cb/session=hunter2")
+    assert "hunter2" not in sanitize_url("https://app.test/w#access_token=hunter2")
+    assert "hunter2" not in sanitize_url(
+        "https://example.test/?next=/cb%3Ftoken%3Dhunter2")
+    # A decoded %2F stays inside its segment rather than becoming structure.
+    assert sanitize_url("https://example.test/s/a%2Fb").endswith("/s/a%2Fb")
+    # Pure-digit path ids are token-shaped too (a 24-digit run exceeds the
+    # card-pattern bound yet is still account-id material).
+    assert "123456789012345678901234" not in sanitize_url(
+        "https://example.test/acct/123456789012345678901234")
+    # Long ordinary slugs — alpha+hyphen, no digits — still survive.
+    assert sanitize_url(
+        "https://example.test/docs/getting-started-with-the-new-platform"
+    ).endswith("/docs/getting-started-with-the-new-platform")

@@ -14,7 +14,7 @@
     ],
     "intentional_deviation": "DREAM-Jev remains conservative trajectory-retention replay: it never predicts that the fixed decision model would choose a different browser action or invent an unseen DOM outcome."
   },
-  "trusted_computing_base": "jev-ultrafast-tcb/0.15",
+  "trusted_computing_base": "jev-ultrafast-tcb/0.16",
   "experience_schema": "jev-dream/2",
   "trial_schema": "jev-trials/7",
   "backward_read_compatibility": [
@@ -34,7 +34,8 @@
     "jev-ultrafast-tcb/0.11",
     "jev-ultrafast-tcb/0.12",
     "jev-ultrafast-tcb/0.13",
-    "jev-ultrafast-tcb/0.14"
+    "jev-ultrafast-tcb/0.14",
+    "jev-ultrafast-tcb/0.15"
   ],
   "self_improvable": [
     "candidate ranking weights",
@@ -104,7 +105,7 @@
   },
   "validation": {
     "authoritative_report": "generated per-run via scripts/qualify.py --out report.json --report-md VALIDATION.generated.md",
-    "offline_tests_passed": 435,
+    "offline_tests_passed": 446,
     "python_compileall": "passed",
     "javascript_syntax": "passed",
     "toml_json_parse": "passed",

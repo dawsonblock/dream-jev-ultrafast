@@ -27,6 +27,7 @@ DREAM-Jev invariants:
 - Preserve suspension and rollback. A drifted learned policy must be able to fall back to the baseline without changing browser authority.
 - Do not remove hash-chain verification from experience stores or policy-digest verification from the registry.
 - Effect classification is monotonic: structural floors, sensitive target fields, and label signals collect and the highest authority wins; no early return may bypass escalation.
+- The pre-mutation execution guard binds the full `ctxOf` authority context, not just element identity — every input `classify_effect` consumed at decision time must still match inside the guarded mutation turn; authority-relevant attribute changes are stale targets, never mutations under a stale classification.
 - Canary pair identity is `(task_family, instance_id)`; cross-family instance collisions are evidence corruption, not a pair.
 - When promotion verification keys are configured, active policy records must carry a valid domain-separated attestation bound to candidate/parent digests and the qualifying evidence digests; unsigned or forged authority fails closed.
 - A configured chain-head anchor must agree with the log on every read and append; a gap is resolved only by explicit `reanchor()`, never silently.

@@ -332,6 +332,63 @@ def main():
                 pass
             passed.append(f"{label} is confirmed or indeterminate, never stale")
 
+        # --- authority-context binding (TCB 0.16) ---
+        # The execution guard must cover every signal classify_effect()
+        # consumed at decision time. A page that flips only authority-
+        # relevant attributes — type, autocomplete, form association,
+        # method/action, the scoped sensitive-field inventory, href scheme,
+        # target, download — while leaving identity, label, value and
+        # visible text untouched is still a *different* action semantically,
+        # and must fail before the mutation point.
+        SEM_HTML = repr("""
+          <form method="post" action="/x"><button type="button" id="sem">Continue</button>
+          <input id="plain" aria-label="Note"><a id="lnk" href="/docs">Docs</a></form>
+        """)
+        for label, expr, selector in [
+            ("button type flips to submit",
+             "document.querySelector('#sem').type='submit'", "#sem"),
+            ("form method flips to get",
+             "document.querySelector('#sem').form.setAttribute('method','get')", "#sem"),
+            ("form action goes cross-origin",
+             "document.querySelector('#sem').form.setAttribute('action','https://evil.example/')",
+             "#sem"),
+            ("sensitive sibling appears in scope",
+             "document.querySelector('#sem').form.insertAdjacentHTML('beforeend',"
+             "'<input type=password>')", "#sem"),
+            ("field type flips to email",
+             "document.querySelector('#plain').type='email'", "#plain"),
+            ("autocomplete flips to one-time-code",
+             "document.querySelector('#plain').setAttribute('autocomplete','one-time-code')",
+             "#plain"),
+            ("href scheme flips to mailto",
+             "document.querySelector('#lnk').setAttribute('href','mailto:a@b.c')", "#lnk"),
+            ("download attribute appears",
+             "document.querySelector('#lnk').setAttribute('download','f')", "#lnk"),
+        ]:
+            browser.evaluate("document.body.innerHTML=" + SEM_HTML)
+            page = browser.observe(screenshot=False)
+            want_label = {"#sem": "Continue", "#plain": "Note", "#lnk": "Docs"}[selector]
+            action = next(a for a in page["actions"]
+                          if a["label"] == want_label)
+            browser.evaluate(expr)
+            assert not browser.fresh(page, action), label
+            passed.append("authority-context mutation invalidates: " + label)
+
+        # End-to-end on the atomic path: observe a benign form button, flip
+        # its type to submit, then dispatch — the single guarded turn
+        # re-computes the authority context and refuses before e.click().
+        browser.evaluate("document.body.innerHTML=" + SEM_HTML)
+        page = browser.observe(screenshot=False)
+        action = next(a for a in page["actions"] if a["label"] == "Continue")
+        browser.evaluate("document.querySelector('#sem').type='submit'")
+        try:
+            browser.act(action, page)
+        except StalePage:
+            pass
+        else:
+            raise AssertionError("post-decision submit flip executed under stale authority")
+        passed.append("atomic dispatch refuses a post-decision authority flip")
+
         # TOCTOU churn: the document mutates continuously between observation
         # and execution. Every attempt must either land on the element the
         # action described or refuse before mutation — a click that lands on

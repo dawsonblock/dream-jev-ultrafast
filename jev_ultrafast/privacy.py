@@ -4,17 +4,30 @@ from __future__ import annotations
 
 import os
 import re
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 _EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.I)
 _CARD = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
 _API_SECRET = re.compile(r"\b(?:sk|pk|api|token)[-_][A-Za-z0-9_-]{16,}\b", re.I)
-_SENSITIVE_QUERY = re.compile(
-    r"^(?:access_?token|refresh_?token|id_?token|token|auth(?:entication|orization)?|code|"
-    r"api_?key|apikey|access_?key|client_?secret|private_?key|secret(?:_?key)?|key|"
-    r"pass(?:word|wd)|pwd|session(?:_?id)?|sig(?:nature)?|jwt|bearer|csrf|xsrf|otp|totp|ssn)$",
-    re.I,
+# Opaque bearer-shaped material that appears without a keyword prefix: JWTs
+# and long mixed-character path segments (reset tokens, session ids, hashes).
+_JWT = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+# A whole path segment that is one opaque token: 24+ mixed alphanumeric
+# characters (hex/base32/base64url material — real slugs stay readable) or a
+# pure 16+ digit run, which is card/account-id shaped, never prose.
+_PATH_TOKEN = re.compile(
+    r"(?:(?=.*\d)(?=.*[a-z])[a-z0-9_\-]{24,}|\d{16,})", re.I
 )
+_SENSITIVE_KEYS = (
+    r"access_?token|refresh_?token|id_?token|token|auth(?:entication|orization)?|code|"
+    r"api_?key|apikey|access_?key|client_?secret|private_?key|secret(?:_?key)?|key|"
+    r"pass(?:word|wd)|pwd|session(?:_?id)?|sig(?:nature)?|jwt|bearer|csrf|xsrf|otp|totp|ssn"
+)
+_SENSITIVE_QUERY = re.compile(rf"^(?:{_SENSITIVE_KEYS})$", re.I)
+# key=value material wherever it appears — decoded path segments, fragments,
+# and nested-URL query values can all carry credential pairs that never went
+# through the top-level query-parameter redaction.
+_SENSITIVE_KV = re.compile(rf"\b(?:{_SENSITIVE_KEYS})=[^&#\s;]*", re.I)
 _SENSITIVE_LABEL = re.compile(
     r"\b(password|passcode|secret|api key|access token|credit card|card number|cvv|cvc|"
     r"social security|\bsin\b|routing number|bank account|account number)\b",
@@ -75,6 +88,18 @@ def routing_level():
         raise ValueError(
             f"JEV_MODEL_ROUTING must be one of {', '.join(ROUTING_LEVELS)}"
         )
+    if level == "sanitized" and _mode() in {"off", "none", "0", "false"}:
+        # The two flags must not compose into raw remote transmission:
+        # "sanitized" is the promise that outbound text passed the redaction
+        # pass, and privacy=off disables that pass while remote endpoints
+        # remain reachable. Declare the intent instead — 'public' sends
+        # verbatim, 'local-only' never leaves the machine.
+        raise ValueError(
+            "JEV_MODEL_ROUTING=sanitized cannot combine with "
+            "JEV_MODEL_PRIVACY=off — sanitized means outbound text was "
+            "redacted. Set JEV_MODEL_ROUTING=public to send raw text "
+            "explicitly, or local-only to keep the run on-machine."
+        )
     return level
 
 
@@ -129,8 +154,34 @@ def redact_text(value, limit=6000):
     text = _EMAIL.sub("[REDACTED_EMAIL]", text)
     text = _CARD.sub("[REDACTED_NUMBER]", text)
     text = _API_SECRET.sub("[REDACTED_SECRET]", text)
+    text = _JWT.sub("[REDACTED_SECRET]", text)
     return text
 
+
+def _mask_sensitive_kv(match):
+    """``token=abc`` → ``token=[REDACTED]`` — keep the key name, drop the value."""
+    return match.group(0).split("=", 1)[0] + "=[REDACTED]"
+
+
+def _path_segment(segment):
+    """Sanitize one raw URL path segment.
+
+    Secrets hide behind percent-escapes, so decode before the redaction pass —
+    then re-encode the structural characters decoding could introduce: an
+    escaped ``?``/``#``/``/`` must not re-enter the emitted URL as real
+    structure (a decoded ``?`` would otherwise carry ``key=value`` material
+    that never passed the sensitive-parameter mask)."""
+    decoded = _SENSITIVE_KV.sub(
+        _mask_sensitive_kv, redact_text(unquote(segment), 512)
+    )
+    if _PATH_TOKEN.fullmatch(decoded):
+        return "[REDACTED]"
+    return (
+        decoded.replace("%", "%25")
+        .replace("?", "%3F")
+        .replace("#", "%23")
+        .replace("/", "%2F")
+    )
 
 
 def sanitize_url(value, limit=4096):
@@ -139,12 +190,23 @@ def sanitize_url(value, limit=4096):
         return raw
     try:
         parts = urlsplit(raw)
+        # URL userinfo carries verbatim credentials (http://user:pass@host) —
+        # never forward it to a model endpoint.
+        netloc = parts.netloc.rsplit("@", 1)[-1]
+        # Paths carry reset/session tokens, emails, and account ids. Segments
+        # are decoded and redacted individually so a decoded %2F cannot
+        # smuggle a token past a segment boundary.
+        path = "/".join(_path_segment(segment) for segment in parts.path.split("/"))
         query = urlencode([
-            (key, "[REDACTED]" if _SENSITIVE_QUERY.match(key) else redact_text(val, 512))
+            (key, "[REDACTED]" if _SENSITIVE_QUERY.match(key)
+             else _SENSITIVE_KV.sub(_mask_sensitive_kv, redact_text(val, 512)))
             for key, val in parse_qsl(parts.query, keep_blank_values=True)
         ], doseq=True)
-        fragment = redact_text(parts.fragment, 512)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, fragment))[:limit]
+        # Fragments carry OAuth-style key=value tokens (#access_token=…).
+        fragment = _SENSITIVE_KV.sub(
+            _mask_sensitive_kv, redact_text(unquote(parts.fragment), 512)
+        )
+        return urlunsplit((parts.scheme, netloc, path, query, fragment))[:limit]
     except ValueError:
         return redact_text(raw, limit)
 

@@ -28,7 +28,7 @@ Give it one goal. Every observation produces an indexed table of the page's actu
 [Watch the MP4](docs/demo.mp4) · [Measurements](docs/performance.md) · [Read the loop](jev_ultrafast/agent.py)
 
 > [!NOTE]
-> **v0.9.x makes the learning layer statistically honest.** Randomized in-browser trials are analyzed intention-to-treat with structured censoring; effects are called `beneficial`/`harmful` only when an *α-spent approximate* interval clears a practical threshold — "we observed it" and "we established it" are different claims. Experiment plans are digested, signed, and stale-proof. See the [changelog](CHANGELOG.md) and [VALIDATION.md](VALIDATION.md) for the full history.
+> **v0.9.x makes the learning layer statistically honest.** Randomized in-browser trials are analyzed intention-to-treat with structured censoring; effects are called `beneficial`/`harmful` only when an *anytime-valid confidence sequence* clears a practical threshold *and* conservative censoring bounds agree — "we observed it" and "we established it" are different claims. Experiment plans are digested, signed, and stale-proof. See the [changelog](CHANGELOG.md) and [VALIDATION.md](VALIDATION.md) for the full history.
 
 ## How it works
 
@@ -75,6 +75,8 @@ Every executed target is resolved from an observed node owned by a named CDP **i
 
 Before any mutation, a deterministic **effect classifier** maps the candidate to a semantic class (`NAVIGATE`, `FORM_EDIT`, `SUBMISSION`, `PURCHASE`, `DISCLOSURE`, `AUTHENTICATE`, `UNKNOWN_COMMIT`, …) from bounded structural context — form membership, submit semantics, scoped field inventory, the target's own field class, modal scope, outbound destination, label signals. Classification is monotonic: every signal can only escalate, so a credit-card `fill` or a "Share publicly" switch can never short-circuit to `FORM_EDIT`. High-authority effects pause in `approval_required`; a commit-shaped control whose effect cannot be determined is itself an `UNKNOWN_COMMIT`. `act()` accepts no caller-asserted approval — only `approve()` issues a one-shot grant bound to the pending action, its *generated payload digest*, and the page fingerprint.
 
+That classification context is also *bound into the execution transaction*: the pre-mutation guard embeds the same derived signals the classifier consumed, so a page that flips `type`, `autocomplete`, form association/method/action, sibling field inventory, `href` scheme, `target`, or `download` between decision and dispatch is a stale target — not a mutation executing under a stale authorization.
+
 ## Quick start
 
 ```bash
@@ -115,9 +117,9 @@ The shim binds `127.0.0.1` and applies the demo server's request hardening (Host
 
 </details>
 
-`JEV_MODEL_PRIVACY=basic` (the default) bounds serialized strings and redacts incidental emails, card-like numbers, API-secret patterns, credential query parameters, and sensitive field values before observations reach a model. A useful reduction layer — not a complete DLP system.
+`JEV_MODEL_PRIVACY=basic` (the default) bounds serialized strings and redacts incidental emails, card-like numbers, API-secret patterns, JWTs, credential `key=value` parameters in URL queries, paths, and fragments, URL userinfo, token-shaped URL path segments, and sensitive field values before observations reach a model. A useful reduction layer — not a complete DLP system.
 
-`JEV_MODEL_ROUTING` binds the run's model traffic to a security level before any inference starts: `local-only` refuses every non-loopback model endpoint outright (the goal and page never leave the machine), `sanitized` (the default) allows remote endpoints but sends the task goal through the same redaction pass as page content, and `public` declares the task non-sensitive and sends the goal verbatim. Regex redaction is a floor, not a guarantee — declare `local-only` for runs whose objective contains secrets. Every non-loopback endpoint also requires `https` — plaintext remote HTTP would carry the API key and model context in cleartext (`JEV_ALLOW_INSECURE_TRANSPORT=1` exists only for local development).
+`JEV_MODEL_ROUTING` binds the run's model traffic to a security level before any inference starts: `local-only` refuses every non-loopback model endpoint outright (the goal and page never leave the machine), `sanitized` (the default) allows remote endpoints but sends the task goal through the same redaction pass as page content, and `public` declares the task non-sensitive and sends the goal verbatim. The levels are security invariants: `sanitized` cannot be combined with `JEV_MODEL_PRIVACY=off` — the pair fails closed rather than silently downgrading to raw transmission (use `public` to declare that intent). Regex redaction is a floor, not a guarantee — declare `local-only` for runs whose objective contains secrets. Every non-loopback endpoint also requires `https` — plaintext remote HTTP would carry the API key and model context in cleartext (`JEV_ALLOW_INSECURE_TRANSPORT=1` exists only for local development).
 
 `JEV_INPUT_GUARANTEE=trusted` (or `Agent(input_guarantee="trusted")`) routes clicks/fills through the real-CDP-input path for sites that ignore synthetic `isTrusted=false` events. It is a declaration, not a fallback: a silent no-op synthetic click cannot be distinguished from one that landed, so the system escalates automatically only when the atomic path provably did not mutate.
 
@@ -198,7 +200,7 @@ uv run jev-dream improve .jev/experience.jsonl \
 - **`--cost-model`** fits a linear `CostModel` of tokens/latency against offered-candidate count — it only re-orders which *passing* candidate gets staged.
 - **`--outcome-model`** fits a bucketed, Beta-smoothed `P(page_changed)` prior per `(kind, overlap, offered-rank)` cell.
 - **`--choice-model`** fits an uncertainty-aware counterfactual prior labeled by each run's *verified terminal outcome* — page churn inside failed runs teaches it nothing — with posterior stddev and explicit abstention on sparse cells.
-- **`CounterfactualTrials` + `TrialChoiceModel`** (always fitted) consume only randomized `experiment_assigned` evidence: intention-to-treat arms, structured censoring with an imbalance gate, α-spent approximate effect intervals over a practical threshold, and hierarchical `family+site → site → family → pooled` resolution against a bounded treatment signature (`kind` and effect class are floors — click evidence never answers a fill proposal, and `PURCHASE` evidence never answers a `SEARCH`/`DELETE` divergence).
+- **`CounterfactualTrials` + `TrialChoiceModel`** (always fitted) consume only randomized `experiment_assigned` evidence: intention-to-treat arms, structured censoring with an imbalance gate plus Manski worst/best-case bounds, an anytime-valid confidence sequence over a practical threshold (Bonferroni-split across the tracked hypothesis family), and hierarchical `family+site → site → family → pooled` resolution against a bounded treatment signature (`kind` and effect class are floors — click evidence never answers a fill proposal, and `PURCHASE` evidence never answers a `SEARCH`/`DELETE` divergence).
 - **`ExperimentScheduler`** ranks which unresolved hypothesis is worth the next real run; **`CausalChoicePolicy`** exposes `shadow` → `canary` → `active` modes under operator control, tagging every entry `observational` / `randomized` / `pooled_randomized`.
 
 Learned models annotate and prioritize only. A counterfactual proposal is a hypothesis — never an outcome, never evidence, never a gate input. Anything a model prefers must still qualify through real executions and bound live canaries.
@@ -259,7 +261,7 @@ A `DONE` choice is `claimed_done` unless a caller-supplied verifier passes. The 
 
 ```bash
 uv run ruff check .
-uv run pytest                                   # 437 tests, offline
+uv run pytest                                   # 446 tests, offline
 node --check jev_ultrafast/static/app.js
 node --check jev_ultrafast/snapshot.js
 uv build

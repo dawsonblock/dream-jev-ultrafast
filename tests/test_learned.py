@@ -1,5 +1,6 @@
 import hashlib
 import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -1870,6 +1871,188 @@ def test_update_manifest_script_regenerates_and_verifies(tmp_path):
     ok2 = subprocess.run([sys.executable, str(patched), "--check"],
                          capture_output=True, text=True)
     assert ok2.returncode == 0
+
+
+def test_manifest_sig_never_enters_the_manifest(tmp_path):
+    """MANIFEST.sig attests to the manifest's own digest — it cannot be a
+    member of the set it authenticates. In a git worktree the release
+    signature exists as an untracked file; the manifest must exclude it from
+    enumeration or a signed tree would fail --check (and re-hashing it would
+    make every signature self-invalidating)."""
+    import subprocess
+    import sys
+
+    if not shutil.which("git"):
+        pytest.skip("git required for the worktree file-set enumeration")
+    tree = tmp_path / "repo"
+    tree.mkdir()
+    (tree / "a.txt").write_text("alpha")
+    (tree / "MANIFEST.sig").write_text('{"schema": "jev-manifest-sig/1"}')
+    script = Path(__file__).resolve().parent.parent / "scripts" / "update_manifest.py"
+    patched = tmp_path / "update_manifest.py"
+    patched.write_text(script.read_text().replace(
+        'ROOT = Path(__file__).resolve().parent.parent',
+        f'ROOT = Path({str(tree)!r})',
+    ))
+    subprocess.run(["git", "init", "-q"], cwd=tree, check=True)
+    subprocess.run(["git", "add", "a.txt"], cwd=tree, check=True)
+    regen = subprocess.run([sys.executable, str(patched)],
+                           capture_output=True, text=True)
+    assert regen.returncode == 0, regen.stderr
+    manifest = (tree / "MANIFEST.sha256").read_text()
+    assert "a.txt" in manifest
+    assert "MANIFEST.sig" not in manifest
+    ok = subprocess.run([sys.executable, str(patched), "--check"], cwd=tree,
+                        capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stderr
+
+
+def test_tracked_manifest_sig_fails_closed(tmp_path):
+    """.gitignore keeps MANIFEST.sig out of the normal enumeration, but a
+    force-added signature would ship tracked yet uncovered — the file set
+    it authenticates must reject tracking it, not rely on ignore hygiene."""
+    import subprocess
+    import sys
+
+    if not shutil.which("git"):
+        pytest.skip("git required for the worktree file-set enumeration")
+    tree = tmp_path / "repo"
+    tree.mkdir()
+    (tree / "a.txt").write_text("alpha")
+    (tree / "MANIFEST.sig").write_text('{"schema": "jev-manifest-sig/1"}')
+    script = Path(__file__).resolve().parent.parent / "scripts" / "update_manifest.py"
+    patched = tmp_path / "update_manifest.py"
+    patched.write_text(script.read_text().replace(
+        'ROOT = Path(__file__).resolve().parent.parent',
+        f'ROOT = Path({str(tree)!r})',
+    ))
+    subprocess.run(["git", "init", "-q"], cwd=tree, check=True)
+    subprocess.run(["git", "add", "a.txt"], cwd=tree, check=True)
+    subprocess.run(["git", "add", "-f", "MANIFEST.sig"], cwd=tree, check=True)
+    bad = subprocess.run([sys.executable, str(patched)],
+                         capture_output=True, text=True)
+    assert bad.returncode != 0
+    assert "MANIFEST.sig" in bad.stderr
+
+
+def test_packaged_manifest_check_rejects_unlisted_files(tmp_path):
+    """In a packaged tree (no .git) the manifest's own list is the expected
+    set — digest equality alone cannot detect a file added after unpacking.
+    --check must enumerate what is actually present and fail on extras, or
+    a signed manifest would vouch for a release it does not fully describe."""
+    import subprocess
+    import sys
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "a.txt").write_text("alpha")
+    (tree / "MANIFEST.sha256").write_text(
+        f"{hashlib.sha256(b'alpha').hexdigest()}  a.txt\n"
+    )
+    script = Path(__file__).resolve().parent.parent / "scripts" / "update_manifest.py"
+    patched = tmp_path / "update_manifest.py"
+    patched.write_text(script.read_text().replace(
+        'ROOT = Path(__file__).resolve().parent.parent',
+        f'ROOT = Path({str(tree)!r})',
+    ))
+    ok = subprocess.run([sys.executable, str(patched), "--check"],
+                        capture_output=True, text=True)
+    assert ok.returncode == 0, ok.stderr
+    # An extra file the manifest does not list fails closed.
+    (tree / "injected.py").write_text("x = 1\n")
+    bad = subprocess.run([sys.executable, str(patched), "--check"],
+                         capture_output=True, text=True)
+    assert bad.returncode == 1
+    assert "injected.py" in bad.stderr
+    # Runtime detritus is ignored — the exception set is narrow and matches
+    # .gitignore, not an arbitrary backdoor.
+    (tree / "injected.py").unlink()
+    (tree / "__pycache__").mkdir()
+    (tree / "__pycache__" / "a.pyc").write_bytes(b"\x00")
+    ok2 = subprocess.run([sys.executable, str(patched), "--check"],
+                         capture_output=True, text=True)
+    assert ok2.returncode == 0, ok2.stderr
+
+
+def test_verification_scripts_never_import_the_artifact(tmp_path):
+    """The artifact under verification must not supply — or execute — the
+    code that verifies it. sign_manifest --verify and qualify
+    --verify-report run in a fresh interpreter that must finish without
+    jev_ultrafast ever entering sys.modules."""
+    import subprocess
+    import sys
+    import textwrap
+
+    scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+    probe = textwrap.dedent(f"""
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        spec = importlib.util.spec_from_file_location(
+            "sm", {str(scripts_dir / 'sign_manifest.py')!r})
+        sm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sm)
+        sm._verify(Path({str(tmp_path)!r}), set())  # unsigned tree → exits 1
+
+        spec = importlib.util.spec_from_file_location(
+            "qu", {str(scripts_dir / 'qualify.py')!r})
+        qu = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(qu)
+        qu._verify_report(Path({str(tmp_path / 'none.json')!r}), {{}})
+
+        print("CLEAN" if "jev_ultrafast" not in sys.modules else "LOADED")
+    """)
+    out = subprocess.run([sys.executable, "-c", probe],
+                         capture_output=True, text=True)
+    assert "CLEAN" in out.stdout, out.stderr
+
+
+def _load_qualify_module():
+    """Import scripts/qualify.py as a module (scripts aren't a package)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "jev_qualify",
+        Path(__file__).resolve().parent.parent / "scripts" / "qualify.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_qualify_report_signing_round_trip(tmp_path):
+    """A signed jev-qualify/2 report verifies under its key, and fails closed
+    on a tampered body or an unexpected key — the artifact a release decision
+    reads must not be detachable from its signature."""
+    qualify = _load_qualify_module()
+    signer = EvidenceSigner.from_hex("11" * 32)
+    other = EvidenceSigner.from_hex("22" * 32)
+    report = {
+        "schema": "jev-qualify/2",
+        "mode": "bounded",
+        "overall": "passed",
+        "stages": [{"stage": "Q0", "status": "passed", "checks": []}],
+    }
+    qualify._sign_report(report, "11" * 32)
+    assert report["signature"]["schema"] == "jev-qualify-sig/1"
+    assert report["signature"]["key_id"] == signer.key_id
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report))
+    assert qualify._verify_report(path, {signer.key_id}) == 0
+    # Tampered body fails closed — digest no longer covers the file.
+    tampered = dict(report)
+    tampered["overall"] = "failed"
+    tampered_path = tmp_path / "tampered.json"
+    tampered_path.write_text(json.dumps(tampered))
+    assert qualify._verify_report(tampered_path, {signer.key_id}) == 1
+    # Right signature shape, wrong pinned key — fails closed.
+    assert qualify._verify_report(path, {other.key_id}) == 1
+    # Unsigned report under pinned keys — fails closed.
+    unsigned = tmp_path / "unsigned.json"
+    unsigned.write_text(json.dumps({k: v for k, v in report.items()
+                                    if k != "signature"}))
+    assert qualify._verify_report(unsigned, {signer.key_id}) == 1
 
 
 def test_assignment_propensity_distribution_is_correct():

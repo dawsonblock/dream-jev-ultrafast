@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import inspect
 import json
@@ -293,7 +294,9 @@ class Agent:
             for element, node in zip(elements, ordered_nodes, strict=True)
         ]
         return {
-            **{k: v for k, v in self.state.items() if k != "browser"},
+            # Deep copy: a snapshot consumer must not hold references into
+            # live agent state (page, history, decisions, pending approval).
+            **copy.deepcopy({k: v for k, v in self.state.items() if k != "browser"}),
             "elements": elements,
             "candidate_metadata": {
                 "offered_actions": len(candidates),

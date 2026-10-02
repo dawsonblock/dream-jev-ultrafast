@@ -116,13 +116,19 @@
       download: !!(e.hasAttribute && e.hasAttribute('download')),
     };
   };
+  // The guard binds BOTH element identity and the full authority context
+  // classify_effect() consumed at decision time. Mutating authority-relevant
+  // attributes — type, autocomplete, form association/method/action, sibling
+  // field inventory, href scheme, target, download, modal scope — between
+  // observation and dispatch must change this value or the same action could
+  // execute under a weaker authority than its true semantics.
   cache.guard=e=>{
     if (!e?.isConnected || !visible(e)) return null;
     const scope=e.closest('form,dialog,[role="dialog"],article,li,tr,[role="row"]') || e.parentElement;
     return [identity(e),role(e),name(e),clip(e.value,512),e.checked??null,e.selectedIndex??null,
       e.readOnly??null,e.matches(':disabled'),e.getAttribute('aria-disabled'),
       e.getAttribute('aria-expanded'),e.getAttribute('aria-checked'),e.getAttribute('aria-selected'),
-      clip(e.getAttribute('href'),1024),clip(scope?.innerText,2000)];
+      clip(e.getAttribute('href'),1024),clip(scope?.innerText,2000),ctxOf(e)];
   };
 
   // Actions are collected per observed node, then merged round-robin across

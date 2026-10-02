@@ -4,6 +4,66 @@ Detailed release history for Jev Ultrafast. Cut releases live on the
 [GitHub releases page](https://github.com/dawsonblock/dream-jev-ultrafast/releases);
 this file documents what changed and why, in the project's own words.
 
+## v0.9.2 — adversarial-page authority binding
+
+A fourth-pass source audit found that the authority plane was weaker at the
+*mutation* boundary than at the *decision* boundary, plus provenance and
+privacy gaps in the release tooling:
+
+- **Authority context is part of the execution transaction** (TCB
+  `jev-ultrafast-tcb/0.16`). `snapshot.js` computes `ctxOf(e)` — submit
+  semantics, form method/origin, scoped sensitive-field inventory, the
+  target's own field class, messaging/external/download flags, modal scope —
+  and `classify_effect()` decides authority from exactly that context. The
+  pre-mutation guard, however, compared only identity/value/style signals,
+  so a page could flip `button.type` to `submit`, change `autocomplete` to
+  `one-time-code`, repoint a form cross-origin, or inject a password sibling
+  between the policy decision and dispatch without tripping the stale
+  guard. The guard now embeds the full `ctxOf` result, and every guarded
+  evaluation (`fresh`, atomic mutate, trusted pre-press/pre-release)
+  re-derives it inside the isolated world — a mismatch is a stale target,
+  never a mutation under a weaker classification. Evidence `0.15` remains
+  readable; 0.16 marks the executor generation where the invariant closed.
+  `scripts/check_guards.py` grows a live authority-context section: eight
+  semantic mutations (type/autocomplete/method/action/sibling-inventory/
+  href-scheme/target/download flips) must each invalidate the action's
+  guard, and the atomic dispatch path must refuse a post-decision submit
+  flip before `e.click()`.
+- **Packaged-tree `--check` rejects files the manifest does not list.**
+  `update_manifest.py` previously verified only listed files in a tree
+  without `.git` — an extra file added after unpacking passed silently. In
+  packaged mode it now enumerates the files actually present (with the same
+  narrow ignore set as `.gitignore`) and fails closed on anything unlisted,
+  so a signed manifest fully characterizes the unpacked release.
+- **Signature verification never executes the artifact.** `sign_manifest.py`
+  and `qualify.py` previously inserted the release root into `sys.path` and
+  imported `jev_ultrafast.signing` to verify — running package code from the
+  very tree under verification. Both now carry ~20 lines of self-contained
+  Ed25519 (`cryptography` only), so `--verify`/`--verify-report` cannot be
+  subverted by the artifact. A regression test runs both verifiers in a
+  fresh interpreter and asserts `jev_ultrafast` never enters `sys.modules`.
+- **URL paths and userinfo no longer carry secrets to the model.**
+  `sanitize_url()` redacted query/fragment but forwarded `parts.netloc`
+  (including `user:pass@` userinfo) and the raw path — reset tokens,
+  addresses, and opaque session identifiers in path segments could cross
+  the remote boundary under nominal redaction. Userinfo is stripped, and
+  each raw path segment is decoded, redacted, and masked when token-shaped;
+  ordinary slugs survive. Decoding is confined to the segment it came from —
+  an escaped `?`/`#`/`/` is re-encoded, never re-emitted as real URL
+  structure — and sensitive `key=value` material is masked in decoded paths,
+  fragments (`#access_token=…`), and nested-URL query values, so an encoded
+  `token=` cannot bypass the sensitive-parameter mask. JWTs are also now
+  caught by `redact_text` generally.
+- **`sanitized` routing rejects `JEV_MODEL_PRIVACY=off`.** Two separately
+  named controls could silently compose into raw remote transmission —
+  sanitized promised redaction while `off` disabled the pass. The routing
+  level now fails closed with a pointer to the honest combinations:
+  `public` for verbatim text, `local-only` to stay on-machine.
+- **`Agent.snapshot()` returns a deep copy.** The shallow spread left
+  `page`, `history`, `decisions` and other nested structures shared with
+  live agent state — an in-process consumer could mutate internals through
+  the returned dict. The snapshot is now fully detached.
+
 ## v0.9.2 — qualification correctness
 
 A third-pass audit went after scientific-method defects rather than authority
@@ -77,6 +137,18 @@ the claims being made on it. All ten recommendations implemented:
   dropped from the inspector (fully local as documented), and the read-only
   store test now skips under a privileged runner instead of failing
   spuriously.
+- **Review-pass release hardening.** A post-merge self-audit caught four
+  release-engineering defects the feature work left behind: `MANIFEST.sig`
+  (and `VALIDATION.generated.md`) are excluded from `update_manifest.py`'s
+  file set — the signature authenticates the manifest's own digest, so
+  listing it would create an unsatisfiable self-reference and a signed
+  worktree could never pass `--check`; `.gitattributes` pins LF endings so
+  a Windows CRLF checkout cannot silently invalidate every manifest hash;
+  the Q0 reproducibility gate computes the double-build in-process instead
+  of shelling to `sha256sum` (absent on stock macOS); and the loopback
+  endpoint policy is defined once in `privacy.py` rather than duplicated in
+  `model.py`. `.env.example` documents `JEV_MODEL_ROUTING`,
+  `JEV_ALLOW_INSECURE_TRANSPORT`, and `JEV_INPUT_GUARANTEE`.
 
 ## v0.9.2 — audit remediation
 

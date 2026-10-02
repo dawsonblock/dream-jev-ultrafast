@@ -15,3 +15,9 @@ coverage.xml
 htmlcov/
 mutants/
 setup.cfg
+# Hypothesis's local example database — machine-local, never release content.
+.hypothesis/
+# Release signing artifact produced by scripts/sign_manifest.py --sign on the
+# release machine. The manifest can never list it (it authenticates the
+# manifest's own digest), so it must not enter the file set via a commit.
+MANIFEST.sig

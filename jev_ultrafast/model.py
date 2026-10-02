@@ -8,7 +8,6 @@ import os
 import time
 from dataclasses import dataclass
 from typing import Protocol
-from urllib.parse import urlparse
 
 import httpx
 
@@ -16,6 +15,7 @@ from .privacy import (
     action_goal_overlap,
     assert_endpoint_allowed,
     assert_transport_secure,
+    loopback_endpoint,
     outbound_text,
     redact_text,
     sanitize_action,
@@ -63,8 +63,7 @@ class SystemOneBackend:
         assert_endpoint_allowed(url)
         assert_transport_secure(url)
         key = self.api_key or os.environ.get("JEV_DECISION_API_KEY") or os.environ.get("TYPESAFE_API_KEY")
-        host = (urlparse(url).hostname or "").lower()
-        if not key and host not in {"127.0.0.1", "localhost", "::1"}:
+        if not key and not loopback_endpoint(url):
             raise ValueError(
                 "Remote decision backend needs JEV_DECISION_API_KEY or TYPESAFE_API_KEY; no action executed."
             )
@@ -375,8 +374,7 @@ def field_text(context):
     assert_endpoint_allowed(base)
     assert_transport_secure(base)
     key = os.environ.get("TEXT_MODEL_API_KEY")
-    host = (urlparse(base).hostname or "").lower()
-    if not key and host not in {"127.0.0.1", "localhost", "::1"}:
+    if not key and not loopback_endpoint(base):
         raise ValueError(
             "Remote TYPE_TEXT backend needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor."
         )

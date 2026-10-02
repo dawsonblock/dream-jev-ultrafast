@@ -5,11 +5,11 @@ below comes from the run that produced this file.
 
 - schema: `jev-qualify/2` / mode: `bounded`
 - overall: **passed**
-- generated_at_ms: 1790978080322
+- generated_at_ms: 1790981210316
 
 ## Provenance
 
-- manifest_digest: `b5420e5f46fa7ff93a7c4547c7432bb71a483cfdc8e85c26204123601c7f39cc`
+- manifest_digest: `3588d9bcda65f19999880868088977e267413da31d0bd064524a6b01e85a0217`
 - manifest_signed: False
 - signature_key_id: `None`
 - signature_verified: skipped
@@ -19,18 +19,18 @@ below comes from the run that produced this file.
 
 - os: Darwin arm64 (kernel 25.2.0)
 - python: 3.12.9 · node: v24.16.0 · chrome: Chrome/154.0.8037.93
-- git_commit: `f59f2b5c89126bbeee63013b1717a3cfd12b5521` (dirty: False)
-- tree_digest: `34ccaa27644d0c9c828fa266b85a6583207455a68e09bf09e64c44042555595d`
+- git_commit: `57079349197acf20b1e5d90bd4ee940f4dc47f11` (dirty: True)
+- tree_digest: `25d95b09b51197db672821964c7fc5ff1d4a382a0302052ffe4493985b9f6947`
 - lock_digest: `8ee55088451f489c6ff9e9703615c6fbcc86d8673f759454e671335a1f5570ab`
-- test_suite_digest: `2d6d36fef0420c5b138efe603706f1eeae1b6aeacbbf0258fb667906df650aec`
-- env_digest: `1cc9a19479193574a5162b367fad63e82d6bd741fefa83087816176459704b09`
+- test_suite_digest: `11572a7126c720bbfe7c0adb45bf3d732fa3be82f046aac6360a9a95ebd809bb`
+- env_digest: `ba74193ba4c9c59a43ae6a89ccefd887e90ecd7629e341a99010a76aeb396003`
 
 ## Stages
 
 | stage | status | detail |
 |---|---|---|
-| Q0-static | passed | manifest, compile, lint, syntax, lock, build, reproducibility |
-| Q1-offline | passed | 437 passed |
-| Q2-browser | passed | live Chrome guard suite + E2E scenario |
-| Q3-adversarial | passed | 6 passed |
-| Q4-statistical | passed | causal grid + propensity |
+| Q0-static | passed | 8 checks ran, 1 skipped — manifest, compile, lint, syntax, lock, build, reproducibility |
+| Q1-offline | passed | 1 check ran — 445 passed |
+| Q2-browser | passed | 2 checks ran — live Chrome guard suite + E2E scenario |
+| Q3-adversarial | passed | 7 checks ran — 6 passed |
+| Q4-statistical | passed | 1 check ran — causal grid + propensity |

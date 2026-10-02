@@ -728,6 +728,43 @@ def test_insecure_transport_override_is_explicit(monkeypatch):
     model.SystemOneBackend(url="http://127.0.0.1:9000/v1").decide({})
 
 
+def test_sanitized_routing_rejects_privacy_off(monkeypatch):
+    """'sanitized' is the promise that outbound text was redacted — privacy=off
+    disables the pass while remote endpoints stay reachable. The two flags
+    must not silently compose into raw remote transmission."""
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "sanitized")
+    monkeypatch.setenv("JEV_MODEL_PRIVACY", "off")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    with pytest.raises(ValueError, match="public|local-only"):
+        model.SystemOneBackend(url="https://api.example.test/v1").decide({})
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    with pytest.raises(ValueError, match="public|local-only"):
+        model.field_text({"goal": "x"})
+
+    # The declared alternatives still work: public sends verbatim,
+    # local-only stays on the machine — off is coherent under both.
+    post = Mock(return_value={"model": "t", "answers": {}})
+    monkeypatch.setattr(model, "post_json", post)
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "public")
+    model.SystemOneBackend(url="https://api.example.test/v1").decide({})
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "local-only")
+    model.SystemOneBackend(url="http://127.0.0.1:9000/v1").decide({})
+    assert post.call_count == 2
+
+
+def test_snapshot_returns_no_live_state_references(runner):
+    """snapshot() must be an isolation boundary: mutating the returned
+    nested structures cannot reach back into agent state."""
+    snap = runner.snapshot()
+    snap["page"]["actions"].clear()
+    snap["page"]["url"] = "about:blank"
+    snap["history"].append({"tampered": True})
+    snap["candidate_metadata"]["offered_actions"] = -1
+    assert runner.state["page"]["actions"]
+    assert runner.state["page"]["url"] == "https://example.test/"
+    assert runner.state["history"] == []
+
+
 def test_model_boundaries_redact_history_text(monkeypatch):
     monkeypatch.setenv("JEV_MODEL_PRIVACY", "basic")
     monkeypatch.setenv("TYPESAFE_API_KEY", "test")

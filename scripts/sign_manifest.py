@@ -15,6 +15,12 @@ manifest needing to hash its own signature file.
 fails closed: missing MANIFEST.sig, unknown signing key, digest mismatch, or a
 bad signature all exit 1. Verification does not re-check individual files —
 that is ``update_manifest.py --check`` / ``sha256sum -c``.
+
+This script is deliberately self-contained: the Ed25519 primitives below use
+the ``cryptography`` package directly and never import ``jev_ultrafast``. The
+artifact under verification must not supply — or execute — the code that
+verifies it; ``jev_ultrafast/__init__.py`` alone would run application code
+from the unauthenticated tree.
 """
 
 import argparse
@@ -25,11 +31,35 @@ import sys
 import time
 from pathlib import Path
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = "MANIFEST.sha256"
 SIG_FILE = "MANIFEST.sig"
 SIG_SCHEMA = "jev-manifest-sig/1"
 SIG_DOMAIN = b"jev-dream/release-manifest/v1:"
+
+
+def _sign_hex(seed_hex: str, digest_hex: str) -> tuple[str, str]:
+    """Ed25519 sign of ``SIG_DOMAIN + digest_hex``; returns (key_id, sig_hex)."""
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed_hex.strip()))
+    key_id = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    return key_id, key.sign(SIG_DOMAIN + digest_hex.encode("ascii")).hex()
+
+
+def _verify_hex(public_key_hex: str, digest_hex: str, signature_hex: str) -> bool:
+    try:
+        key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
+        key.verify(bytes.fromhex(signature_hex),
+                   SIG_DOMAIN + digest_hex.encode("ascii"))
+        return True
+    except (InvalidSignature, ValueError):
+        return False
 
 
 def _manifest_digest(root: Path) -> str:
@@ -40,18 +70,15 @@ def _manifest_digest(root: Path) -> str:
 
 
 def _sign(root: Path, seed_hex: str) -> int:
-    sys.path.insert(0, str(root))
-    from jev_ultrafast.signing import EvidenceSigner
-
-    signer = EvidenceSigner.from_hex(seed_hex.strip())
     digest = _manifest_digest(root)
+    key_id, signature = _sign_hex(seed_hex, digest)
     block = {
         "schema": SIG_SCHEMA,
         "kind": "release_manifest_signature",
         "manifest_digest": digest,
         "signed_at_ms": int(time.time() * 1000),
-        "key_id": signer.key_id,
-        "signature": signer.sign_hex(digest, domain=SIG_DOMAIN),
+        "key_id": key_id,
+        "signature": signature,
     }
     out = root / SIG_FILE
     out.write_text(
@@ -59,14 +86,11 @@ def _sign(root: Path, seed_hex: str) -> int:
         encoding="utf-8",
     )
     print(f"{SIG_FILE}: manifest digest {digest[:16]}… signed by "
-          f"{signer.key_id[:16]}…")
+          f"{key_id[:16]}…")
     return 0
 
 
 def _verify(root: Path, keys: set[str]) -> int:
-    sys.path.insert(0, str(root))
-    from jev_ultrafast.signing import verify_signature
-
     sig_path = root / SIG_FILE
     if not sig_path.exists():
         print(f"{SIG_FILE}: missing — unsigned release manifest", file=sys.stderr)
@@ -89,8 +113,7 @@ def _verify(root: Path, keys: set[str]) -> int:
     if key_id not in keys:
         print(f"{SIG_FILE}: manifest signed by an unexpected key", file=sys.stderr)
         return 1
-    if not signature or not verify_signature(key_id, digest, str(signature),
-                                             domain=SIG_DOMAIN):
+    if not signature or not _verify_hex(key_id, digest, str(signature)):
         print(f"{SIG_FILE}: signature verification failure", file=sys.stderr)
         return 1
     print(f"{SIG_FILE}: manifest digest {digest[:16]}… verified under key "

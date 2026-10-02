@@ -69,7 +69,14 @@ SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", "jev-dream/3", SCHEMA_VERSION
 # acknowledgement was lost is recorded as unknowable, never as a retryable
 # stale page — pools that predate it cannot distinguish a press that may have
 # landed from a click that provably never ran.
-TCB_VERSION = "jev-ultrafast-tcb/0.15"
+# 0.16 binds the full authority context into the pre-mutation execution
+# guard: the same derived signals classify_effect() consumed at decision
+# time (submit semantics, form method/origin, scoped field inventory, the
+# target's field class, messaging/external/download flags, modal scope) are
+# recomputed inside the guarded mutation turn. Earlier versions compared
+# only identity/value/style signals, so a page could flip authority-relevant
+# attributes between decision and dispatch without tripping the stale guard.
+TCB_VERSION = "jev-ultrafast-tcb/0.16"
 SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.3",
     "jev-ultrafast-tcb/0.4",
@@ -83,6 +90,7 @@ SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.12",
     "jev-ultrafast-tcb/0.13",
     "jev-ultrafast-tcb/0.14",
+    "jev-ultrafast-tcb/0.15",
     TCB_VERSION,
 }
 ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
