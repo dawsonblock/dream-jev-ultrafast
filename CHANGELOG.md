@@ -30,6 +30,9 @@ A second-pass audit found four defects that mattered precisely because everythin
 - **`scripts/mutate_check.py`** is the bounded §55 sweep: 12 curated TCB mutants, each must turn the suite red — the first pass exposed four real gaps (required-signing enforcement, `prev_hash` link integrity, reserved-key forgery, anchor-digest tamper), now covered by dedicated tests; the sweep is 12/12 killed.
 - **`scripts/sign_manifest.py`** signs/verifies the manifest digest under a domain-separated Ed25519 key (`jev-manifest-sig/1`), and consecutive `uv build` runs are byte-identical — the signed-reproducible-release artifacts exist.
 - **`scripts/qualify.py`** is the staged §64 pipeline (Q0→Q4, `jev-qualify/1` report; unrunnable legs report `skipped`, never `passed`) and **`scripts/soak_check.py`** runs the probes under a wall-clock deadline for the 24h gate. The suite also passes under Python 3.12.9, matching 3.13.
+- **`scripts/e2e_check.py`** is a real end-to-end leg: the full agent loop on real Chrome (scripted backend, real evidence store) — verified-done clean run with journaled attempts and an approval-gated privileged click, plus a decide-time DOM-churn fault leg that aborts censored with zero wrong-element mutation. CI `live-guards` runs it; `offline` is now an ubuntu+macos × 3.12+3.13 matrix.
+- **`scripts/keydrill_check.py`** rehearses the §61 compromise drill: forged and stolen-key evidence rejected under rotation, the retired chain forensically readable, a fresh epoch continuing under the new key — rotation is a new epoch, never a rewrite.
+- A committed `[tool.mutmut]` config makes the exhaustive §55 tool pass `uv run --with mutmut mutmut run`.
 - **Coverage floor**: the offline suite now runs under `--cov-fail-under=80` (suite at 86%; the browser-execution paths it can't reach are covered by the live Chrome guards). `hypothesis` and `pytest-cov` join the dev group.
 
 ## v0.9.1 — causal-evidence hardening

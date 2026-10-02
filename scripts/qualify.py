@@ -117,10 +117,14 @@ def main() -> int:
                          [{"cmd": PY + ["-m", "pytest", "-q"]}]))
 
     print("Q2 — browser execution guards", flush=True)
-    stages.append(_stage("Q2-browser", "live Chrome guard suite", [
+    stages.append(_stage("Q2-browser", "live Chrome guard suite + E2E scenario", [
         {"cmd": PY + ["scripts/check_guards.py"],
          "timeout": 900} if chrome else
         {"cmd": ["python3", "scripts/check_guards.py"],
+         "skip": "no CDP endpoint reachable"},
+        {"cmd": PY + ["scripts/e2e_check.py"],
+         "timeout": 900} if chrome else
+        {"cmd": ["python3", "scripts/e2e_check.py"],
          "skip": "no CDP endpoint reachable"},
     ]))
 
@@ -132,6 +136,7 @@ def main() -> int:
         {"cmd": PY + ["scripts/crash_check.py", "--iterations",
                       "1000" if full else "30"]},
         {"cmd": PY + ["scripts/mutate_check.py"], "timeout": 3600},
+        {"cmd": PY + ["scripts/keydrill_check.py"]},
         {"cmd": PY + ["scripts/race_check.py", "--nav-iterations",
                       "1000" if full else "200", "--churn-iterations", "0"],
          "timeout": 3600}

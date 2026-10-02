@@ -34,6 +34,14 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 
+[tool.mutmut]
+# §55 full-tool mutation pass configuration (mutmut 3.x). Scoped runs:
+#   uv run --with mutmut mutmut run                     # whole package (long)
+#   uv run --with mutmut mutmut run --mutate signing.py # per docs/3.x CLI
+source_paths = "jev_ultrafast/"
+pytest_add_cli_args = ["--no-cov", "-x", "-q"]
+pytest_add_cli_args_test_selection = ["tests"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # §56 coverage floor: the offline suite holds ~86% (browser.py is exercised by
