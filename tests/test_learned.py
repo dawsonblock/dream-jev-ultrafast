@@ -1884,3 +1884,24 @@ def test_assignment_propensity_distribution_is_correct():
         hits = sum(1 for _ in range(100_000) if rng.random() < rate)
         z = abs(hits / 100_000 - rate) / math.sqrt(rate * (1 - rate) / 100_000)
         assert z < 4.0, f"rate={rate} observed={hits / 100_000} z={z:.1f}"
+
+
+def test_fits_and_replay_are_deterministic(tmp_path):
+    """§57: identical evidence produces byte-identical fitted artifacts — the
+    digests downstream bindings sign must not drift between runs."""
+    store = tmp_path / "det.jsonl"
+    worlds = _divergent_worlds(store)
+    events = [json.loads(line) for line in store.read_text().splitlines() if line.strip()]
+    for i in range(6):
+        events += _trial_run(f"d{i}", "candidate" if i % 2 else "control",
+                             success=i % 3 == 0, propensity=0.5)
+
+    assert CounterfactualTrials.fit(events).digest == CounterfactualTrials.fit(events).digest
+    assert ChoiceModel.fit(events).digest == ChoiceModel.fit(events).digest
+    assert OutcomeModel.fit(events).digest == OutcomeModel.fit(events).digest
+    a = DreamImprover(gate=PromotionGate(min_coverage=0.0)).improve(
+        worlds, ExplorationPolicy(), trials=CounterfactualTrials.fit(events))
+    b = DreamImprover(gate=PromotionGate(min_coverage=0.0)).improve(
+        worlds, ExplorationPolicy(), trials=CounterfactualTrials.fit(events))
+    assert a.selected.digest == b.selected.digest
+    assert a.trials_digest == b.trials_digest

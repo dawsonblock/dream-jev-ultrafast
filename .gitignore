@@ -10,3 +10,6 @@ artifacts/
 dist/
 .jev/
 *.jsonl.lock
+.coverage
+coverage.xml
+htmlcov/

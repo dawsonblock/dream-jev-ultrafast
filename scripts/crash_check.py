@@ -6,6 +6,12 @@ After each kill the store must either hold a verifiable chain or recover by
 discarding a torn tail; malformed records must never be *accepted*.
 
     uv run python scripts/crash_check.py [--iterations 30] [--writers 4]
+                                        [--segment 25]
+
+Stores rotate every `--segment` iterations so each segment's chain stays
+short enough to load+verify per kill — the kill-point coverage is the
+variable under test, not chain length. Rotation itself widens coverage:
+fresh chains, mid-length chains, and torn tails are all exercised.
 
 Exit 0: every post-kill recovery produced a valid chain (or a torn tail the
 store itself discards). Any load failure, broken chain, or anchor
@@ -42,6 +48,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--writers", type=int, default=4)
+    parser.add_argument("--segment", type=int, default=25)
     parser.add_argument("--seed", type=int, default=0xC0FFEE)
     args = parser.parse_args()
 
@@ -51,13 +58,14 @@ def main() -> int:
 
     rng = random.Random(args.seed)
     tmp = Path(tempfile.mkdtemp(prefix="jev-crash-"))
-    store_path = tmp / "events.jsonl"
-    anchor_path = tmp / "anchor.json"
     script = tmp / "writer.py"
     script.write_text(WRITER)
 
-    killed = recovered = 0
+    killed = recovered = seg = 0
     for it in range(args.iterations):
+        seg = it // args.segment
+        store_path = tmp / f"events-{seg}.jsonl"
+        anchor_path = tmp / f"anchor-{seg}.json"
         n_writers = rng.randint(2, args.writers)
         procs = [
             subprocess.Popen(
@@ -87,7 +95,7 @@ def main() -> int:
 
         store = ExperienceStore(store_path)
         try:
-            events = store.load()
+            store.load()
             store.verify()
             recovered += 1
         except Exception as exc:
@@ -97,13 +105,16 @@ def main() -> int:
                     p.kill()
             return 1
 
-    if not events:
+    total_events = sum(
+        sum(1 for _ in f.open()) for f in tmp.glob("events-*.jsonl"))
+    if not total_events:
         print("crash-injection: vacuous — no events were ever written")
         return 1
-    size_mb = store_path.stat().st_size / 1e6 if store_path.exists() else 0.0
+    size_mb = sum(f.stat().st_size for f in tmp.glob("events-*.jsonl")) / 1e6
     print(f"crash-injection: {args.iterations} iterations, {killed} kills, "
-          f"{recovered} verified recoveries, {len(events)} events, "
-          f"{size_mb:.1f}MB — every post-kill state verified")
+          f"{recovered} verified recoveries, {total_events} events across "
+          f"{seg + 1} segments, {size_mb:.1f}MB — "
+          "every post-kill state verified")
     return 0
 
 

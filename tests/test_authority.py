@@ -2,6 +2,7 @@
 torn-tail evidence recovery, and signing-key rotation."""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -520,3 +521,82 @@ def test_payload_classification_is_a_second_authority_signal():
     assert assess_payload("4111 1111 1111 1111").level == "require_approval"
     assert assess_payload("dawson@example.com").level == "require_approval"
     assert assess_payload("Zurich").level == "allow"
+
+
+# --- §59–§61: durability and signer failure modes -------------------------
+
+def test_signer_failure_never_falls_back_to_unsigned(tmp_path):
+    """§61/§622: a failing signer (KMS timeout, HSM unavailable, partial
+    response) must abort the append — there is no unsigned fallback path."""
+    class FailingSigner:
+        key_id = "deadbeef"
+        def sign_hex(self, digest_hex, domain=b""):
+            raise TimeoutError("KMS unavailable")
+
+    path = tmp_path / "signed.jsonl"
+    store = ExperienceStore(path, signer=FailingSigner())
+    with pytest.raises(TimeoutError, match="KMS"):
+        store.append(_minimal_event())
+    # The failed append wrote nothing — the file stays absent or empty.
+    assert not path.exists() or path.read_bytes() == b""
+
+
+def test_signer_failure_mid_chain_preserves_existing_events(tmp_path):
+    """A signer that dies mid-run leaves the prior chain intact — partial
+    failure is detectable, not corrupting."""
+    good = EvidenceSigner.from_hex("ab" * 32)
+
+    class FlakySigner:
+        def __init__(self):
+            self.calls = 0
+            self.key_id = good.key_id
+        def sign_hex(self, digest_hex, domain=b""):
+            self.calls += 1
+            if self.calls > 1:
+                raise ConnectionError("HSM lost")
+            return good.sign_hex(digest_hex)
+
+    path = tmp_path / "flaky.jsonl"
+    store = ExperienceStore(path, signer=FlakySigner())
+    store.append(_minimal_event())
+    with pytest.raises(ConnectionError):
+        store.append(_minimal_event())
+    # First event still verifies; the failed second append left no fragment.
+    loaded = ExperienceStore(path, verify_keys={good.key_id}).load()
+    assert len(loaded) == 1
+
+
+def test_append_fails_closed_on_readonly_store(tmp_path):
+    """§60: when durable evidence cannot be written, append must raise —
+    a mutation journaled nowhere must not silently proceed. (Appending to an
+    existing file needs write permission on the *file*; revoking the
+    directory alone would not exercise the path.)"""
+    path = tmp_path / "events.jsonl"
+    ExperienceStore(path).append(_minimal_event())
+    os.chmod(path, 0o444)
+    try:
+        with pytest.raises(OSError):
+            ExperienceStore(path).append(_minimal_event())
+    finally:
+        os.chmod(path, 0o644)
+    # The store itself remains verifiable after the refused write.
+    assert len(ExperienceStore(path).load()) == 1
+
+
+def test_clock_regression_does_not_corrupt_chain(tmp_path):
+    """§58: chain integrity is prev_hash-linked, not wall-clock — a backward
+    clock changes only the informational timestamp, never verification."""
+    import jev_ultrafast.dream as dream
+
+    path = tmp_path / "clock.jsonl"
+    store = ExperienceStore(path)
+    store.append(_minimal_event())
+    real_time = dream.time.time
+    dream.time.time = lambda: real_time() - 3600  # clock jumps back an hour
+    try:
+        store.append(_minimal_event())
+    finally:
+        dream.time.time = real_time
+    events = store.load()
+    assert events[1]["recorded_at_ms"] < events[0]["recorded_at_ms"]
+    store.verify()  # chain still verifies — ordering is hash-linked

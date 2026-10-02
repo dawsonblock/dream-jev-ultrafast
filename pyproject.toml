@@ -20,7 +20,13 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [dependency-groups]
-dev = ["pytest>=8.4,<9", "ruff>=0.14,<1", "pillow>=11,<13"]
+dev = [
+    "pytest>=8.4,<9",
+    "ruff>=0.14,<1",
+    "pillow>=11,<13",
+    "hypothesis>=6.140,<7",
+    "pytest-cov>=6,<8",
+]
 
 [tool.ruff]
 line-length = 120
@@ -30,3 +36,6 @@ select = ["E", "F", "I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# §56 coverage floor: the offline suite holds ~86% (browser.py is exercised by
+# the live Chrome guards, demo.py by the CLI smoke). 80% is the committed gate.
+addopts = "--cov=jev_ultrafast --cov-report=term-missing --cov-fail-under=80"
