@@ -31,9 +31,25 @@ jobs:
       - run: uv run python scripts/update_manifest.py --check
       - run: uv run ruff check .
       - run: uv run pytest -q
+      # §53/§22 bounded adversarial legs — continuous, not just historical
+      # evidence. Browser-free, so the whole OS×Python matrix exercises them.
+      - run: uv run python scripts/fuzz_check.py --cases 20000
+      - run: uv run python scripts/crash_check.py --iterations 3 --writers 2
       - run: node --check jev_ultrafast/snapshot.js
       - run: node --check jev_ultrafast/static/app.js
       - run: uv build
+
+  mutation-gate:
+    # §55/§63 continuous gate: the curated TCB mutant sweep must stay 12/12
+    # killed — every fail-closed check keeps its detecting test on every push.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --group dev
+      - run: uv run python scripts/mutate_check.py
 
   live-guards:
     # Real-browser execution-guard regressions. v0.4.0 shipped a mutation bug
@@ -75,3 +91,6 @@ jobs:
       # §46/§47 leg: the full loop end-to-end on the same Chrome — scripted
       # backend, real evidence store, decide-time fault injection.
       - run: BU_CDP_URL=http://127.0.0.1:9222 uv run python scripts/e2e_check.py
+      # §12/§44 bounded slice: the race + TOCTOU churn probes run on the job's
+      # real Chrome so interruption-safety regressions gate every push.
+      - run: BU_CDP_URL=http://127.0.0.1:9222 uv run python scripts/race_check.py --nav-iterations 50 --churn-iterations 100
