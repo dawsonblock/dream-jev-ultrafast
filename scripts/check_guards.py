@@ -253,11 +253,23 @@ def main():
             ("atomic fill oninput navigation",
              '<label>Site<input id="nf" oninput="location.replace(\'about:blank\')"></label>',
              "fill", {}, "x"),
+            ("atomic fill onchange navigation",
+             '<label>Site<input id="nf" onchange="location.replace(\'about:blank\')"></label>',
+             "fill", {}, "x"),
             ("trusted fill oninput navigation",
              '<label>Site<input id="nf" oninput="location.replace(\'about:blank\')"></label>',
              "fill", {"guarantee": "trusted"}, "x"),
+            ("atomic fill oninput document.write",
+             '<label>Site<input id="nf" oninput="document.open();'
+             "document.write('<p>gone</p>');document.close()\"></label>",
+             "fill", {}, "x"),
             ("select onchange navigation",
              '<select aria-label="Nav" onchange="location.replace(\'about:blank\')">'
+             "<option>All</option><option>Go</option></select>",
+             "select", {}, None),
+            ("select onchange document.write",
+             '<select aria-label="Nav" onchange="document.open();'
+             "document.write('<p>gone</p>');document.close()\">"
              "<option>All</option><option>Go</option></select>",
              "select", {}, None),
             ("atomic click document.write",
@@ -268,23 +280,47 @@ def main():
              '<button id="adv" onmousedown="location.replace(\'about:blank\')" '
              'onclick="window.hits=(window.hits||0)+1">Continue</button>',
              "click", {"guarantee": "trusted"}, None),
+            ("trusted press onpointerdown navigation",
+             '<button id="adv" onpointerdown="location.replace(\'about:blank\')" '
+             'onclick="window.hits=(window.hits||0)+1">Continue</button>',
+             "click", {"guarantee": "trusted"}, None),
+            # Native form submission navigates without any JS handler — the
+            # browser tears the context down mid-click the same way.
+            ("atomic click form-submit navigation",
+             '<form action="about:blank" method="get">'
+             '<button id="adv" type="submit">Continue</button></form>',
+             "click", {}, None),
+            # history.replaceState mutates the URL/fingerprint without
+            # navigation — the click itself still completes normally. No
+            # window counter here: the window persists, and the next-case
+            # assertions expect a clean slate.
+            ("atomic click history.replaceState",
+             '<button id="adv" onclick="history.replaceState(null,\'\',\'/moved\')">'
+             "Continue</button>",
+             "click", {}, None),
         ]
         for label, html, kind, extra, text in nav_cases:
             # The prior case may have left the tab mid-navigation
-            # (location.replace inside the handler): evaluate on a navigating
-            # target races 'Inspected target navigated or closed', so wait for
-            # a live document before injecting the next fixture.
+            # (location.replace inside the handler), and the navigation can
+            # commit *after* a successful evaluate — wiping the just-injected
+            # fixture. So settle means: inject AND observe the expected
+            # action kind, retrying the whole cycle until it survives.
+            action = None
             for _settle in range(100):
                 try:
                     browser.evaluate("document.body.innerHTML=" + repr(html))
-                    break
+                    page = browser.observe(screenshot=False)
+                    action = next(
+                        (a for a in page["actions"] if a["kind"] == kind), None
+                    )
+                    if action is not None:
+                        break
                 except Exception:
-                    import time
-                    time.sleep(0.05)
+                    pass
+                import time
+                time.sleep(0.05)
             else:
-                raise AssertionError(f"{label}: page never settled for fixture injection")
-            page = browser.observe(screenshot=False)
-            action = next(a for a in page["actions"] if a["kind"] == kind)
+                raise AssertionError(f"{label}: fixture never produced a '{kind}' action")
             try:
                 if text is None:
                     browser.act(action, page, **extra)
@@ -295,6 +331,46 @@ def main():
             except IndeterminateMutation:
                 pass
             passed.append(f"{label} is confirmed or indeterminate, never stale")
+
+        # TOCTOU churn: the document mutates continuously between observation
+        # and execution. Every attempt must either land on the element the
+        # action described or refuse before mutation — a click that lands on
+        # a *different* element than intended is the failure this guards.
+        browser.evaluate("document.body.innerHTML=" + repr("""
+            <div id="box"></div>
+        """) + """
+            ;window.clicked=null;
+            window.__churn=setInterval(()=>{
+              document.getElementById('box').innerHTML=[0,1,2,3].map(i=>
+                `<button onclick="window.clicked='b'+${i}">B${i}</button>`).join('');
+            },3)
+        """)
+        churn_ok = churn_stale = 0
+        for _round in range(40):
+            page = browser.observe(screenshot=False)
+            target = next(
+                (a for a in page["actions"]
+                 if a["kind"] == "click" and a["label"] == "B0"),
+                None,
+            )
+            if target is None:
+                continue  # mid-regeneration gap — not a decision boundary
+            try:
+                browser.act(target, page)
+            except (StalePage, IndeterminateMutation):
+                churn_stale += 1
+                continue
+            churn_ok += 1
+            assert browser.evaluate("window.clicked") == "b0", (
+                "churned click landed on a different element than described"
+            )
+            browser.evaluate("window.clicked=null")
+        browser.evaluate("clearInterval(window.__churn)")
+        assert churn_ok > 0, "churn guard never executed a click"
+        passed.append(
+            f"TOCTOU churn: {churn_ok} correct-target clicks, "
+            f"{churn_stale} rejected, zero wrong-target mutations"
+        )
 
         # The aborted press must leave clean pointer state: a later legitimate
         # trusted click still works.

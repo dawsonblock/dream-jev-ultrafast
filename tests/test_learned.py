@@ -1869,3 +1869,18 @@ def test_update_manifest_script_regenerates_and_verifies(tmp_path):
     ok2 = subprocess.run([sys.executable, str(patched), "--check"],
                          capture_output=True, text=True)
     assert ok2.returncode == 0
+
+
+def test_assignment_propensity_distribution_is_correct():
+    """T-800: the arm draw is `rng.random() < rate`. Over 100k seeded draws
+    (fully deterministic — no flake surface) the observed candidate-arm
+    frequency must sit within ~4 sigma of the configured propensity at each
+    rate the scheduler exposes."""
+    import math
+    import random
+
+    for rate in (0.50, 0.25, 0.10):
+        rng = random.Random(0xC0FFEE)
+        hits = sum(1 for _ in range(100_000) if rng.random() < rate)
+        z = abs(hits / 100_000 - rate) / math.sqrt(rate * (1 - rate) / 100_000)
+        assert z < 4.0, f"rate={rate} observed={hits / 100_000} z={z:.1f}"

@@ -120,6 +120,11 @@ def multiplicity_probe(sequences, *, divergences, n_per_arm, base, seed):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sequences", type=int, default=400)
+    parser.add_argument(
+        "--probe-sequences", type=int, default=None,
+        help="Sequences for the multiplicity probe (default: sequences//4, "
+        "capped — probe cost scales with divergence count)",
+    )
     args = parser.parse_args()
 
     print(f"CounterfactualTrials Monte-Carlo — {args.sequences} sequences/point")
@@ -128,7 +133,11 @@ def main():
         ("null  delta=0.00  n=12  p=0.50", dict(n_per_arm=12, delta=0.0,  base=0.5, propensity=0.5)),
         ("null  delta=0.00  n=30  p=0.50", dict(n_per_arm=30, delta=0.0,  base=0.5, propensity=0.5)),
         ("null  delta=0.00  n=30  p=0.25", dict(n_per_arm=30, delta=0.0,  base=0.5, propensity=0.25)),
+        ("delta=+0.01       n=30  p=0.50", dict(n_per_arm=30, delta=0.01, base=0.5, propensity=0.5)),
+        ("delta=+0.05       n=30  p=0.50", dict(n_per_arm=30, delta=0.05, base=0.5, propensity=0.5)),
         ("delta=+0.10       n=30  p=0.50", dict(n_per_arm=30, delta=0.10, base=0.5, propensity=0.5)),
+        ("delta=-0.05       n=30  p=0.50", dict(n_per_arm=30, delta=-0.05, base=0.5, propensity=0.5)),
+        ("delta=-0.10       n=30  p=0.50", dict(n_per_arm=30, delta=-0.10, base=0.55, propensity=0.5)),
         ("delta=+0.30       n=30  p=0.50", dict(n_per_arm=30, delta=0.30, base=0.5, propensity=0.5)),
         ("delta=+0.60       n=30  p=0.50", dict(n_per_arm=30, delta=0.60, base=0.2, propensity=0.5)),
         ("delta=-0.30       n=30  p=0.50", dict(n_per_arm=30, delta=-0.30, base=0.8, propensity=0.5)),
@@ -140,13 +149,13 @@ def main():
               f"{counts['unresolved']:>11}{counts['none']:>6}")
 
     print("\nMultiplicity probe (all-null divergences, per-sequence family strata)")
-    for divergences in (2, 5, 10, 25):
-        hits = multiplicity_probe(max(100, args.sequences // 2),
+    probe_seq = args.probe_sequences or min(2000, max(100, args.sequences // 4))
+    for divergences in (2, 5, 10, 25, 50, 100):
+        hits = multiplicity_probe(probe_seq,
                                   divergences=divergences, n_per_arm=12,
                                   base=0.5, seed=divergences)
-        seqs = max(100, args.sequences // 2)
-        print(f"  {divergences:>3} divergences: {hits}/{seqs} sequences had >=1 false "
-              f"'beneficial' ({hits / seqs:.1%})")
+        print(f"  {divergences:>3} divergences: {hits}/{probe_seq} sequences had >=1 false "
+              f"'beneficial' ({hits / probe_seq:.1%})")
 
 
 if __name__ == "__main__":
