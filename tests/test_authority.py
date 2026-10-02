@@ -342,6 +342,31 @@ def test_key_rotation_and_domain_separation(tmp_path):
     assert verify_signature(new_key.key_id, "ab" * 32, new_key._key.sign(frame_digest("ab" * 32)).hex())
 
 
+def test_verify_keys_from_env_single_and_multi_paths(monkeypatch):
+    """Both env-var forms must contribute keys — the single-key fallback and
+    the comma/space-separated list are distinct code paths (mutmut found the
+    single-key branch uncovered)."""
+    from jev_ultrafast.signing import verify_keys_from_env
+
+    monkeypatch.delenv("JEV_EVIDENCE_VERIFY_KEY", raising=False)
+    monkeypatch.delenv("JEV_EVIDENCE_VERIFY_KEYS", raising=False)
+    assert verify_keys_from_env() == set()
+
+    # Single-key form alone.
+    monkeypatch.setenv("JEV_EVIDENCE_VERIFY_KEY", "key_a")
+    assert verify_keys_from_env() == {"key_a"}
+
+    # Multi-key form alone, comma-separated.
+    monkeypatch.delenv("JEV_EVIDENCE_VERIFY_KEY")
+    monkeypatch.setenv("JEV_EVIDENCE_VERIFY_KEYS", "key_b,key_c")
+    assert verify_keys_from_env() == {"key_b", "key_c"}
+
+    # Both forms merge; space-separated multi also works.
+    monkeypatch.setenv("JEV_EVIDENCE_VERIFY_KEY", "key_a")
+    monkeypatch.setenv("JEV_EVIDENCE_VERIFY_KEYS", "key_b key_c")
+    assert verify_keys_from_env() == {"key_a", "key_b", "key_c"}
+
+
 def test_cli_reads_signed_store_with_rotation_flags(tmp_path):
     from jev_ultrafast.dream_cli import main
 
