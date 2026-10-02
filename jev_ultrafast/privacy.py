@@ -93,6 +93,28 @@ def assert_endpoint_allowed(url):
         )
 
 
+def assert_transport_secure(url):
+    """Require TLS for every non-loopback model endpoint.
+
+    Loopback HTTP is fine (same machine); a remote http:// endpoint would
+    carry the Authorization header and the entire model context in cleartext.
+    ``JEV_ALLOW_INSECURE_TRANSPORT=1`` is the explicit dangerous-development
+    escape hatch — never set it for a qualified run.
+    """
+    parts = urlsplit(str(url))
+    scheme = parts.scheme.lower()
+    if scheme == "https" or loopback_endpoint(url):
+        return
+    if scheme == "http" and os.environ.get("JEV_ALLOW_INSECURE_TRANSPORT") == "1":
+        return
+    raise ValueError(
+        f"Refusing {'plaintext ' if scheme == 'http' else 'non-TLS '}"
+        f"model endpoint {parts.netloc or url!s}: non-loopback model traffic "
+        "requires https (or JEV_ALLOW_INSECURE_TRANSPORT=1 for local "
+        "development only)."
+    )
+
+
 def outbound_text(value, limit=6000):
     """Bound free-text that may reach a model endpoint to the routing level."""
     if routing_level() == "public":

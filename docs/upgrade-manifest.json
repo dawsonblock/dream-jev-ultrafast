@@ -1,6 +1,6 @@
 {
   "project": "jev-ultrafast",
-  "version": "0.4.1",
+  "version": "0.9.2",
   "release_name": "DREAM-Jev Qualification Control Plane",
   "based_on": "jev-ultrafast v0.3.0 DREAM-Jev",
   "design_source": {
@@ -14,19 +14,37 @@
     ],
     "intentional_deviation": "DREAM-Jev remains conservative trajectory-retention replay: it never predicts that the fixed decision model would choose a different browser action or invent an unseen DOM outcome."
   },
-  "trusted_computing_base": "jev-ultrafast-tcb/0.5",
+  "trusted_computing_base": "jev-ultrafast-tcb/0.15",
   "experience_schema": "jev-dream/2",
+  "trial_schema": "jev-trials/7",
   "backward_read_compatibility": [
     "jev-dream/1",
+    "jev-dream/2",
+    "jev-trials/4",
+    "jev-trials/5",
+    "jev-trials/6",
     "jev-ultrafast-tcb/0.3",
-    "jev-ultrafast-tcb/0.4"
+    "jev-ultrafast-tcb/0.4",
+    "jev-ultrafast-tcb/0.5",
+    "jev-ultrafast-tcb/0.6",
+    "jev-ultrafast-tcb/0.7",
+    "jev-ultrafast-tcb/0.8",
+    "jev-ultrafast-tcb/0.9",
+    "jev-ultrafast-tcb/0.10",
+    "jev-ultrafast-tcb/0.11",
+    "jev-ultrafast-tcb/0.12",
+    "jev-ultrafast-tcb/0.13",
+    "jev-ultrafast-tcb/0.14"
   ],
   "self_improvable": [
     "candidate ranking weights",
     "candidate quotas",
     "model action budget",
     "browser action budget",
-    "no-progress stopping patience"
+    "no-progress stopping patience",
+    "exploration policy data within the bounded ExplorationPolicy space",
+    "observational action priors (ChoiceModel annotations)",
+    "randomized causal action priors (TrialChoiceModel annotations)"
   ],
   "non_self_modifiable": [
     "isolated-world DOM identity",
@@ -34,26 +52,40 @@
     "browser mutation implementation",
     "approval and deny policy",
     "privacy/redaction rules",
+    "model-routing security levels and transport enforcement",
     "completion verifier contract",
     "replay objective implementation",
     "evidence hash-chain verification",
     "promotion/canary/health gates",
-    "policy registry, suspension, and rollback implementation"
+    "policy registry, suspension, and rollback implementation",
+    "causal estimator and sequential-inference implementation"
   ],
-  "v0_4_upgrades": [
-    "cross-process experience-store locking",
-    "corrupt-tail append refusal",
-    "candidate catalogue digest and selected rank evidence",
-    "world-pool and split-manifest replay provenance",
-    "evidence-head binding",
-    "all-split replay candidate qualification",
-    "parent-digest policy lineage",
-    "paired task-family canary evidence",
-    "live latency/action/token regression gates",
-    "unbound canary promotion disabled by default",
-    "active-policy health monitoring and suspension",
-    "policy history and rollback",
-    "multi-command jev-dream operational CLI"
+  "qualification_pipeline": {
+    "runner": "scripts/qualify.py",
+    "report_schema": "jev-qualify/2",
+    "report_signature_schema": "jev-qualify-sig/1",
+    "report_signature_domain": "jev-dream/qualify-report/v1:",
+    "manifest_signature_schema": "jev-manifest-sig/1",
+    "gates": [
+      "Q0 static integrity: manifest check + signature verification, compileall, ruff, JS syntax, lock, build, reproducible double-build",
+      "Q1 offline correctness: full pytest suite with committed coverage floor",
+      "Q2 browser execution: live Chrome guard suite + E2E (skipped, not passed, without a CDP endpoint)",
+      "Q3 adversarial: structured fuzz, crash injection, curated TCB mutation sweep, key-compromise drill, anchor-enforcement slice, live race loops",
+      "Q4 statistical: causal null/power/multiplicity Monte-Carlo grid + propensity draw"
+    ]
+  },
+  "v0_9_2_upgrades": [
+    "node-fair action-catalogue truncation (a giant select cannot starve later controls)",
+    "train/validation-only candidate selection with a single post-selection holdout evaluation",
+    "experiment arm rates bounded to [0.05, 0.95] — degenerate allocation rejected",
+    "Manski worst/best-case censoring bounds gating effect establishment",
+    "anytime-valid KL confidence sequence for sequential establishment",
+    "Bonferroni multiplicity control across concurrently tracked hypotheses",
+    "operator-declared input guarantee (JEV_INPUT_GUARANTEE, atomic|trusted) journaled per dispatch",
+    "model-routing security levels (JEV_MODEL_ROUTING, local-only|sanitized|public)",
+    "TLS required for every non-loopback model endpoint",
+    "manifest-signature and anchor-enforcement qualification gates",
+    "generated, artifact-bound validation reporting (optionally signed)"
   ],
   "default_canary_gate": {
     "baseline_tasks_min": 12,
@@ -67,10 +99,12 @@
     "failure_rate_regression": 0.0,
     "average_latency_regression_ratio_max": 0.25,
     "average_action_regression_ratio_max": 0.25,
-    "average_token_regression_ratio_max": 0.25
+    "average_token_regression_ratio_max": 0.25,
+    "max_pair_sign_p": 0.05
   },
   "validation": {
-    "offline_tests_passed": 116,
+    "authoritative_report": "generated per-run via scripts/qualify.py --out report.json --report-md VALIDATION.generated.md",
+    "offline_tests_passed": 435,
     "python_compileall": "passed",
     "javascript_syntax": "passed",
     "toml_json_parse": "passed",
@@ -79,6 +113,7 @@
     "cross_process_registry_test": "passed",
     "ruff": "passed",
     "uv_build": "passed",
-    "live_browser_harness": "passed: 23 guard checks against dedicated Chrome 152 via BU_CDP_URL"
+    "mutation_sweep": "12/12 curated TCB mutants killed",
+    "live_browser_harness": "passed: 47 guard checks against dedicated Chrome 154 via BU_CDP_URL (historical; CI live-guards job re-runs per push)"
   }
 }

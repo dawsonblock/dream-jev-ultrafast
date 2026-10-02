@@ -36,6 +36,62 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PY = [sys.executable]
 _TALLY = re.compile(r"(\d+)\s+(passed|failed|skipped|deselected|xpassed|xfailed)")
+REPORT_SIG_SCHEMA = "jev-qualify-sig/1"
+REPORT_SIG_DOMAIN = b"jev-dream/qualify-report/v1:"
+
+
+def _report_digest(report: dict) -> str:
+    """Canonical digest of the report with any signature block stripped."""
+    clean = {k: v for k, v in report.items() if k != "signature"}
+    return hashlib.sha256(
+        json.dumps(clean, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _sign_report(report: dict, seed_hex: str) -> dict:
+    sys.path.insert(0, str(ROOT))
+    from jev_ultrafast.signing import EvidenceSigner
+
+    signer = EvidenceSigner.from_hex(seed_hex.strip())
+    digest = _report_digest(report)
+    report["signature"] = {
+        "schema": REPORT_SIG_SCHEMA,
+        "kind": "qualification_report_signature",
+        "report_digest": digest,
+        "key_id": signer.key_id,
+        "signature": signer.sign_hex(digest, domain=REPORT_SIG_DOMAIN),
+    }
+    return report
+
+
+def _verify_report(path: Path, keys: set[str]) -> int:
+    sys.path.insert(0, str(ROOT))
+    from jev_ultrafast.signing import verify_signature
+
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"report unreadable ({exc})", file=sys.stderr)
+        return 1
+    sig = report.get("signature") if isinstance(report, dict) else None
+    if not isinstance(sig, dict) or sig.get("schema") != REPORT_SIG_SCHEMA:
+        print("report is unsigned or has an unrecognized signature block",
+              file=sys.stderr)
+        return 1
+    digest = _report_digest(report)
+    if sig.get("report_digest") != digest:
+        print("report digest mismatch — report was modified after signing",
+              file=sys.stderr)
+        return 1
+    if sig.get("key_id") not in keys:
+        print("report signed by an unexpected key", file=sys.stderr)
+        return 1
+    if not verify_signature(sig["key_id"], digest, str(sig.get("signature")),
+                            domain=REPORT_SIG_DOMAIN):
+        print("report signature verification failure", file=sys.stderr)
+        return 1
+    print(f"report verified under key {str(sig['key_id'])[:16]}…")
+    return 0
 
 
 def _cdp_up() -> bool:
@@ -132,6 +188,9 @@ def _write_markdown(report: dict, path: Path) -> None:
         f"- manifest_signed: {report['provenance'].get('manifest_signed')}",
         f"- signature_key_id: `{report['provenance'].get('signature_key_id')}`",
         f"- signature_verified: {report['provenance'].get('signature_verified')}",
+        f"- report_signed: {bool(report.get('signature'))}"
+        + (f" (key `{str(report.get('signature', {}).get('key_id'))[:16]}…`)"
+           if report.get("signature") else ""),
         "",
         "## Environment",
         "",
@@ -183,7 +242,26 @@ def main() -> int:
     parser.add_argument("--report-md", default=None,
                         help="also render a generated markdown report (e.g. "
                              "VALIDATION.generated.md)")
+    parser.add_argument("--sign", metavar="SEED_HEX", default=None,
+                        help="sign the report with this Ed25519 seed "
+                             "(JEV_QUALIFY_SIGNING_KEY is also honored)")
+    parser.add_argument("--verify-report", metavar="PATH", default=None,
+                        help="verify a signed report and exit")
+    parser.add_argument("--key", action="append", default=[],
+                        help="accepted report verify key (repeatable); "
+                             "JEV_QUALIFY_VERIFY_KEYS is also honored")
     args = parser.parse_args()
+
+    if args.verify_report:
+        keys = {k.strip() for k in args.key if k and k.strip()}
+        keys.update(k.strip() for k in
+                    os.environ.get("JEV_QUALIFY_VERIFY_KEYS", "").split(",")
+                    if k.strip())
+        if not keys:
+            print("no verification key configured — refusing to accept an "
+                  "unpinned report", file=sys.stderr)
+            return 1
+        return _verify_report(Path(args.verify_report), keys)
 
     full = args.full
     chrome = _cdp_up()
@@ -296,6 +374,12 @@ def main() -> int:
                                  for c in s["checks"]]}
                    for s in stages],
     }
+    # The report binds source artifact + environment; signing binds it to a
+    # release authority — a detached or mutated report must not be readable
+    # as qualified evidence for some other tree.
+    seed = args.sign or os.environ.get("JEV_QUALIFY_SIGNING_KEY", "").strip()
+    if seed:
+        _sign_report(report, seed)
     text = json.dumps(report, indent=2, sort_keys=True)
     if args.out:
         Path(args.out).write_text(text + "\n")

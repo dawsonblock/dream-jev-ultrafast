@@ -117,7 +117,7 @@ The shim binds `127.0.0.1` and applies the demo server's request hardening (Host
 
 `JEV_MODEL_PRIVACY=basic` (the default) bounds serialized strings and redacts incidental emails, card-like numbers, API-secret patterns, credential query parameters, and sensitive field values before observations reach a model. A useful reduction layer — not a complete DLP system.
 
-`JEV_MODEL_ROUTING` binds the run's model traffic to a security level before any inference starts: `local-only` refuses every non-loopback model endpoint outright (the goal and page never leave the machine), `sanitized` (the default) allows remote endpoints but sends the task goal through the same redaction pass as page content, and `public` declares the task non-sensitive and sends the goal verbatim. Regex redaction is a floor, not a guarantee — declare `local-only` for runs whose objective contains secrets.
+`JEV_MODEL_ROUTING` binds the run's model traffic to a security level before any inference starts: `local-only` refuses every non-loopback model endpoint outright (the goal and page never leave the machine), `sanitized` (the default) allows remote endpoints but sends the task goal through the same redaction pass as page content, and `public` declares the task non-sensitive and sends the goal verbatim. Regex redaction is a floor, not a guarantee — declare `local-only` for runs whose objective contains secrets. Every non-loopback endpoint also requires `https` — plaintext remote HTTP would carry the API key and model context in cleartext (`JEV_ALLOW_INSECURE_TRANSPORT=1` exists only for local development).
 
 `JEV_INPUT_GUARANTEE=trusted` (or `Agent(input_guarantee="trusted")`) routes clicks/fills through the real-CDP-input path for sites that ignore synthetic `isTrusted=false` events. It is a declaration, not a fallback: a silent no-op synthetic click cannot be distinguished from one that landed, so the system escalates automatically only when the atomic path provably did not mutate.
 
@@ -280,7 +280,7 @@ Live examples and recording scripts make paid API calls. `scripts/record_flights
 
 | Doc | Contents |
 | --- | --- |
-| [CHANGELOG.md](CHANGELOG.md) | Full release history, v0.4 → v0.9.1 |
+| [CHANGELOG.md](CHANGELOG.md) | Full release history, v0.4 → v0.9.2 |
 | [VALIDATION.md](VALIDATION.md) | Reproduced verification results per release |
 | [docs/performance.md](docs/performance.md) | Measurements, boundaries, raw evidence |
 | [docs/design.md](docs/design.md) | Architecture decisions |

@@ -605,11 +605,13 @@ def test_ordinary_generated_text_keeps_benign_fill_autonomous(runner, monkeypatc
 
 def test_input_guarantee_defaults_to_atomic_and_rejects_unknown(monkeypatch):
     monkeypatch.delenv("JEV_INPUT_GUARANTEE", raising=False)
-    a = loop.Agent.__new__(loop.Agent)
-    a.input_guarantee = "atomic"  # what __init__ stores for the default
-    monkeypatch.setenv("JEV_INPUT_GUARANTEE", "trusted")
+    # Validation must not depend on a real browser starting.
+    monkeypatch.setattr(loop, "Browser", lambda *a, **k: Mock(observe=Mock(return_value=page())))
     b = loop.Agent("http://x", "g")
-    assert b.input_guarantee == "trusted"
+    assert b.input_guarantee == "atomic"
+    monkeypatch.setenv("JEV_INPUT_GUARANTEE", "trusted")
+    c = loop.Agent("http://x", "g")
+    assert c.input_guarantee == "trusted"
     with pytest.raises(ValueError, match="input_guarantee"):
         loop.Agent("http://x", "g", input_guarantee="magical")
 
@@ -699,6 +701,31 @@ def test_routing_unknown_level_fails_closed(monkeypatch):
     monkeypatch.setenv("JEV_MODEL_ROUTING", "trust-me")
     with pytest.raises(ValueError, match="JEV_MODEL_ROUTING"):
         model.SystemOneBackend().decide({})
+
+
+def test_remote_plaintext_http_endpoint_refused(monkeypatch):
+    """Non-loopback http:// would carry the bearer key and full model
+    context in cleartext — refused regardless of routing level."""
+    monkeypatch.delenv("JEV_ALLOW_INSECURE_TRANSPORT", raising=False)
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    with pytest.raises(ValueError, match="https"):
+        model.SystemOneBackend(url="http://model.example.com/v1").decide({})
+    monkeypatch.setenv("TEXT_MODEL_BASE_URL", "http://model.example.com/v1")
+    monkeypatch.setenv("TEXT_MODEL_API_KEY", "test")
+    with pytest.raises(ValueError, match="https"):
+        model.field_text({"goal": "x"})
+
+
+def test_insecure_transport_override_is_explicit(monkeypatch):
+    monkeypatch.setenv("JEV_ALLOW_INSECURE_TRANSPORT", "1")
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    post = Mock(return_value={"model": "t", "answers": {}})
+    monkeypatch.setattr(model, "post_json", post)
+    model.SystemOneBackend(url="http://model.example.com/v1").decide({})
+    assert post.called
+    # Loopback http never needed the override.
+    monkeypatch.delenv("JEV_ALLOW_INSECURE_TRANSPORT")
+    model.SystemOneBackend(url="http://127.0.0.1:9000/v1").decide({})
 
 
 def test_model_boundaries_redact_history_text(monkeypatch):
