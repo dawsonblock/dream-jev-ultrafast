@@ -1707,7 +1707,7 @@ def test_trial_choice_model_serialization_roundtrip():
     clone = TrialChoiceModel.from_dict(model.to_dict())
     assert clone.digest == model.digest
     assert clone.version == "jev-causal/3"
-    assert clone.trials.version == "jev-trials/9"
+    assert clone.trials.version == "jev-trials/10"
 
 
 def test_improve_suppresses_trial_refuted_proposals(tmp_path):
@@ -1769,7 +1769,7 @@ def test_trials_cli_summarizes_and_resolves(tmp_path, capsys):
     assert main(["trials", str(path)]) == 0
     bare = json.loads(capsys.readouterr().out)
     assert bare["trials"]["cells"] > 0
-    assert bare["trials"]["version"] == "jev-trials/9"
+    assert bare["trials"]["version"] == "jev-trials/10"
     assert "resolved" not in bare  # no query asked, no pooled guess printed
 
     assert main([

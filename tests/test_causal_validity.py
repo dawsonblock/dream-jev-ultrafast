@@ -833,7 +833,7 @@ def test_v4_cells_migrate_to_split_coordinates():
         10, 8, 8, 2, 6.0, 8.0, 8.0, 8.0, 8.0,
     )
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/4", "cells": [v4]})
-    assert trials.version == "jev-trials/9"
+    assert trials.version == "jev-trials/10"
     cell = trials.cells[0]
     assert cell[0] == "flights" and cell[1] == ""
     assert cell[3] == "unknown" and cell[6] == "unknown"  # effect/rank wildcards
@@ -865,7 +865,7 @@ def test_v5_cells_migrate_with_zeroed_indeterminate_counter():
     v5 = (*key, *stats_v5, 1.0, 2.0, 0.5, *reasons_v5)
     assert len(v5) == 35
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/5", "cells": [v5]})
-    assert trials.version == "jev-trials/9"
+    assert trials.version == "jev-trials/10"
     cell = trials.cells[0]
     assert len(cell) == TRIAL_CELL_LEN
     # The v8 outcome-vector block is appended after the reason tail; the
@@ -1952,7 +1952,7 @@ def test_unmeasured_arms_report_null_not_zero():
     v7k = (*ctrl, *stats, *costs, *reasons)
     trials = CounterfactualTrials.from_dict(
         {"version": "jev-trials/7", "cells": [v7, v7k]})
-    assert trials.version == "jev-trials/9"
+    assert trials.version == "jev-trials/10"
     entry = next(iter(trials.estimate().values()))
     for arm in ("candidate", "control"):
         ov = entry[arm]["outcome_vector"]
@@ -2036,7 +2036,7 @@ def test_v8_roundtrip_preserves_outcome_counters():
                      stale_or_failure=1, risk_events=1, extra_transitions=2)
     trials = CounterfactualTrials.fit(events)
     clone = CounterfactualTrials.from_dict(trials.to_dict())
-    assert clone.version == "jev-trials/9"
+    assert clone.version == "jev-trials/10"
     assert clone.cells == trials.cells
     assert clone.estimate() == trials.estimate()
     ov = next(iter(clone.estimate().values()))["candidate"]["outcome_vector"]
@@ -2045,3 +2045,147 @@ def test_v8_roundtrip_preserves_outcome_counters():
     # assigned step (extra transitions stay clean).
     assert ov["safety"]["authority_touches"] == 1.0
     assert ov["safety"]["guard_failures"] == 1.0
+
+
+def test_registered_family_counts_declared_but_unobserved_hypotheses():
+    """Phase 5: a declaration outlives its analyzable cells.
+
+    A spliced run (two *distinct* assignments) is quarantined under
+    ``invalid_units`` and forms no cells — but it still declared a
+    hypothesis, so its context joins the registered family and pays into
+    ``hypothesis_count`` instead of vanishing from the error budget.
+    """
+    events = _trials("candidate", 10, 8, "c", task_family="f", site="h",
+                     proposal_effect="navigate")
+    events += _trials("control", 10, 4, "k", task_family="f", site="h",
+                      proposal_effect="navigate")
+    spliced_a = _trial_meta("sa", "candidate", task_family="f", site="h",
+                            proposal_effect="navigate", overlap=0)
+    spliced_b = _trial_meta("sb", "control", task_family="f", site="h",
+                            proposal_effect="navigate", overlap=0)
+    events += [
+        {"event": "run_started", "run_id": "splice", "task_key": "t",
+         "goal": "g", "task_family": "f"},
+        {"event": "experiment_assigned", "run_id": "splice", "task_key": "t",
+         "experiment": spliced_a},
+        {"event": "experiment_assigned", "run_id": "splice", "task_key": "t",
+         "experiment": spliced_b},
+        {"event": "run_finished", "run_id": "splice", "task_key": "t",
+         "status": "done", "verified": True},
+    ]
+    trials = CounterfactualTrials.fit(events)
+    assert trials.invalid_units == 1
+    summary = trials.hypothesis_summary
+    assert summary["observed"] == 1
+    assert summary["declared_unobserved"] == 1
+    assert summary["family_size"] == 2
+    entry = next(iter(trials.estimate().values()))
+    assert entry["hypothesis_count"] == 2
+    # The observed context was declared by both arms → a registered test.
+    assert entry["hypothesis_registered"] is True
+
+
+def test_rejected_and_post_terminal_declarations_still_pay_into_the_family():
+    """Malformed and post-terminal assignments cannot form cells, but they
+    still declared hypotheses — the family counts what was *tested*, not
+    just what was analyzable."""
+    events = _trials("candidate", 10, 8, "c", task_family="f", site="h",
+                     proposal_effect="navigate")
+    events += _trials("control", 10, 4, "k", task_family="f", site="h",
+                      proposal_effect="navigate")
+    bad_arm = _trial_meta("bad", "sideways", task_family="f", site="h",
+                          proposal_effect="navigate", overlap=0)
+    events += [
+        {"event": "run_started", "run_id": "bad", "task_key": "t",
+         "goal": "g", "task_family": "f"},
+        {"event": "experiment_assigned", "run_id": "bad", "task_key": "t",
+         "experiment": bad_arm},
+        {"event": "run_finished", "run_id": "bad", "task_key": "t",
+         "status": "done", "verified": True},
+    ]
+    # Post-terminal assignment: ordered after the run's terminal event —
+    # invalid as a unit, but its declaration still stands.
+    late = _trial_meta("late", "candidate", task_family="f", site="h",
+                       proposal_effect="navigate", overlap=2)
+    events += [
+        {"event": "run_started", "run_id": "late", "task_key": "t",
+         "goal": "g", "task_family": "f", "sequence": 0},
+        {"event": "run_finished", "run_id": "late", "task_key": "t",
+         "status": "done", "verified": True, "sequence": 1},
+        {"event": "experiment_assigned", "run_id": "late", "task_key": "t",
+         "experiment": late, "sequence": 2},
+    ]
+    trials = CounterfactualTrials.fit(events)
+    assert trials.rejected == 1
+    assert trials.invalid_units == 1
+    summary = trials.hypothesis_summary
+    assert summary["declared_unobserved"] == 2
+    assert summary["family_size"] == 3
+    # The rejected arm never claims a valid side of the comparison: the
+    # declared context cannot pretend to be a registered *comparison*.
+    declared_ctxs = {tuple(e[:14]) for e in trials.registered}
+    assert len(declared_ctxs) == 3
+    assert trials._registered_comparisons() == {
+        tuple(c[:14]) for c in trials.cells
+    }
+
+
+def test_unregistered_store_reports_exploratory_not_registered():
+    """Stores predating registration cannot prove preregistration: cells
+    keep the implicit family count and every contrast honestly reports
+    ``hypothesis_registered`` False rather than borrowing authority."""
+    events = _trials("candidate", 10, 8, "c", task_family="f",
+                     proposal_effect="navigate")
+    events += _trials("control", 10, 4, "k", task_family="f",
+                      proposal_effect="navigate")
+    trials = CounterfactualTrials.fit(events)
+    legacy = CounterfactualTrials.from_dict(
+        {"version": "jev-trials/9", "cells": trials.to_dict()["cells"]}
+    )
+    assert legacy.registered == ()
+    entry = next(iter(legacy.estimate().values()))
+    assert entry["hypothesis_registered"] is False
+    assert entry["hypothesis_count"] == 1  # cell-derived family, unchanged
+    assert legacy.hypothesis_summary["registered_comparisons"] == 0
+
+
+def test_registered_family_roundtrips():
+    events = _trials("candidate", 10, 8, "c", task_family="f", site="h",
+                     proposal_effect="navigate")
+    events += _trials("control", 10, 4, "k", task_family="f", site="h",
+                      proposal_effect="navigate")
+    trials = CounterfactualTrials.fit(events)
+    clone = CounterfactualTrials.from_dict(trials.to_dict())
+    assert clone.registered == trials.registered
+    assert clone.hypothesis_summary == trials.hypothesis_summary
+    assert clone.estimate() == trials.estimate()
+
+
+def test_resolve_reports_preregistration_status():
+    """A supported fresh contrast is a preregistered comparison; the same
+    cells in a legacy store answer identically but cannot claim it."""
+    def _events():
+        ev = _trials("candidate", 20, 18, "c", task_family="f", site="h",
+                     proposal_effect="navigate")
+        ev += _trials("control", 20, 6, "k", task_family="f", site="h",
+                      proposal_effect="navigate")
+        return ev
+
+    trials = CounterfactualTrials.fit(_events())
+    estimate = trials.resolve(
+        task_family="f", site="h", model_kind="click", model_overlap=0,
+        model_rank=1, proposal_kind="click", proposal_overlap=1,
+        proposal_rank=0, proposal_effect="navigate",
+    )
+    assert estimate["support_sufficient"] is True
+    assert estimate["hypothesis_registered"] is True
+    legacy = CounterfactualTrials.from_dict(
+        {"version": "jev-trials/9", "cells": trials.to_dict()["cells"]}
+    )
+    legacy_estimate = legacy.resolve(
+        task_family="f", site="h", model_kind="click", model_overlap=0,
+        model_rank=1, proposal_kind="click", proposal_overlap=1,
+        proposal_rank=0, proposal_effect="navigate",
+    )
+    assert legacy_estimate["effect_status"] == estimate["effect_status"]
+    assert legacy_estimate["hypothesis_registered"] is False

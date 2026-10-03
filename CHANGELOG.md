@@ -48,6 +48,21 @@ ambiguity, all fixed inside the existing causal layer:
   `generalization_level`): an *unsupported* pooled contrast is now
   honestly `pooled_randomized`/`insufficient` rather than wearing the
   context-specific `randomized` label.
+- **Multiplicity is now an explicit registered family, not inferred cell
+  count** (`jev-trials/10`). Every parseable `experiment_assigned` record
+  registers its hypothesis context *before* outcomes are observed —
+  including declarations whose units were later quarantined
+  (`invalid_units`), rejected as malformed, or fully censored — and
+  `hypothesis_count` (the Bonferroni denominator behind every confidence
+  sequence) is the registered contexts unioned with observed cells. A
+  declared-but-unanalyzable test therefore still pays its share of α
+  instead of silently disappearing from the error budget. Contrasts
+  report `hypothesis_registered` — both arms declared the answering
+  context (every contributing context, when backoff merges several) — as
+  preregistration provenance, and `CounterfactualTrials.hypothesis_summary`
+  exposes the declared/observed/unobserved bookkeeping. Stores written
+  before registration existed keep the cell-derived family and report
+  `hypothesis_registered: False` rather than borrowing authority.
 
 ## v0.9.2 — adversarial-page authority binding
 

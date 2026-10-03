@@ -342,7 +342,18 @@ class CounterfactualTrials:
     # propensity outside (0, 1], or runless events that cannot form a
     # validated experimental unit at all.
     rejected: int = 0
-    version: str = "jev-trials/9"
+    # Registered hypothesis family (Phase 5): ``(trial-context, arm)``
+    # tuples declared by every parseable ``experiment_assigned`` record —
+    # *including* declarations whose units were later quarantined
+    # (``invalid_units``), rejected as malformed, or fully censored. The
+    # assignment event precedes the outcome by construction, so it is the
+    # preregistration record: a declared-but-unanalyzable test is still a
+    # test that was run, and it pays its share of the family error budget
+    # instead of vanishing from the denominator. Multiplicity is computed
+    # over this registered union with observed cells, never cell count
+    # alone.
+    registered: tuple[tuple, ...] = ()
+    version: str = "jev-trials/10"
 
     MIN_ESS = 8.0
     MIN_EFFECT = 0.0
@@ -362,9 +373,30 @@ class CounterfactualTrials:
                 loose.append(event)
         acc: dict[tuple, list] = {}
         action_entries: set[tuple] = set()
+        registered_entries: set[tuple] = set()
         duplicates = 0
         invalid_units = 0
         rejected = 0
+
+        def _declare(meta, transition):
+            """Register the hypothesis an assignment declared, before outcomes.
+
+            The assignment record is written before the run's result is
+            observed — it *is* the preregistration. Declarations are
+            collected for every parseable assignment, including units later
+            quarantined or censored: a test that ran and produced no
+            usable cells still consumed a slot in the family error budget.
+            A meta whose context cannot be extracted at all cannot name a
+            hypothesis and is simply not declarable.
+            """
+            try:
+                context = _trial_context(meta, transition)
+            except (TypeError, ValueError, AttributeError):
+                return
+            arm = str(meta.get("arm") or "")
+            registered_entries.add(
+                (*context, arm if arm in {"candidate", "control"} else "invalid")
+            )
 
         def _proposal_action_key(meta: dict, transition: dict | None) -> str | None:
             """The exact-action identity of the assigned proposal, if known.
@@ -410,6 +442,9 @@ class CounterfactualTrials:
             used only for the multi-objective utility annotation and the
             structured secondary/safety report.
             """
+            # Declare before validating: the assignment event registered
+            # the hypothesis even if the record proves malformed below.
+            _declare(meta, transition)
             arm = str(meta.get("arm") or "")
             try:
                 propensity = float(meta.get("assignment_probability"))
@@ -526,7 +561,11 @@ class CounterfactualTrials:
                 # run mean the producer invariant broke or evidence was
                 # spliced together; counting both arms against one final
                 # outcome would fabricate a trial that never happened. The
-                # whole unit is quarantined, not partially analyzed.
+                # whole unit is quarantined, not partially analyzed — but
+                # each spliced assignment still declared a hypothesis, so
+                # each pays into the registered family.
+                for _assigned_event, declared_meta in distinct:
+                    _declare(declared_meta, None)
                 invalid_units += 1
                 continue
             if distinct:
@@ -534,7 +573,9 @@ class CounterfactualTrials:
                 if final is not None and _post_terminal(assigned_event, final):
                     # An assignment ordered after the run's terminal event is
                     # not a trial of that run — it cannot have produced the
-                    # outcome it would be credited with. The unit is invalid.
+                    # outcome it would be credited with. The unit is invalid;
+                    # its declaration still stands.
+                    _declare(meta, None)
                     invalid_units += 1
                     continue
                 step = cls._execution_step(meta, trial_steps)
@@ -589,7 +630,54 @@ class CounterfactualTrials:
             action_index=tuple(sorted(action_entries)),
             invalid_units=invalid_units,
             rejected=rejected,
+            registered=tuple(sorted(registered_entries)),
         )
+
+    def _registered_arms(self) -> dict[tuple, set]:
+        """Declared arms per context — the explicit hypothesis family."""
+        arms: dict[tuple, set] = {}
+        for entry in self.registered:
+            ctx = tuple(entry[: _TRIAL_KEY_LEN - 1])
+            arms.setdefault(ctx, set()).add(entry[_TRIAL_KEY_LEN - 1])
+        return arms
+
+    def _registered_comparisons(self) -> set[tuple]:
+        """Contexts where both arms were declared — a preregistered test."""
+        return {
+            ctx
+            for ctx, arms in self._registered_arms().items()
+            if {"candidate", "control"} <= arms
+        }
+
+    def _hypothesis_count(self) -> int:
+        """The multiplicity family: registered ∪ observed contexts.
+
+        Registered declarations that produced no analyzable cells still
+        count — the test was declared and run; only the record of what it
+        declared survives. Stores built before registration existed fall
+        back to the cell count alone (the previous implicit family), which
+        is exactly the registered-empty case.
+        """
+        return len(
+            {tuple(entry[: _TRIAL_KEY_LEN - 1]) for entry in self.registered}
+            | {tuple(cell[: _TRIAL_KEY_LEN - 1]) for cell in self.cells}
+        )
+
+    @property
+    def hypothesis_summary(self) -> dict:
+        """Registration diagnostics: declared family vs analyzed cells."""
+        registered_ctxs = {
+            tuple(entry[: _TRIAL_KEY_LEN - 1]) for entry in self.registered
+        }
+        cell_ctxs = {tuple(cell[: _TRIAL_KEY_LEN - 1]) for cell in self.cells}
+        return {
+            "declared": len(registered_ctxs),
+            "registered_comparisons": len(self._registered_comparisons()),
+            "observed": len(cell_ctxs),
+            "declared_unobserved": len(registered_ctxs - cell_ctxs),
+            "unregistered_observed": len(cell_ctxs - registered_ctxs),
+            "family_size": self._hypothesis_count(),
+        }
 
     @staticmethod
     def _execution_step(meta: dict, trial_steps: list[dict]) -> dict | None:
@@ -664,12 +752,18 @@ class CounterfactualTrials:
             slot = bucket.setdefault(arm, [0] * TRIAL_COUNT_LEN)
             for i, v in enumerate(cell[_TRIAL_KEY_LEN:]):
                 slot[i] += v
-        # Multiplicity is over every tracked hypothesis, not just the ones
-        # this report happens to print — a filtered view does not shrink the
-        # family that is actually being watched.
-        hypothesis_count = len({tuple(cell[:_TRIAL_KEY_LEN - 1]) for cell in self.cells})
+        # Multiplicity is over every tracked hypothesis — the registered
+        # family ∪ observed cells — not just the ones this report happens
+        # to print; a filtered view does not shrink the family that is
+        # actually being watched.
+        hypothesis_count = self._hypothesis_count()
+        registered = self._registered_comparisons()
         for ctx, bucket in grouped.items():
-            arms["|".join(ctx)] = self._contrast(bucket, hypothesis_count=hypothesis_count)
+            arms["|".join(ctx)] = self._contrast(
+                bucket,
+                hypothesis_count=hypothesis_count,
+                hypothesis_registered=ctx in registered,
+            )
         return arms
 
     @staticmethod
@@ -802,6 +896,7 @@ class CounterfactualTrials:
         min_effect=None,
         weights=None,
         hypothesis_count: int = 1,
+        hypothesis_registered: bool = False,
     ) -> dict:
         """Per-arm estimates plus the candidate−control contrast.
 
@@ -814,11 +909,17 @@ class CounterfactualTrials:
         subtler case where balanced censoring could still flip the sign.
 
         ``hypothesis_count`` is the number of simultaneously tracked
-        divergences; the family's ``SEQUENTIAL_ALPHA`` is Bonferroni-split
-        across them before the per-look spending is applied, so no fleet of
-        parallel hypotheses can inflate the false-establishment rate.
+        divergences — the *registered* family unioned with observed cells;
+        the family's ``SEQUENTIAL_ALPHA`` is Bonferroni-split across them
+        before the per-look spending is applied, so no fleet of parallel
+        hypotheses can inflate the false-establishment rate.
+        ``hypothesis_registered`` reports whether the comparison being
+        contrasted was itself declared by both arms — preregistration
+        provenance, not a gate: randomized assignment precedes outcome by
+        construction, but legacy stores cannot prove their declarations.
         """
         entry = {arm: cls._arm_entry(counts) for arm, counts in bucket.items()}
+        entry["hypothesis_registered"] = bool(hypothesis_registered)
         if "candidate" not in entry or "control" not in entry:
             return entry
         candidate, control = entry["candidate"], entry["control"]
@@ -1145,9 +1246,12 @@ class CounterfactualTrials:
             levels.append("family")
         levels.append("pooled")
         fallback = None
+        hypothesis_count = self._hypothesis_count()
+        registered_comparisons = self._registered_comparisons()
         for level in levels:
             for signature_level, enforced in masks:
                 bucket: dict[str, list] = {}
+                contributing: set[tuple] = set()
                 for cell in self.cells:
                     if not self._stratum_matches(cell, level, family, host):
                         continue
@@ -1157,6 +1261,7 @@ class CounterfactualTrials:
                     slot = bucket.setdefault(arm, [0] * TRIAL_COUNT_LEN)
                     for i, v in enumerate(cell[_TRIAL_KEY_LEN:]):
                         slot[i] += v
+                    contributing.add(tuple(cell[: _TRIAL_KEY_LEN - 1]))
                 if not bucket:
                     continue
                 if "candidate" not in bucket or "control" not in bucket:
@@ -1170,9 +1275,14 @@ class CounterfactualTrials:
                         bucket,
                         min_effect=min_effect,
                         weights=weights,
-                        hypothesis_count=len(
-                            {tuple(cell[:_TRIAL_KEY_LEN - 1]) for cell in self.cells}
-                        ),
+                        hypothesis_count=hypothesis_count,
+                        # A backoff contrast is a preregistered comparison
+                        # only when *every* context folded into it was
+                        # declared by both arms — a merged contrast that
+                        # draws on even one undeclared context is partly
+                        # post-hoc and says so.
+                        hypothesis_registered=bool(contributing)
+                        and contributing <= registered_comparisons,
                     ),
                     "level": level,
                     "signature_level": signature_level,
@@ -1238,12 +1348,22 @@ class CounterfactualTrials:
                   for i, v in enumerate(entry))
             for entry in payload.get("action_index", ())
         )
+        # Registration history is not recoverable post-hoc: stores written
+        # before ``registered`` existed simply have no declarations — the
+        # multiplicity family falls back to observed cells, and every
+        # contrast honestly reports ``hypothesis_registered: False``.
+        registered = tuple(
+            tuple(str(v).replace("|", " ") if i < _TRIAL_KEY_LEN - 1 else v
+                  for i, v in enumerate(entry))
+            for entry in payload.get("registered", ())
+        )
         return cls(
             cells=cells,
             duplicates=int(payload.get("duplicates", 0) or 0),
             action_index=action_index,
             invalid_units=int(payload.get("invalid_units", 0) or 0),
             rejected=int(payload.get("rejected", 0) or 0),
+            registered=registered,
             version=version,
         )
 
@@ -1477,6 +1597,8 @@ class TrialChoiceModel:
             "action_randomized_anywhere": estimate.get("action_randomized_anywhere"),
             "action_randomized_in_context": estimate.get("action_randomized_in_context"),
             "action_key": estimate.get("action_key"),
+            "hypothesis_registered": estimate.get("hypothesis_registered"),
+            "hypothesis_count": estimate.get("hypothesis_count"),
             # Provenance: this prediction comes only from randomized evidence.
             "source": "randomized",
         }
@@ -1566,6 +1688,8 @@ class TrialChoiceModel:
             "generalization_level": estimate.get("generalization_level"),
             "exact_action_randomized": estimate.get("exact_action_randomized"),
             "action_key": estimate.get("action_key"),
+            "hypothesis_registered": estimate.get("hypothesis_registered"),
+            "hypothesis_count": estimate.get("hypothesis_count"),
             "source": "randomized",
         }
 
@@ -1662,6 +1786,8 @@ class TrialChoiceModel:
                 "action_randomized_anywhere": estimate.get("action_randomized_anywhere"),
                 "action_randomized_in_context": estimate.get("action_randomized_in_context"),
                 "action_key": estimate.get("action_key"),
+                "hypothesis_registered": estimate.get("hypothesis_registered"),
+                "hypothesis_count": estimate.get("hypothesis_count"),
                 "source": "randomized",
                 "_tier": tiers.get(status, 3),
             })

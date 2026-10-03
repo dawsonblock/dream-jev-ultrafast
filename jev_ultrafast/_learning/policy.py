@@ -259,6 +259,10 @@ class CausalChoicePolicy:
                 "action_randomized_in_context": (
                     causal_entry or {}
                 ).get("action_randomized_in_context"),
+                "hypothesis_registered": (causal_entry or {}).get(
+                    "hypothesis_registered"
+                ),
+                "hypothesis_count": (causal_entry or {}).get("hypothesis_count"),
                 "causal": causal_entry,
                 "observational": observational,
                 "execution_blocker": blocker,
@@ -456,6 +460,8 @@ class CausalChoicePolicy:
             "exact_action_randomized": causal.get("exact_action_randomized"),
             "action_randomized_anywhere": causal.get("action_randomized_anywhere"),
             "action_randomized_in_context": causal.get("action_randomized_in_context"),
+            "hypothesis_registered": causal.get("hypothesis_registered"),
+            "hypothesis_count": causal.get("hypothesis_count"),
             "evidence_origin": top.get("evidence_origin"),
             "support_status": top.get("support_status"),
             "deployment_score": top.get("deployment_score"),
