@@ -70,7 +70,9 @@ def _trial_run(run_id, arm, *, success=True, propensity=0.5, kind="click",
                model_kind="click", overlap=1, model_overlap=0, status=None,
                verified=None, executed=True, task_family=None, site=None,
                reason=None, proposal_effect=None, model_effect=None,
-               latency_ms=0, tokens=0, approvals=0, duplicate=False):
+               latency_ms=0, tokens=0, approvals=0, duplicate=False,
+               page_changed=True, stale_or_failure=0, risk_events=0,
+               extra_transitions=0, extra_risk_events=0, extra_stale=0):
     """One randomized trial as a complete run (see test_learned's builder)."""
     meta = _trial_meta(
         run_id, arm, propensity=propensity, kind=kind, model_kind=model_kind,
@@ -91,14 +93,31 @@ def _trial_run(run_id, arm, *, success=True, propensity=0.5, kind="click",
                 {"id": meta["model_choice_id"], "kind": model_kind, "label": "M",
                  "goal_overlap": model_overlap},
             ],
-            "page_changed": True,
+            "page_changed": page_changed,
             "latency_ms": latency_ms,
             "model_calls": 1,
             "tokens": tokens,
-            "stale_or_failure": 0,
-            "risk_events": 0,
+            "stale_or_failure": stale_or_failure,
+            "risk_events": risk_events,
             "experiment": meta,
         })
+        # Untagged extra transitions extend the run's real trajectory —
+        # they count toward steps/cost/authority markers without being the
+        # assigned step itself.
+        for _ in range(int(extra_transitions)):
+            transitions.append({
+                "event": "transition",
+                "state": "S",
+                "next_state": "D",
+                "selected": {"id": f"aux{run_id}", "kind": kind},
+                "candidates": [],
+                "page_changed": False,
+                "latency_ms": 0,
+                "model_calls": 1,
+                "tokens": 0,
+                "stale_or_failure": extra_stale,
+                "risk_events": extra_risk_events,
+            })
     finished = {"event": "run_finished", "run_id": run_id, "task_key": "t",
                 "status": status or ("done" if success else "blocked"),
                 "verified": success if verified is None else verified}
@@ -499,11 +518,15 @@ def test_v4_cells_migrate_to_split_coordinates():
         10, 8, 8, 2, 6.0, 8.0, 8.0, 8.0, 8.0,
     )
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/4", "cells": [v4]})
-    assert trials.version == "jev-trials/7"
+    assert trials.version == "jev-trials/8"
     cell = trials.cells[0]
     assert cell[0] == "flights" and cell[1] == ""
     assert cell[3] == "unknown" and cell[6] == "unknown"  # effect/rank wildcards
-    assert cell[-1] == 2  # unknown_abort count survived
+    # v8 appends the outcome-vector block after the reason tail — the last
+    # reason counter sits at -1-_OUTCOME_STATS, so read the tail explicitly.
+    from jev_ultrafast.dreamlearn import _REASON_BASE, TERMINATION_REASONS
+    reasons = cell[_REASON_BASE:_REASON_BASE + len(TERMINATION_REASONS)]
+    assert reasons[-1] == 2  # unknown_abort count survived
     entry = trials.estimate()[next(iter(trials.estimate()))]["candidate"]
     assert entry["assigned"] == 10 and entry["trials"] == 8 and entry["censored"] == 2
 
@@ -514,7 +537,9 @@ def test_v5_cells_migrate_with_zeroed_indeterminate_counter():
     statistic starts empty for imputation, and every recorded verdict —
     including the unverified_claim counter that used to sit at the same tail
     position — keeps its count."""
-    from jev_ultrafast.dreamlearn import TERMINATION_REASONS, TRIAL_CELL_LEN
+    from jev_ultrafast.dreamlearn import (
+        _REASON_BASE, TERMINATION_REASONS, TRIAL_CELL_LEN,
+    )
 
     reasons_v5 = [0, 1, 0, 0, 0, 0, 3, 2]  # v5 tail order, ending unverified/unknown
     key = ("flights", "example.test", "click", "navigate", "button", "0", "0-4", "0-2",
@@ -523,10 +548,12 @@ def test_v5_cells_migrate_with_zeroed_indeterminate_counter():
     v5 = (*key, *stats_v5, 1.0, 2.0, 0.5, *reasons_v5)
     assert len(v5) == 35
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/5", "cells": [v5]})
-    assert trials.version == "jev-trials/7"
+    assert trials.version == "jev-trials/8"
     cell = trials.cells[0]
     assert len(cell) == TRIAL_CELL_LEN
-    tail = cell[-len(TERMINATION_REASONS):]
+    # The v8 outcome-vector block is appended after the reason tail; the
+    # reasons themselves keep their v7 positions.
+    tail = cell[_REASON_BASE:_REASON_BASE + len(TERMINATION_REASONS)]
     names = list(TERMINATION_REASONS)
     assert tail[names.index("indeterminate_execution")] == 0
     assert tail[names.index("unverified_claim")] == 3
@@ -1390,3 +1417,223 @@ def test_active_trial_levels_reject_unknown_strings():
     # An explicit operator may still widen the list — modes are configuration
     # — but only with real level names.
     CausalChoicePolicy(mode="active", active_trial_levels=("family", "pooled"))
+
+
+# ==================================================== hierarchical outcomes
+#
+# jev-outcome-vector/1: the primary endpoint stays verified run success under
+# ITT. Secondary endpoints carry diagnostics and vetoes; safety endpoints are
+# constraints, never utility.
+
+
+def test_outcome_vector_schema_and_coverage():
+    """Every arm report carries the versioned outcome vector. Fresh v8 cells
+    report coverage 1 (the fields were actually recorded); the primary block
+    restates — never replaces — the top-level endpoint."""
+    entry = _cell(_trials("candidate", 10, 8, "c") + _trials("control", 10, 4, "k"))
+    for arm in ("candidate", "control"):
+        ov = entry[arm]["outcome_vector"]
+        assert ov["schema"] == "jev-outcome-vector/1"
+        assert ov["coverage"] == 1.0
+        assert ov["primary"]["verified_success"] == entry[arm]["p_success"]
+        assert set(ov["secondary"]) == {"verified_transition", "recovery", "steps"}
+        assert set(ov["cost"]) == {"latency_ms", "tokens", "approvals"}
+        assert set(ov["safety"]) == {
+            "authority_touches", "guard_failures", "indeterminate_rate"}
+    assert entry["safety"]["regression"] is False
+    assert set(entry["secondary_delta"]) == {
+        "verified_transition", "recovery", "steps"}
+
+
+def test_local_progress_with_unrelated_failure_is_not_promoted():
+    """Scenario: the assigned step reliably moved the page (verified
+    transition) but the runs all failed for unrelated reasons. The primary
+    endpoint must dominate — the divergence is refuted, not promoted — while
+    the secondary channel still shows the mechanism firing."""
+    # Every candidate run: step executed and changed the page, run blocked.
+    events = (
+        _trials("candidate", 20, 0, "c", task_family="f", page_changed=True)
+        + _trials("control", 20, 0, "k", task_family="f", page_changed=False)
+    )
+    entry = _cell(events, family="f")
+    assert entry["candidate"]["outcome_vector"]["secondary"]["verified_transition"]["p"] == 1.0
+    assert entry["control"]["outcome_vector"]["secondary"]["verified_transition"]["p"] == 0.0
+    assert entry["secondary_delta"]["verified_transition"]["delta"] == 1.0
+    # Both arms scored 0 on the primary endpoint — no effect is established,
+    # and nothing about the secondary progress rescues it.
+    assert entry["effect_status"] == "unresolved"
+    model = TrialChoiceModel.fit(events)
+    assert model.rank(_CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f")
+
+
+def test_inert_step_with_accidental_success_stays_separate():
+    """Scenario: the assigned step never changed the page but the runs
+    succeeded anyway (the success came from elsewhere in the trajectory).
+    The secondary transition channel records 0 — mechanism and outcome are
+    reported independently."""
+    events = (
+        _trials("candidate", 24, 24, "c", task_family="f", page_changed=False)
+        + _trials("control", 24, 0, "k", task_family="f", page_changed=False)
+    )
+    entry = _cell(events, family="f")
+    assert entry["candidate"]["outcome_vector"]["secondary"]["verified_transition"]["p"] == 0.0
+    assert entry["secondary_delta"]["verified_transition"]["delta"] == 0.0
+    assert entry["effect_status"] == "beneficial"  # primary still governs
+
+
+def test_latency_gain_cannot_compensate_success_regression():
+    """Scenario: the candidate is much faster but fails more. The cost block
+    reports the speed gain *and* the primary endpoint stays harmful — a
+    report reader sees both, and the prior never proposes the arm."""
+    events = (
+        _trials("candidate", 24, 0, "c", task_family="f", latency_ms=10)
+        + _trials("control", 24, 24, "k", task_family="f", latency_ms=500)
+    )
+    entry = _cell(events, family="f")
+    assert entry["effect_status"] == "harmful"
+    cand = entry["candidate"]["outcome_vector"]
+    ctrl = entry["control"]["outcome_vector"]
+    assert cand["cost"]["latency_ms"] < ctrl["cost"]["latency_ms"]
+    model = TrialChoiceModel.fit(events)
+    assert model.rank(_CANDIDATES, model_choice=_MODEL_CHOICE,
+                      task_family="f") == []
+
+
+def test_success_gain_with_authority_burden_is_a_safety_regression():
+    """Scenario: the candidate wins on the primary endpoint but every
+    execution consumed an authority-plane approval. Safety is a constraint:
+    the regression is flagged on the contrast, active execution is blocked
+    with ``safety_regression``, and canary refuses to nominate the arm —
+    success cannot buy off an authority regression."""
+    events = (
+        _trials("candidate", 24, 24, "c", task_family="f", risk_events=1)
+        + _trials("control", 24, 0, "k", task_family="f", risk_events=0)
+    )
+    entry = _cell(events, family="f")
+    assert entry["effect_status"] == "beneficial"
+    assert entry["safety"]["regression"] is True
+    assert "authority_touches" in entry["safety"]["regressions"]
+    model = TrialChoiceModel.fit(events)
+    ranked = model.rank(_CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f")
+    assert ranked[0]["safety_regression"] is True
+    active = CausalChoicePolicy(mode="active", trial_model=model)
+    ent = _active_entry(active, task_family="f")
+    assert ent["execution_blocker"] == "safety_regression"
+    assert ent["executable"] is False
+    assert active.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE,
+                           task_family="f") is None
+    canary = CausalChoicePolicy(mode="canary", trial_model=model)
+    assert canary.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE,
+                           task_family="f") is None
+
+
+def test_unmeasured_arms_report_null_not_zero():
+    """Scenario: cells migrated from jev-trials/7 never recorded outcome
+    fields. Secondary and safety endpoints must report ``None`` — a migrated
+    zero is absence of evidence, not a measured zero — and the safety
+    verdict is unknown, not clean."""
+    from jev_ultrafast.dreamlearn import _REASON_BASE, TERMINATION_REASONS
+    key = ("f", "s", "click", "navigate", "button", "0", "0-4", "0-2",
+           "click", "navigate", "link", "1", "0-4", "0-2", "candidate")
+    stats = [10, 10, 10, 0, 9.0, 10.0, 10.0, 10.0, 10.0, 0.0]
+    costs = [30.0, 40.0, 2.0]
+    reasons = [0] * len(TERMINATION_REASONS)
+    v7 = (*key, *stats, *costs, *reasons)
+    assert len(v7) == 37
+    ctrl = (*key[:-1], "control")
+    v7k = (*ctrl, *stats, *costs, *reasons)
+    trials = CounterfactualTrials.from_dict(
+        {"version": "jev-trials/7", "cells": [v7, v7k]})
+    assert trials.version == "jev-trials/8"
+    entry = next(iter(trials.estimate().values()))
+    for arm in ("candidate", "control"):
+        ov = entry[arm]["outcome_vector"]
+        assert ov["coverage"] == 0.0
+        assert ov["secondary"]["verified_transition"]["p"] is None
+        assert ov["secondary"]["verified_transition"]["ci"] is None
+        assert ov["secondary"]["steps"]["mean"] is None
+        assert ov["safety"]["authority_touches"] is None
+        assert ov["safety"]["guard_failures"] is None
+    assert entry["secondary_delta"]["verified_transition"]["delta"] is None
+    assert entry["safety"]["regression"] is None  # unknown, not clean
+
+
+def test_differential_censoring_excludes_secondary_mass_too():
+    """Scenario: candidate arm heavily censored by crash terminations. The
+    censored mass counts toward no endpoint — secondary counters come from
+    analyzed runs only — and the imbalance veto still holds."""
+    events = _trials("candidate", 16, 16, "c", task_family="f", page_changed=True)
+    for i in range(16):
+        events += _trial_run(f"cx{i}", "candidate", status="aborted",
+                             verified=False, executed=False,
+                             reason="browser_crash", task_family="f")
+    events += _trials("control", 16, 4, "k", task_family="f",
+                      page_changed=False)
+    for i in range(2):
+        events += _trial_run(f"kx{i}", "control", status="aborted",
+                             verified=False, executed=False,
+                             reason="operator_cancel", task_family="f")
+    entry = _cell(events, family="f")
+    assert entry["censoring_imbalance"] is True
+    assert entry["effect_status"] == "unresolved"
+    assert entry["unresolved_reason"] == "censoring_imbalance"
+    # The 16 analyzed candidate runs still carry their measured transitions.
+    assert entry["candidate"]["outcome_vector"]["coverage"] == 1.0
+
+
+def test_secondary_delta_never_establishes():
+    """Scenario: a secondary endpoint's fixed-sample CI excludes zero under
+    optional-stopping-shaped data — that must not touch the primary
+    establishment machinery. ``establishment`` is pinned False and
+    ``effect_status`` is decided only by the primary confidence sequence."""
+    events = (
+        _trials("candidate", 12, 6, "c", task_family="f", page_changed=True)
+        + _trials("control", 12, 6, "k", task_family="f", page_changed=False)
+    )
+    entry = _cell(events, family="f")
+    vt = entry["secondary_delta"]["verified_transition"]
+    assert vt["ci"][0] > 0.0  # the secondary contrast IS lopsided
+    assert vt["establishment"] is False
+    assert entry["secondary_delta"]["recovery"]["establishment"] is False
+    assert entry["secondary_delta"]["steps"]["establishment"] is False
+    # And the primary endpoint, dead even, stays unresolved — secondary
+    # certainty cannot leak into it.
+    assert entry["effect_status"] == "unresolved"
+
+
+def test_recovery_endpoint_counts_stale_marker_then_success():
+    """A run that recorded guard-failure markers yet still verified done is
+    a measured recovery — distinct from a clean success."""
+    events = (
+        _trials("candidate", 16, 12, "c", task_family="f",
+                stale_or_failure=1)
+        + _trials("control", 16, 8, "k", task_family="f")
+    )
+    entry = _cell(events, family="f")
+    cand = entry["candidate"]["outcome_vector"]
+    assert cand["secondary"]["recovery"]["p"] == 0.75
+    assert cand["safety"]["guard_failures"] == 1.0
+    # Control had no guard failures and no recoveries.
+    assert entry["control"]["outcome_vector"]["safety"]["guard_failures"] == 0.0
+    # A guard-failure burden on the candidate is a safety regression —
+    # the candidate recovered often, but recovering from a self-inflicted
+    # guard failure is not a free lunch.
+    assert "guard_failures" in entry["safety"]["regressions"]
+    assert entry["safety"]["regression"] is True
+
+
+def test_v8_roundtrip_preserves_outcome_counters():
+    """fit → to_dict → from_dict must round-trip the appended outcome block."""
+    events = _trials("candidate", 10, 8, "c", task_family="f",
+                     stale_or_failure=1, risk_events=1, extra_transitions=2)
+    trials = CounterfactualTrials.fit(events)
+    clone = CounterfactualTrials.from_dict(trials.to_dict())
+    assert clone.version == "jev-trials/8"
+    assert clone.cells == trials.cells
+    assert clone.estimate() == trials.estimate()
+    ov = next(iter(clone.estimate().values()))["candidate"]["outcome_vector"]
+    assert ov["secondary"]["steps"]["mean"] == 3.0
+    # One authority touch and one guard failure per run — only on the
+    # assigned step (extra transitions stay clean).
+    assert ov["safety"]["authority_touches"] == 1.0
+    assert ov["safety"]["guard_failures"] == 1.0

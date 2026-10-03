@@ -39,6 +39,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     'CounterfactualTrials',
+    'OUTCOME_VECTOR_SCHEMA',
     'TRIAL_CELL_LEN',
     'TRIAL_COUNT_LEN',
     'TrialChoiceModel',
@@ -109,13 +110,24 @@ _COST_BASE = _TRIAL_KEY_LEN + _TRIAL_STATS
 _REASON_BASE = _COST_BASE + _TRIAL_COSTS
 
 
-TRIAL_CELL_LEN = _REASON_BASE + len(TERMINATION_REASONS)
-
-
-TRIAL_COUNT_LEN = TRIAL_CELL_LEN - _TRIAL_KEY_LEN
-
-
 _COUNT_REASON_BASE = _REASON_BASE - _TRIAL_KEY_LEN
+
+
+# jev-trials/8 outcome-vector block: appended *after* the reason tail so every
+# v7 counter index is unchanged. Six weighted counters per analyzed
+# assignment — measured mass (how much of the analyzed pool actually carried
+# outcome fields), verified transitions, steps used, recoveries, authority
+# touches, and guard failures.
+_COUNT_OUTCOME_BASE = _COUNT_REASON_BASE + len(TERMINATION_REASONS)
+
+
+_OUTCOME_STATS = 6
+
+
+TRIAL_COUNT_LEN = _COUNT_OUTCOME_BASE + _OUTCOME_STATS
+
+
+TRIAL_CELL_LEN = _TRIAL_KEY_LEN + TRIAL_COUNT_LEN
 
 
 _V4_CELL_LEN = 15
@@ -125,6 +137,12 @@ _V5_CELL_LEN = 35
 
 
 _V6_CELL_LEN = 36
+
+
+_V7_CELL_LEN = 37
+
+
+OUTCOME_VECTOR_SCHEMA = "jev-outcome-vector/1"
 
 
 def _migrate_v4_trial_cells(cells) -> tuple[tuple, ...]:
@@ -195,6 +213,19 @@ def _migrate_v6_trial_cells(cells) -> tuple[tuple, ...]:
         tuple(cell[:insert_at]) + (0.0,) + tuple(cell[insert_at:])
         for cell in cells
     )
+
+
+def _migrate_v7_trial_cells(cells) -> tuple[tuple, ...]:
+    """v7 cells → v8: the outcome-vector block appended after the reason tail.
+
+    v8 records per-assignment weighted counters for the structured
+    ``jev-outcome-vector/1`` secondary and safety endpoints. A v7 cell never
+    measured them — every migrated slot is ``0.0`` (never an invented
+    value), and because the first counter is the *measured* mass itself, a
+    migrated arm reports ``coverage: 0`` and ``None``-valued secondary and
+    safety rates rather than confident zeros.
+    """
+    return tuple(tuple(cell) + (0.0,) * _OUTCOME_STATS for cell in cells)
 
 
 @dataclass(frozen=True)
@@ -293,7 +324,7 @@ class CounterfactualTrials:
     # analysis, and counting it twice would double-weight that arm. Reported
     # so corruption stays visible instead of silently biasing an estimate.
     duplicates: int = 0
-    version: str = "jev-trials/7"
+    version: str = "jev-trials/8"
 
     MIN_ESS = 8.0
     MIN_EFFECT = 0.0
@@ -321,8 +352,10 @@ class CounterfactualTrials:
             trial never reached the browser); ``outcome`` is the run's class —
             censored assignments are tallied with their termination reason but
             carry no endpoint weight. ``run_costs`` are the run's latency,
-            tokens, and approval count, used only for the multi-objective
-            utility annotation.
+            tokens, and approval count, plus the run-level outcome-vector
+            signals (steps used, guard-failure markers, authority touches),
+            used only for the multi-objective utility annotation and the
+            structured secondary/safety report.
             """
             arm = str(meta.get("arm") or "")
             try:
@@ -353,10 +386,28 @@ class CounterfactualTrials:
             cell[4] += float(outcome == "success") * weight
             cell[5] += weight
             cell[6] += weight * weight
-            latency, tokens, approvals = run_costs
+            latency, tokens, approvals, steps, guard_failures, authority_touches = run_costs
             cell[10] += latency * weight
             cell[11] += tokens * weight
             cell[12] += approvals * weight
+            # jev-outcome-vector/1 counters (appended block; indices stable
+            # across the v7→v8 migration because they sit past the reason
+            # tail). ``measured`` records that this analyzed run actually
+            # carried outcome fields — a migrated v7 arm reports zero mass
+            # here and surfaces ``coverage: 0`` instead of fabricated rates.
+            cell[_COUNT_OUTCOME_BASE] += weight
+            # Verified state transition under ITT: the assigned step executed
+            # and the page moved. An assigned-but-unexecuted arm contributes
+            # 0 — its trajectory is the treatment being measured.
+            cell[_COUNT_OUTCOME_BASE + 1] += float(bool(page_changed)) * weight
+            cell[_COUNT_OUTCOME_BASE + 2] += steps * weight
+            # Recovery: the run recorded guard-failure markers yet still
+            # finished verifier-confirmed done.
+            cell[_COUNT_OUTCOME_BASE + 3] += (
+                float(bool(guard_failures and outcome == "success")) * weight
+            )
+            cell[_COUNT_OUTCOME_BASE + 4] += authority_touches * weight
+            cell[_COUNT_OUTCOME_BASE + 5] += guard_failures * weight
 
         for run_id, run_events in runs.items():
             run_events.sort(key=lambda e: (e.get("sequence", 0), e.get("recorded_at_ms", 0)))
@@ -365,10 +416,23 @@ class CounterfactualTrials:
             )
             outcome = _run_outcome(final)
             reason = _termination_reason(final)
+            transitions_all = [e for e in run_events if e.get("event") == "transition"]
             run_costs = (
-                sum(max(0, int(e.get("latency_ms", 0))) for e in run_events if e.get("event") == "transition"),
-                sum(max(0, int(e.get("tokens", 0))) for e in run_events if e.get("event") == "transition"),
+                sum(max(0, int(e.get("latency_ms", 0))) for e in transitions_all),
+                sum(max(0, int(e.get("tokens", 0))) for e in transitions_all),
                 sum(1 for e in run_events if e.get("event") == "approval_required"),
+                # Outcome-vector run signals: steps used, transitions carrying
+                # guard-failure markers (``stale_or_failure``), and transitions
+                # that consumed authority-plane approvals (``risk_events``).
+                len(transitions_all),
+                sum(
+                    1 for e in transitions_all
+                    if int(e.get("stale_or_failure") or 0) > 0
+                ),
+                sum(
+                    1 for e in transitions_all
+                    if int(e.get("risk_events") or 0) > 0
+                ),
             )
             assignments = [
                 e
@@ -432,11 +496,11 @@ class CounterfactualTrials:
                     duplicates += 1
                     continue
                 loose_seen.add(identity)
-                record(meta, "censored", "unknown_abort", None, None, (0, 0, 0))
+                record(meta, "censored", "unknown_abort", None, None, (0, 0, 0, 0, 0, 0))
             elif event.get("event") == "transition" and isinstance(event.get("experiment"), dict):
                 record(
                     event["experiment"], "censored", "unknown_abort",
-                    event.get("page_changed"), event, (0, 0, 0),
+                    event.get("page_changed"), event, (0, 0, 0, 0, 0, 0),
                 )
         return cls(
             cells=tuple(sorted(key + tuple(counts) for key, counts in acc.items())),
@@ -537,6 +601,10 @@ class CounterfactualTrials:
             for index, reason in enumerate(TERMINATION_REASONS)
             if counts[13 + index]
         }
+        (
+            w_outcome_measured, w_vtrans, w_steps,
+            w_recovery, w_authority, w_guard,
+        ) = counts[_COUNT_OUTCOME_BASE:_COUNT_OUTCOME_BASE + _OUTCOME_STATS]
         ess = (wsum * wsum / wsq) if wsq else 0.0
         p_success = (ws / wsum) if wsum else 0.0
         # Cells migrated from jev-trials/6 never recorded the censored mass's
@@ -549,6 +617,68 @@ class CounterfactualTrials:
             mean_weight = (wsum / analyzed) if analyzed else 0.0
             wcensored_eff = censored * max(1.0, mean_weight)
         total = wsum + wcensored_eff
+        # Outcome vector: structured secondary/cost/safety endpoints under the
+        # same ITT weighting as the primary. ``coverage`` is the weighted
+        # share of the analyzed pool whose runs carried the fields at all —
+        # migrated v7 cells report 0 and every secondary/safety rate is None
+        # rather than a fabricated zero.
+        outcome_measured = bool(w_outcome_measured)
+
+        def _rate(x):
+            return (x / wsum) if wsum else None
+
+        bounds_lo = ws / total if total else 0.0
+        bounds_hi = (ws + wcensored_eff) / total if total else 1.0
+
+        def _binary(x):
+            p = _rate(x)
+            return {
+                "p": p if outcome_measured else None,
+                "ci": (
+                    list(_wilson_interval(p, ess))
+                    if outcome_measured and p is not None else None
+                ),
+            }
+
+        outcome_vector = {
+            "schema": OUTCOME_VECTOR_SCHEMA,
+            "coverage": (w_outcome_measured / wsum) if wsum else 0.0,
+            # The primary endpoint is restated here for readers — promotion
+            # authority still runs through the top-level p_success path and
+            # its confidence sequence; this block cannot outrank it.
+            "primary": {
+                "verified_success": p_success,
+                "ci": list(_wilson_interval(p_success, ess)),
+                "bounds": [bounds_lo, bounds_hi],
+            },
+            "secondary": {
+                "verified_transition": _binary(w_vtrans),
+                "recovery": _binary(w_recovery),
+                "steps": {
+                    "mean": _rate(w_steps) if outcome_measured else None,
+                },
+            },
+            "cost": {
+                "latency_ms": (w_latency / wsum) if wsum else 0.0,
+                "tokens": (w_tokens / wsum) if wsum else 0.0,
+                "approvals": (w_approvals / wsum) if wsum else 0.0,
+            },
+            # Safety measurements are constraints, not utility: a positive
+            # mass here can only ever veto or flag, never be bought off by
+            # speed, cost, or success elsewhere.
+            "safety": {
+                "authority_touches": (
+                    _rate(w_authority) if outcome_measured else None
+                ),
+                "guard_failures": (
+                    _rate(w_guard) if outcome_measured else None
+                ),
+                "indeterminate_rate": (
+                    (int(counts[_COUNT_REASON_BASE + _REASON_INDEX["indeterminate_execution"]])
+                     / assigned) if assigned else None
+                ),
+            },
+        }
         return {
             # Primary endpoint: verified run success under ITT.
             # ``p_page_changed`` is executed-trial telemetry — never a
@@ -577,6 +707,7 @@ class CounterfactualTrials:
             "avg_latency_ms": (w_latency / wsum) if wsum else 0.0,
             "avg_tokens": (w_tokens / wsum) if wsum else 0.0,
             "avg_approvals": (w_approvals / wsum) if wsum else 0.0,
+            "outcome_vector": outcome_vector,
         }
 
     @classmethod
@@ -688,7 +819,67 @@ class CounterfactualTrials:
             arm: weights.arm_utility(entry[arm]) for arm in ("candidate", "control")
         }
         entry["utility_delta"] = entry["utility"]["candidate"] - entry["utility"]["control"]
+        # Secondary endpoints: fixed-sample contrasts for diagnosis and
+        # prioritization. ``establishment`` is pinned False — secondary
+        # deltas deliberately spend none of the family's sequential alpha;
+        # the primary endpoint's confidence sequence is the only path that
+        # can declare an effect established.
+        entry["secondary_delta"] = {
+            name: cls._secondary_delta(candidate, control, name)
+            for name in ("verified_transition", "recovery")
+        }
+        c_steps = candidate["outcome_vector"]["secondary"]["steps"]
+        k_steps = control["outcome_vector"]["secondary"]["steps"]
+        entry["secondary_delta"]["steps"] = {
+            "delta": (
+                c_steps["mean"] - k_steps["mean"]
+                if c_steps["mean"] is not None and k_steps["mean"] is not None
+                else None
+            ),
+            "ci": None,
+            "establishment": False,
+        }
+        # Safety is a constraint block: a measured excess on any safety
+        # endpoint over the control arm is a regression flag — a veto that
+        # can only ever close the active path, never a quantity the utility
+        # annotation or a success delta can compensate for.
+        cand_safety = candidate["outcome_vector"]["safety"]
+        ctrl_safety = control["outcome_vector"]["safety"]
+        both_measured = bool(
+            candidate["outcome_vector"]["coverage"] > 0
+            and control["outcome_vector"]["coverage"] > 0
+        )
+        regressions = [
+            name
+            for name in ("authority_touches", "guard_failures", "indeterminate_rate")
+            if cand_safety.get(name) is not None
+            and ctrl_safety.get(name) is not None
+            and cand_safety[name] > ctrl_safety[name] + 1e-9
+        ]
+        entry["safety"] = {
+            "regression": bool(regressions) if both_measured else None,
+            "regressions": regressions,
+        }
         return entry
+
+    @staticmethod
+    def _secondary_delta(candidate: dict, control: dict, key: str) -> dict:
+        """Fixed-sample Newcombe contrast on a secondary binary endpoint.
+
+        Diagnostic only — ``establishment`` stays False because secondary
+        endpoints spend none of the family's sequential alpha. A missing
+        (unmeasured) arm yields ``None`` fields, never a fabricated zero
+        delta.
+        """
+        cs = candidate["outcome_vector"]["secondary"][key]
+        ks = control["outcome_vector"]["secondary"][key]
+        if cs["p"] is None or ks["p"] is None:
+            return {"delta": None, "ci": None, "establishment": False}
+        ci = _newcombe(
+            {"p_success": cs["p"], "ess": candidate["ess"]},
+            {"p_success": ks["p"], "ess": control["ess"]},
+        )
+        return {"delta": cs["p"] - ks["p"], "ci": list(ci), "establishment": False}
 
     @staticmethod
     def _stratum_matches(cell, level: str, family: str, host: str) -> bool:
@@ -840,20 +1031,28 @@ class CounterfactualTrials:
             raise ValueError(f"Unknown counterfactual-trials keys: {sorted(unknown)}")
         cells = tuple(tuple(c) for c in payload.get("cells", ()))
         version = str(payload.get("version", cls.version))
+        migrated = False
         if cells and len(cells[0]) == _V4_CELL_LEN:
             # v4 evidence migrates in place; the collapsed scope is split and
             # the widened coordinates land as "unknown" wildcards.
             cells = _migrate_v6_trial_cells(_migrate_v4_trial_cells(cells))
-            version = cls.version
+            migrated = True
         elif cells and len(cells[0]) == _V5_CELL_LEN:
             # v5 cells are one reason counter short of v6; splice in the new
             # indeterminate_execution slot rather than rejecting the store.
             cells = _migrate_v6_trial_cells(_migrate_v5_trial_cells(cells))
-            version = cls.version
+            migrated = True
         elif cells and len(cells[0]) == _V6_CELL_LEN:
             # v6 cells lack the censored-weight statistic; splice a zero so
             # the bound computation can apply its imputed fallback.
             cells = _migrate_v6_trial_cells(cells)
+            migrated = True
+        if cells and len(cells[0]) == _V7_CELL_LEN:
+            # v7 cells lack the outcome-vector counters; append zeros so
+            # secondary/safety endpoints report as unmeasured, never as zero.
+            cells = _migrate_v7_trial_cells(cells)
+            migrated = True
+        if migrated:
             version = cls.version
         if any(len(c) != TRIAL_CELL_LEN for c in cells):
             raise ValueError("Unsupported counterfactual-trials cell arity")
@@ -1231,6 +1430,13 @@ class TrialChoiceModel:
                 "support_sufficient": estimate.get("support_sufficient"),
                 "trial_level": estimate.get("level"),
                 "signature_level": estimate.get("signature_level"),
+                # Structured outcome provenance: secondary deltas are
+                # diagnostic only (``establishment`` pinned False at the
+                # contrast layer), and ``safety_regression`` is a constraint
+                # flag — it can close the active path, never open it.
+                "safety_regression": (estimate.get("safety") or {}).get("regression"),
+                "secondary_delta": estimate.get("secondary_delta"),
+                "outcome_vector": (estimate.get("candidate") or {}).get("outcome_vector"),
                 "source": "randomized",
                 "_tier": tiers.get(status, 3),
             })

@@ -329,6 +329,27 @@ inventory).
   key — each failure lands in `release_blockers` and exits non-zero. The
   signature binds the canonical report including the release verdict, so
   post-signing mutation invalidates verification.
+- **Hierarchical outcome vectors without weakening the primary endpoint**:
+  `jev-trials/8` appends a six-stat outcome block to each trial cell and
+  every arm report carries a `jev-outcome-vector/1` structure: `primary`
+  restates the verified-success ITT endpoint for readers (promotion
+  authority still runs only through the top-level `p_success` confidence
+  sequence — the vector cannot outrank it), `secondary` reports
+  `verified_transition`/`recovery` rates and mean `steps`, `cost` reports
+  latency/token/approval means, and `safety` reports `authority_touches`,
+  `guard_failures`, and `indeterminate_rate`. Contrast entries add
+  `secondary_delta` (fixed-sample Newcombe contrasts with
+  `establishment` pinned false — secondary endpoints spend none of the
+  family's sequential alpha) and a `safety` block where a measured excess
+  on any safety endpoint is a `regression` — a constraint, never utility
+  that success or speed can buy off. `TrialChoiceModel` propagates
+  `safety_regression`/`secondary_delta`/`outcome_vector` per entry;
+  `CausalChoicePolicy` returns `execution_blocker: "safety_regression"`
+  for regressing arms and refuses them canary nomination alongside
+  established-harmful divergences. Cells migrated from `jev-trials/7`
+  report `coverage: 0` and `None`-valued secondary/safety rates — an
+  unmeasured arm says unknown, never a confident zero — and the safety
+  verdict itself reports `None` (unknown), not clean.
 
 ## Deployment gate
 

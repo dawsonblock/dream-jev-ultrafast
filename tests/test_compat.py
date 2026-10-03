@@ -132,10 +132,12 @@ def test_plan_and_catalog_digests_unchanged():
 
 
 def test_causal_serialization_and_statistics_unchanged():
-    assert dreamlearn.TRIAL_CELL_LEN == 37
-    assert dreamlearn.TRIAL_COUNT_LEN == 22
+    # Cell layout values updated for the jev-trials/8 outcome-vector block
+    # (Phase 5): 15-key + 10 stats + 3 costs + 9 reasons + 6 outcome counters.
+    assert dreamlearn.TRIAL_CELL_LEN == 43
+    assert dreamlearn.TRIAL_COUNT_LEN == 28
     assert dreamlearn.CounterfactualTrials().to_dict() == {
-        "cells": (), "duplicates": 0, "version": "jev-trials/7",
+        "cells": (), "duplicates": 0, "version": "jev-trials/8",
     }
     masks = dreamlearn._signature_masks(
         ["click", "high", "navigation", "primary", "1", "0-4", "fill"])

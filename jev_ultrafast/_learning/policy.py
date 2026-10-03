@@ -49,7 +49,8 @@ class CausalChoicePolicy:
     ``execution_blocker``: the named reason it cannot execute
     deterministically (``no_causal_evidence``, ``insufficient_support``,
     ``unresolved``, ``below_effect_threshold``, ``missing_probability``,
-    ``pooled_only``, ``unsupported_stratum``), or ``None``.
+    ``safety_regression``, ``pooled_only``, ``unsupported_stratum``,
+    ``harmful``), or ``None``.
     """
 
     mode: str = "shadow"
@@ -215,6 +216,14 @@ class CausalChoicePolicy:
             return "below_effect_threshold"
         if causal_entry.get("p_progress") is None:
             return "missing_probability"
+        # Safety measurements are constraints, not utility: a measured
+        # regression on any safety endpoint (authority burden, guard
+        # failures, indeterminate executions) is a veto — no success delta,
+        # latency gain, or token saving can compensate for it. ``None``
+        # (unmeasured) does not veto: it is absence of evidence, and the
+        # support gates already govern what absent evidence may do.
+        if causal_entry.get("safety_regression"):
+            return "safety_regression"
         trial_level = causal_entry.get("trial_level")
         if trial_level not in self.active_trial_levels:
             return "pooled_only" if trial_level == "pooled" else "unsupported_stratum"
@@ -247,14 +256,18 @@ class CausalChoicePolicy:
             if not top["executable"]:
                 return None
         else:
-            # canary: nominate the first non-refuted entry — an established-
-            # harmful divergence is settled and negative; spending a real
-            # randomized trial re-testing it is never warranted.
+            # canary: nominate the first entry that is neither refuted nor
+            # safety-regressing — an established-harmful divergence is
+            # settled and negative, and preferentially nominating a
+            # safety-suspect arm is not how evidence against it should be
+            # gathered. Spending a real randomized trial re-testing either
+            # is never warranted.
             top = next(
                 (
                     entry
                     for entry in ranking["proposals"]
-                    if entry.get("execution_blocker") != "harmful"
+                    if entry.get("execution_blocker")
+                    not in {"harmful", "safety_regression"}
                 ),
                 None,
             )
@@ -287,6 +300,7 @@ class CausalChoicePolicy:
             "expected_delta": causal.get("expected_delta"),
             "control_p": causal.get("control_p"),
             "effect_status": causal.get("effect_status"),
+            "safety_regression": causal.get("safety_regression"),
             "trial_level": causal.get("trial_level"),
             "signature_level": causal.get("signature_level"),
             "source": top["source"],
