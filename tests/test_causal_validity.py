@@ -12,6 +12,8 @@ No paid APIs; everything is synthetic evidence.
 
 import json
 
+import pytest
+
 from jev_ultrafast.dream import (
     DreamImprover,
     ExplorationPolicy,
@@ -1009,3 +1011,210 @@ def test_signature_role_rank_and_phase_are_queryable():
         model_role="link", task_family="f",
     )
     assert estimate["signature_level"] == "minus_phase_rank_role"
+
+
+# --------------------------------------- causal probability propagation
+#
+# The candidate-side success probability is control_p + delta, derived at the
+# estimation layer — never 0.5 + delta. These tests pin the regression where
+# CausalChoicePolicy.proposal() fabricated a 0.5 control rate.
+
+
+def _trials(arm, count, successes, prefix, **kw):
+    return [
+        event
+        for i in range(count)
+        for event in _trial_run(f"{prefix}{i}", arm, success=(i < successes), **kw)
+    ]
+
+
+_CANDIDATES = [
+    {"id": "m", "kind": "click", "goal_overlap": 0},
+    {"id": "p", "kind": "click", "goal_overlap": 1},
+]
+_MODEL_CHOICE = {"id": "m", "kind": "click", "goal_overlap": 0}
+
+
+def _causal_entry(model, candidates=_CANDIDATES, model_choice=_MODEL_CHOICE, **kw):
+    ranked = model.rank(candidates, model_choice=model_choice, **kw)
+    assert len(ranked) == 1
+    return ranked[0]
+
+
+def test_causal_p_progress_is_control_rate_plus_delta_not_half_plus_delta():
+    """control_p = 0.80, delta = +0.10 → p_progress = 0.90.
+
+    The fabricated-0.5 formula would report 0.60 — silently inverting the
+    ordering against any candidate whose true control rate exceeds 0.5."""
+    events = _trials("candidate", 20, 18, "c") + _trials("control", 20, 16, "k")
+    model = TrialChoiceModel.fit(events)
+    entry = _causal_entry(model)
+    assert entry["control_p"] == pytest.approx(0.80)
+    assert entry["expected_delta"] == pytest.approx(0.10)
+    assert entry["p_progress"] == pytest.approx(0.90)
+    # The policy consumes the propagated value, not a reconstruction.
+    policy = CausalChoicePolicy(mode="canary", trial_model=model)
+    proposal = policy.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE)
+    assert proposal["p_progress"] == pytest.approx(0.90)
+    assert proposal["causal_p_progress"] == pytest.approx(0.90)
+    assert proposal["control_p"] == pytest.approx(0.80)
+
+
+def test_causal_p_progress_low_control_rate():
+    """control_p = 0.10, delta = +0.20 → p_progress = 0.30.
+
+    Under the defect this returned 0.70 — a weak candidate inflated past the
+    honest value by the assumed 0.5 baseline."""
+    events = _trials("candidate", 20, 6, "c") + _trials("control", 20, 2, "k")
+    model = TrialChoiceModel.fit(events)
+    entry = _causal_entry(model)
+    assert entry["control_p"] == pytest.approx(0.10)
+    assert entry["expected_delta"] == pytest.approx(0.20)
+    assert entry["p_progress"] == pytest.approx(0.30)
+    policy = CausalChoicePolicy(mode="canary", trial_model=model)
+    proposal = policy.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE)
+    assert proposal["p_progress"] == pytest.approx(0.30)
+
+
+class _StaticTrials:
+    """Stand-in for CounterfactualTrials returning a fixed contrast.
+
+    Real Bernoulli evidence can never produce |control + delta| outside
+    [0, 1] — the clamp is a defensive bound exercised here through the real
+    ``resolve`` consumer (``predict``) rather than by fabricating cells."""
+
+    def __init__(self, estimate):
+        self._estimate = estimate
+
+    def resolve(self, **kwargs):
+        return self._estimate
+
+
+def test_causal_p_progress_clamps_high():
+    """control_p = 0.95, delta = +0.20 → 1.0 after the [0, 1] clamp."""
+    model = TrialChoiceModel(trials=_StaticTrials({
+        "control": {"p_success": 0.95, "trials": 20},
+        "candidate": {"p_success": 1.0, "trials": 20},
+        "delta": 0.20,
+        "effect_status": "beneficial",
+        "support_sufficient": True,
+        "level": "pooled",
+    }))
+    prediction = model.predict(kind="click", goal_overlap=1)
+    assert prediction["p_progress"] == pytest.approx(1.0)
+    assert prediction["control_p"] == pytest.approx(0.95)
+    entry = _causal_entry(model)
+    assert entry["p_progress"] == pytest.approx(1.0)
+
+
+def test_causal_p_progress_clamps_low():
+    """control_p = 0.05, delta = −0.20 → 0.0 after the [0, 1] clamp."""
+    model = TrialChoiceModel(trials=_StaticTrials({
+        "control": {"p_success": 0.05, "trials": 20},
+        "candidate": {"p_success": 0.0, "trials": 20},
+        "delta": -0.20,
+        "effect_status": "unresolved",
+        "support_sufficient": True,
+        "level": "pooled",
+    }))
+    prediction = model.predict(kind="click", goal_overlap=1)
+    assert prediction["p_progress"] == pytest.approx(0.0)
+    entry = _causal_entry(model)
+    assert entry["p_progress"] == pytest.approx(0.0)
+
+
+def test_causal_support_without_control_arm_fabricates_no_probability():
+    """A contrast that claims support but has no valid finite control
+    probability yields p_progress = None — never 0.5 + delta, and the
+    observational estimate is not silently substituted as if it were the
+    causal one."""
+    # Estimation layer: control arm missing or non-finite → no probability.
+    missing = TrialChoiceModel(trials=_StaticTrials({
+        "candidate": {"p_success": 0.9, "trials": 20},
+        "delta": 0.3,
+        "effect_status": "beneficial",
+        "support_sufficient": True,
+        "level": "pooled",
+    }))
+    prediction = missing.predict(kind="click", goal_overlap=1)
+    assert prediction["p_progress"] is None
+    assert prediction["control_p"] is None
+    nonfinite = TrialChoiceModel(trials=_StaticTrials({
+        "control": {"p_success": float("nan"), "trials": 20},
+        "candidate": {"p_success": 0.9, "trials": 20},
+        "delta": 0.3,
+        "effect_status": "beneficial",
+        "support_sufficient": True,
+        "level": "pooled",
+    }))
+    assert nonfinite.predict(kind="click", goal_overlap=1)["p_progress"] is None
+
+    # Policy layer: a supported causal entry with no propagated probability
+    # reports None — the observational channel's own value stays separate.
+    class _StubTrialModel:
+        def rank(self, candidates, **kwargs):
+            return [{
+                "id": "p", "kind": "click",
+                "expected_delta": 0.3, "control_p": None, "p_progress": None,
+                "uncertainty": None, "delta_ci": None,
+                "effect_status": "beneficial", "support_sufficient": True,
+                "trial_level": "pooled", "signature_level": "full",
+                "source": "randomized",
+            }]
+
+    class _StubChoiceModel:
+        def predict(self, **kwargs):
+            return {"p_progress": 0.9, "uncertainty": 0.05, "confident": True,
+                    "source": "observational"}
+
+    policy = CausalChoicePolicy(
+        mode="canary", trial_model=_StubTrialModel(), choice_model=_StubChoiceModel()
+    )
+    proposal = policy.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE)
+    assert proposal["p_progress"] is None
+    assert proposal["causal_p_progress"] is None
+    assert proposal["observational_p_progress"] == pytest.approx(0.9)
+
+
+def _observational_run(run_id, *, verified=True):
+    """A non-experimental run selecting the rank-1 click — feeds only the
+    observational ChoiceModel (experiment-tagged transitions are excluded
+    from its fit by construction)."""
+    return [
+        {"event": "run_started", "run_id": run_id, "task_key": "t", "goal": "g",
+         "policy": ExplorationPolicy().to_dict(),
+         "policy_digest": ExplorationPolicy().digest},
+        {"event": "transition", "run_id": run_id, "task_key": "t",
+         "state": "S", "next_state": "D",
+         "selected": {"id": "p", "kind": "click", "goal_overlap": 1},
+         "candidates": [
+             {"id": "m", "kind": "click", "label": "M", "goal_overlap": 0},
+             {"id": "p", "kind": "click", "label": "P", "goal_overlap": 1},
+         ],
+         "page_changed": True, "latency_ms": 0, "model_calls": 1,
+         "tokens": 0, "stale_or_failure": 0, "risk_events": 0},
+        {"event": "run_finished", "run_id": run_id, "task_key": "t",
+         "status": "done", "verified": verified},
+    ]
+
+
+def test_observational_and_causal_probabilities_keep_separate_provenance():
+    """The two channels disagree here — observational ≈ 0.91, causal = 0.30 —
+    and both stay on the proposal under their own names. The supported
+    randomized value governs ``p_progress``; the observational value is never
+    averaged in or relabeled."""
+    causal_events = _trials("candidate", 20, 6, "c") + _trials("control", 20, 2, "k")
+    obs_events = [e for i in range(9) for e in _observational_run(f"o{i}")]
+    trial_model = TrialChoiceModel.fit(causal_events)
+    choice_model = ChoiceModel.fit(obs_events)
+    policy = CausalChoicePolicy(
+        mode="canary", trial_model=trial_model, choice_model=choice_model
+    )
+    proposal = policy.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE)
+    # 10/11 ≈ 0.909 observational posterior vs 0.30 causal — far enough apart
+    # that any mixing between the channels would be visible.
+    assert proposal["observational_p_progress"] == pytest.approx(10 / 11)
+    assert proposal["causal_p_progress"] == pytest.approx(0.30)
+    assert proposal["p_progress"] == pytest.approx(0.30)
+    assert proposal["source"] == "pooled_randomized"
+    assert proposal["expected_delta"] == pytest.approx(0.20)

@@ -1814,6 +1814,34 @@ class CounterfactualTrials:
         )
 
 
+def _candidate_probability(estimate: dict | None) -> tuple[float | None, float | None]:
+    """``(control_p, p_progress)`` implied by a resolved contrast.
+
+    The causal candidate probability is the *measured* control-arm success
+    rate plus the measured effect, clamped to [0, 1]. It is derived here, at
+    the estimation layer, so no downstream consumer ever reconstructs it
+    from a fabricated baseline such as ``0.5 + delta``. A contrast lacking a
+    valid finite control probability yields ``p_progress = None`` — causal
+    support without a control arm is not a probability.
+    """
+    if not isinstance(estimate, dict):
+        return None, None
+    control = estimate.get("control")
+    delta = estimate.get("delta")
+    try:
+        control_p = (
+            float(control.get("p_success")) if isinstance(control, dict) else None
+        )
+        delta_f = float(delta) if delta is not None else None
+    except (TypeError, ValueError):
+        return None, None
+    if control_p is None or not math.isfinite(control_p):
+        return None, None
+    if delta_f is None or not math.isfinite(delta_f):
+        return control_p, None
+    return control_p, min(max(control_p + delta_f, 0.0), 1.0)
+
+
 @dataclass(frozen=True)
 class TrialChoiceModel:
     """A decision prior built ONLY from randomized arm assignments.
@@ -1966,15 +1994,16 @@ class TrialChoiceModel:
         if best is None:
             return None
         delta, candidate, estimate = best
-        control_p = estimate["control"]["p_success"] if "control" in estimate else 0.0
+        control_p, p_progress = _candidate_probability(estimate)
         ci = estimate.get("delta_ci") or [delta, delta]
         return {
             "id": candidate.get("id"),
             "kind": candidate.get("kind"),
-            # The candidate's implied success probability — control-arm rate
-            # plus the measured effect — so downstream ``expected_delta``
-            # arithmetic stays probability-shaped.
-            "p_progress": min(max(control_p + delta, 0.0), 1.0),
+            # The candidate's implied success probability — measured
+            # control-arm rate plus the measured effect — so downstream
+            # ``expected_delta`` arithmetic stays probability-shaped.
+            "control_p": control_p,
+            "p_progress": p_progress,
             "uncertainty": (ci[1] - ci[0]) / 2.0,
             "confident": True,
             "expected_delta": delta,
@@ -2033,6 +2062,7 @@ class TrialChoiceModel:
         if estimate is None:
             return {
                 "p_progress": None,
+                "control_p": None,
                 "n": 0,
                 "level": None,
                 "signature_level": None,
@@ -2048,6 +2078,7 @@ class TrialChoiceModel:
             # nothing.
             return {
                 "p_progress": None,
+                "control_p": None,
                 "n": int((estimate.get("candidate") or {}).get("trials", 0)),
                 "level": estimate.get("level"),
                 "signature_level": estimate.get("signature_level"),
@@ -2055,9 +2086,10 @@ class TrialChoiceModel:
                 "support_sufficient": bool(estimate.get("support_sufficient")),
                 "source": "randomized",
             }
-        control_p = control["p_success"]
+        control_p, p_progress = _candidate_probability(estimate)
         return {
-            "p_progress": min(max(control_p + delta, 0.0), 1.0),
+            "p_progress": p_progress,
+            "control_p": control_p,
             "delta": delta,
             "n": estimate["control"]["trials"] + estimate["candidate"]["trials"],
             "level": estimate.get("level"),
@@ -2119,10 +2151,24 @@ class TrialChoiceModel:
             status = str(estimate.get("effect_status") or "insufficient_data")
             if status == "harmful":
                 continue
+            control_p, p_progress = _candidate_probability(estimate)
+            ci = estimate.get("delta_ci")
             entries.append({
                 "id": candidate.get("id"),
                 "kind": candidate.get("kind"),
                 "expected_delta": estimate.get("delta"),
+                "control_p": control_p,
+                # Propagated causal probability: measured control rate plus
+                # measured delta, derived at the estimation layer. None when
+                # the contrast lacks a valid finite control probability —
+                # consumers fail closed on absent, never on assumed 0.5.
+                "p_progress": p_progress,
+                "uncertainty": (
+                    (float(ci[1]) - float(ci[0])) / 2.0
+                    if isinstance(ci, (list, tuple)) and len(ci) == 2
+                    else None
+                ),
+                "delta_ci": list(ci) if isinstance(ci, (list, tuple)) else None,
                 "utility_delta": estimate.get("utility_delta"),
                 "effect_status": status,
                 "support_sufficient": estimate.get("support_sufficient"),
@@ -2482,18 +2528,30 @@ class CausalChoicePolicy:
             return None
         causal = top.get("causal") or {}
         observational = top.get("observational") or {}
-        p_progress = observational.get("p_progress")
+        causal_p = causal.get("p_progress")
+        observational_p = observational.get("p_progress")
         if causal.get("expected_delta") is not None and causal.get("support_sufficient"):
-            p_progress = min(
-                max(0.5 + float(causal["expected_delta"]), 0.0), 1.0
-            )
+            # Supported randomized evidence governs the proposal's implied
+            # success probability. It is the measured control rate plus the
+            # measured effect, propagated from the estimation layer — never
+            # reconstructed from a fabricated 0.5 baseline, and never
+            # silently replaced by the observational probability when the
+            # causal contrast cannot supply one.
+            p_progress = causal_p
+            uncertainty = causal.get("uncertainty")
+        else:
+            p_progress = observational_p
+            uncertainty = observational.get("uncertainty")
         return {
             "id": top["id"],
             "kind": top["kind"],
             "p_progress": p_progress,
-            "uncertainty": observational.get("uncertainty"),
+            "causal_p_progress": causal_p,
+            "observational_p_progress": observational_p,
+            "uncertainty": uncertainty,
             "confident": bool(causal.get("support_sufficient") or observational.get("confident")),
             "expected_delta": causal.get("expected_delta"),
+            "control_p": causal.get("control_p"),
             "effect_status": causal.get("effect_status"),
             "trial_level": causal.get("trial_level"),
             "signature_level": causal.get("signature_level"),
