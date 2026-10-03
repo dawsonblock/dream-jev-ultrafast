@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -970,6 +971,131 @@ def test_resolve_uploads_validates_the_allowlist(tmp_path, monkeypatch):
         loop._resolve_uploads([str(tmp_path)])
     monkeypatch.setenv("JEV_UPLOADS", str(good))
     assert loop._resolve_uploads(None)[0]["path"] == str(good.resolve())
+
+
+def test_upload_declaration_snapshots_content_into_private_staging(tmp_path):
+    """Declaration copies the exact declared bytes under a content hash —
+    the staged snapshot, not the mutable source path, is the thing an
+    approval grant and dispatch can ever reach."""
+    import hashlib
+
+    src = tmp_path / "attach.pdf"
+    src.write_bytes(b"original-content-x")
+    entries = loop._resolve_uploads([str(src)])
+    entry = entries[0]
+    assert entry["content_sha256"] == hashlib.sha256(b"original-content-x").hexdigest()
+    assert entry["size"] == len(b"original-content-x")
+    staged = Path(entry["staged_path"])
+    # The page still observes the real basename; the staging root is private.
+    assert staged.name == "attach.pdf"
+    assert staged.parent.parent.name.startswith("jev-uploads-")
+    assert staged.read_bytes() == b"original-content-x"
+
+
+def test_same_size_source_replacement_cannot_reach_the_staged_upload(tmp_path):
+    """The audit's TOCTOU case: path+size proved nothing. A file swapped for
+    same-size different content after declaration must leave the approved
+    bytes untouched — the snapshot is what dispatch sends."""
+    src = tmp_path / "attach.pdf"
+    src.write_bytes(b"original-content-x")
+    entry = loop._resolve_uploads([str(src)])[0]
+    src.write_bytes(b"swapped-content-yy")  # same byte length, same name
+    staged = Path(entry["staged_path"])
+    assert staged.read_bytes() == b"original-content-x"
+    import hashlib
+
+    assert hashlib.sha256(staged.read_bytes()).hexdigest() == entry["content_sha256"]
+    # The declared path is kept only for provenance — never for dispatch.
+    assert entry["path"] == str(src.resolve()) != entry["staged_path"]
+
+
+def _upload_decision():
+    return {
+        "choice": "u1",
+        "operation": "UPLOAD",
+        "target": "1:1",
+        "confidence": 1.0,
+        "probabilities": {"u1": 1.0},
+        "latency_ms": 1,
+        "usage": {},
+    }
+
+
+def _upload_agent(tmp_path, payload=b"original-content-x"):
+    """A runner-shaped agent carrying one declared upload on a file field."""
+    from unittest.mock import Mock
+
+    from jev_ultrafast.policy import DefaultActionPolicy
+
+    src = tmp_path / "attach.pdf"
+    src.write_bytes(payload)
+    a = loop.Agent.__new__(loop.Agent)
+    a.screenshots = False
+    a.pending_text = None
+    a.input_guarantee = "atomic"
+    a.policy = DefaultActionPolicy()
+    a.uploads = loop._resolve_uploads([str(src)])
+    p = base_page(
+        actions=[
+            {"id": "u1", "kind": "upload", "node": 5, "role": "button",
+             "label": "Attach", "ctx": {"field": "file"}},
+            {"id": "wait", "kind": "wait", "label": "Wait"},
+        ]
+    )
+    a.state = {
+        "browser": Mock(fresh=Mock(return_value=True), observe=Mock(return_value=p)),
+        "page": p,
+        "decision": _upload_decision(),
+        "goal": "Send the file",
+        "history": [],
+        "decisions": [],
+        "status": "predicted",
+        "started_at": time.perf_counter(),
+        "record": False,
+        "text_calls": [],
+    }
+    return a, src
+
+
+def test_upload_approval_digest_binds_content_not_path(tmp_path):
+    """The pending grant's payload_digest covers the staged content hash —
+    replacing the declared file after approval changes nothing the grant
+    covers, and dispatch sends the staged snapshot."""
+    import hashlib
+
+    a, src = _upload_agent(tmp_path)
+    p = a.state["page"]
+    state = a.command("act", {"fingerprint": p["fingerprint"]})
+    assert state["status"] == "approval_required"
+    entry = a.uploads[0]
+    expected = hashlib.sha256(
+        f"jev-upload/v1\n{entry['content_sha256']}\n{entry['size']}\n{entry['name']}".encode()
+    ).hexdigest()
+    assert state["pending_approval"]["payload_digest"] == expected
+
+    # Same-size replacement of the declared file: the grant still covers the
+    # ORIGINAL bytes — digest identical, staged snapshot untouched.
+    src.write_bytes(b"swapped-content-yy")
+    a.state["decision"] = _upload_decision()
+    a.state["status"] = "predicted"
+    again = a.command("act", {"fingerprint": p["fingerprint"]})
+    assert again["status"] == "approval_required"
+    assert again["pending_approval"]["payload_digest"] == expected
+
+    a.command("approve")
+    act_call = a.state["browser"].act.call_args
+    assert act_call.kwargs["file_path"] == entry["staged_path"]
+
+
+def test_staged_upload_tampering_fails_closed(tmp_path):
+    """If the staged snapshot itself is altered, the re-hash at decision time
+    raises before the grant comparison — dispatch never runs."""
+    a, _src = _upload_agent(tmp_path)
+    p = a.state["page"]
+    Path(a.uploads[0]["staged_path"]).write_bytes(b"tampered-bytes!!!")
+    with pytest.raises(ValueError, match="staged upload content changed"):
+        a.command("act", {"fingerprint": p["fingerprint"]})
+    a.state["browser"].act.assert_not_called()
 
 
 def test_classify_effect_new_kinds():

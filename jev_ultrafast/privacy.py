@@ -96,9 +96,15 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 #              hatch closed, and requires signed evidence without an extra
 #              flag. A knob explicitly weakening below the profile fails
 #              closed naming the conflict — never silently ignored.
+#   qualified — every strict refusal, plus release provenance at startup:
+#              the agent refuses to run unless the installed tree verifies
+#              against its signed release manifest under a pinned key
+#              (tcb.verify_installation). `strict` hardens the posture;
+#              `qualified` additionally proves what is running.
 # ---------------------------------------------------------------------------
 
-SECURITY_PROFILES = ("standard", "strict")
+SECURITY_PROFILES = ("standard", "strict", "qualified")
+_HARDENED = {"strict", "qualified"}
 _PRIVACY_OFF = {"off", "none", "0", "false"}
 
 
@@ -108,6 +114,7 @@ def security_profile() -> str:
     ``standard`` is the historical default — every knob read independently
     with its own coherence guards. ``strict`` is the hardened posture that
     refuses the weakening combinations a qualified run should never reach.
+    ``qualified`` adds signed-release verification at agent startup.
     An unrecognized value is a misconfiguration — fail closed.
     """
     profile = os.environ.get("JEV_SECURITY_PROFILE", "standard").strip().lower()
@@ -118,31 +125,37 @@ def security_profile() -> str:
     return profile
 
 
+def hardened_profile() -> bool:
+    """Whether the declared posture applies every ``strict`` refusal
+    (``strict`` and ``qualified`` are both hardened profiles)."""
+    return security_profile() in _HARDENED
+
+
 def signed_evidence_required() -> bool:
     """Whether unsigned evidence must fail closed.
 
-    ``JEV_REQUIRE_SIGNED_EVIDENCE`` opts in under any profile; ``strict``
-    implies the requirement — a hardened posture cannot consume unsigned
-    evidence and call it provenance.
+    ``JEV_REQUIRE_SIGNED_EVIDENCE`` opts in under any profile; the hardened
+    profiles imply the requirement — a hardened posture cannot consume
+    unsigned evidence and call it provenance.
     """
     return bool(
-        os.environ.get("JEV_REQUIRE_SIGNED_EVIDENCE")
-        or security_profile() == "strict"
+        os.environ.get("JEV_REQUIRE_SIGNED_EVIDENCE") or hardened_profile()
     )
 
 
 def unbound_metrics_permitted() -> bool:
     """Whether the unbound-metrics promotion escape hatch may open.
 
-    ``strict`` keeps the hatch closed unconditionally — bound paired canary
-    evidence is not optional under a hardened posture; under ``standard``
-    it still requires the explicit ``JEV_ALLOW_UNBOUND_METRICS=1`` opt-in.
+    Hardened profiles keep the hatch closed unconditionally — bound paired
+    canary evidence is not optional under a hardened posture; under
+    ``standard`` it still requires the explicit
+    ``JEV_ALLOW_UNBOUND_METRICS=1`` opt-in.
     """
-    if security_profile() == "strict":
+    if hardened_profile():
         raise ValueError(
-            "JEV_SECURITY_PROFILE=strict keeps the unbound-metrics escape "
-            "hatch closed — promotion requires bound paired canary evidence "
-            "via promote_from_store()."
+            f"JEV_SECURITY_PROFILE={security_profile()} keeps the "
+            "unbound-metrics escape hatch closed — promotion requires bound "
+            "paired canary evidence via promote_from_store()."
         )
     return os.environ.get("JEV_ALLOW_UNBOUND_METRICS") == "1"
 
@@ -155,17 +168,19 @@ def routing_level():
         raise ValueError(
             f"JEV_MODEL_ROUTING must be one of {', '.join(ROUTING_LEVELS)}"
         )
-    if security_profile() == "strict":
+    if hardened_profile():
         if _mode() in _PRIVACY_OFF:
             raise ValueError(
-                "JEV_SECURITY_PROFILE=strict refuses JEV_MODEL_PRIVACY=off — "
-                "redaction is not optional under a hardened posture."
+                f"JEV_SECURITY_PROFILE={security_profile()} refuses "
+                "JEV_MODEL_PRIVACY=off — redaction is not optional under a "
+                "hardened posture."
             )
         if level == "public":
             raise ValueError(
-                "JEV_SECURITY_PROFILE=strict refuses JEV_MODEL_ROUTING=public "
-                "— verbatim goal text to a remote endpoint is not a strict "
-                "posture. Use sanitized or local-only."
+                f"JEV_SECURITY_PROFILE={security_profile()} refuses "
+                "JEV_MODEL_ROUTING=public — verbatim goal text to a remote "
+                "endpoint is not a hardened posture. Use sanitized or "
+                "local-only."
             )
     if level == "sanitized" and _mode() in _PRIVACY_OFF:
         # The two flags must not compose into raw remote transmission:
@@ -212,11 +227,11 @@ def assert_transport_secure(url):
     if scheme == "https" or loopback_endpoint(url):
         return
     if scheme == "http" and os.environ.get("JEV_ALLOW_INSECURE_TRANSPORT") == "1":
-        if security_profile() == "strict":
+        if hardened_profile():
             raise ValueError(
-                "JEV_SECURITY_PROFILE=strict refuses "
+                f"JEV_SECURITY_PROFILE={security_profile()} refuses "
                 "JEV_ALLOW_INSECURE_TRANSPORT — remote model traffic over "
-                "plaintext http is not a strict posture."
+                "plaintext http is not a hardened posture."
             )
         return
     raise ValueError(

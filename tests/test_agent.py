@@ -1672,3 +1672,41 @@ def test_strict_profile_refuses_trusted_input(monkeypatch):
     # atomic remains the strict execution mode
     agent = loop.Agent("http://x", "g", input_guarantee="atomic")
     assert agent.input_guarantee == "atomic"
+
+
+# ------------------------------------------------- qualified profile (P2)
+#
+# `qualified` is strict plus release provenance: the agent re-verifies the
+# installed tree against its signed manifest before running anything.
+
+
+def test_qualified_profile_applies_strict_refusals(monkeypatch):
+    """qualified is a hardened profile — every strict refusal still holds."""
+    from jev_ultrafast.privacy import routing_level
+
+    monkeypatch.setenv("JEV_SECURITY_PROFILE", "qualified")
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "public")
+    with pytest.raises(ValueError, match="qualified"):
+        routing_level()
+
+
+def test_qualified_profile_refuses_unverified_installation(monkeypatch):
+    """No pinned key / unsigned tree → fail closed at agent construction."""
+    monkeypatch.setattr(
+        loop, "Browser",
+        lambda *a, **k: Mock(observe=Mock(return_value=page())))
+    monkeypatch.setenv("JEV_SECURITY_PROFILE", "qualified")
+    monkeypatch.delenv("JEV_MANIFEST_VERIFY_KEYS", raising=False)
+    with pytest.raises(RuntimeError, match="release verification failed"):
+        loop.Agent("http://x", "g")
+
+
+def test_qualified_profile_runs_on_verified_installation(monkeypatch):
+    """A tree that passes release verification constructs normally."""
+    monkeypatch.setattr(
+        loop, "Browser",
+        lambda *a, **k: Mock(observe=Mock(return_value=page())))
+    monkeypatch.setenv("JEV_SECURITY_PROFILE", "qualified")
+    monkeypatch.setattr(loop, "verify_installation", lambda: [])
+    agent = loop.Agent("http://x", "g")
+    assert agent.input_guarantee == "atomic"

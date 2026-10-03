@@ -6,6 +6,75 @@ this file documents what changed and why, in the project's own words.
 
 ## Unreleased
 
+### release provenance, upload binding, and structural policy programs
+
+An independent audit (P0–P2) closed the remaining security/scientific gaps
+and made the mutable artifact genuinely more expressive:
+
+- **Upload approval now binds the file's contents, not its path**
+  (TOCTOU). Declared upload files are snapshotted into a private staging
+  directory at agent construction, the approval capability digest covers
+  the staged content hash + byte length, and dispatch sends the staged
+  snapshot — replacing the source file after approval can never change
+  the bytes that were reviewed. Staging is cleaned on `Agent.close()`.
+- **Exact-action evidence is a measured contrast, not a presence flag**
+  (`jev-trials/11`). The trial store keeps per-`action_key` cells
+  (`action_index` + `action_cells`), and `resolve` annotates a separate
+  `action_exact` contrast — the exact action's own support, effect, and
+  confidence sequence — alongside the class-level estimate. Active-mode
+  deployment requires the action's own evidence to be sufficient and
+  beneficial, a documented `hierarchical_shrinkage` rule for thin
+  per-action data, or a verified external confirmation; a class effect
+  can no longer carry an exact action whose own randomized data is thin
+  or harmful (`deployment` block reports the estimator and blockers).
+- **Multiplicity is allocated online and irrevocably.** Hypothesis
+  contexts register at declaration time in `family_order`, and each
+  declaration spends a fixed geometric share of the family α
+  (`SEQUENTIAL_ALPHA` × rate × (1 − rate)^index — a budget of 0.05 that
+  later hypotheses can never retroactively loosen for earlier ones).
+  Contrasts report `family_alpha`; stores without declaration order use
+  a deterministic equal split across known contexts.
+- **The one-trial invariant holds on legacy evidence too.** The
+  transition-tag migration path deduplicates identical rewrites,
+  quarantines runs carrying two *distinct* experiment decisions, and
+  rejects assignments ordered after the terminal event — the same rules
+  the modern `experiment_assigned` path enforces.
+- **External/manual action confirmations are signed evidence.** Raw
+  `confirmed_action_keys` no longer admit an action: confirmations are
+  domain-separated Ed25519 attestations
+  (`jev-dream/action-confirmation/v1`, `mint_action_confirmation`)
+  verified against `JEV_CONFIRMATION_VERIFY_KEYS`, optionally scoped to
+  task family/site — unsigned confirmations fail closed when keys are
+  configured.
+- **`ExplorationPolicy` is a real declarative program, not just a knob
+  vector.** Two new validated fields — `rules` (guarded score adjustments)
+  and `stop_when` (a stopping expression) — interpret a small checked AST
+  (`_dream/policylang.py`: feature/const/cmp/and/or/not/add/mul nodes
+  over a bounded feature vocabulary). Live candidate scoring, replay
+  filtering, and run termination all evaluate the program; digests stay
+  canonical, and the baseline digest is unchanged (empty programs
+  serialize as before). `mutate_policies()` grows genuine structural
+  mutations alongside the scalar ones — rule insertion/removal,
+  expression-constant perturbation, and stop-condition rewrites — 79
+  baseline candidates where there were 73.
+- **Release verification is externally bootstrapped**
+  (`scripts/verify_release.py`). A self-contained verifier — stdlib +
+  `cryptography`, zero `jev_ultrafast` imports — that can be copied out
+  of the tree: pinned-key `MANIFEST.sig` verification, full-set hashing,
+  the TCB floor embedded as an external expectation rather than imported,
+  a `--expect-tcb-version` pin, and a check that a shipped
+  `VALIDATION.generated.md` declares the manifest digest it actually
+  validates (`--require-validation` makes absence a failure). The
+  internal `scripts/check_tcb.py` remains the CI consistency check and
+  now says so.
+- **`JEV_SECURITY_PROFILE=qualified` — strict plus provenance.** Every
+  strict refusal applies (it is a hardened profile), and the agent
+  additionally re-verifies the installed tree against its signed
+  manifest under `JEV_MANIFEST_VERIFY_KEYS` at construction —
+  `tcb.verify_installation()` hashes the release set and checks the TCB
+  boundary before any run starts; unsigned, unpinned, or drifted trees
+  fail closed (TCB `jev-ultrafast-tcb/0.17`).
+
 ### exact-action generalization and experimental-unit enforcement
 
 A fifth-pass scientific audit found two causal-evidence gaps plus a ranking

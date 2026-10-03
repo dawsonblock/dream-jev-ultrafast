@@ -833,7 +833,7 @@ def test_v4_cells_migrate_to_split_coordinates():
         10, 8, 8, 2, 6.0, 8.0, 8.0, 8.0, 8.0,
     )
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/4", "cells": [v4]})
-    assert trials.version == "jev-trials/10"
+    assert trials.version == "jev-trials/11"
     cell = trials.cells[0]
     assert cell[0] == "flights" and cell[1] == ""
     assert cell[3] == "unknown" and cell[6] == "unknown"  # effect/rank wildcards
@@ -865,7 +865,7 @@ def test_v5_cells_migrate_with_zeroed_indeterminate_counter():
     v5 = (*key, *stats_v5, 1.0, 2.0, 0.5, *reasons_v5)
     assert len(v5) == 35
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/5", "cells": [v5]})
-    assert trials.version == "jev-trials/10"
+    assert trials.version == "jev-trials/11"
     cell = trials.cells[0]
     assert len(cell) == TRIAL_CELL_LEN
     # The v8 outcome-vector block is appended after the reason tail; the
@@ -1952,7 +1952,7 @@ def test_unmeasured_arms_report_null_not_zero():
     v7k = (*ctrl, *stats, *costs, *reasons)
     trials = CounterfactualTrials.from_dict(
         {"version": "jev-trials/7", "cells": [v7, v7k]})
-    assert trials.version == "jev-trials/10"
+    assert trials.version == "jev-trials/11"
     entry = next(iter(trials.estimate().values()))
     for arm in ("candidate", "control"):
         ov = entry[arm]["outcome_vector"]
@@ -2036,7 +2036,7 @@ def test_v8_roundtrip_preserves_outcome_counters():
                      stale_or_failure=1, risk_events=1, extra_transitions=2)
     trials = CounterfactualTrials.fit(events)
     clone = CounterfactualTrials.from_dict(trials.to_dict())
-    assert clone.version == "jev-trials/10"
+    assert clone.version == "jev-trials/11"
     assert clone.cells == trials.cells
     assert clone.estimate() == trials.estimate()
     ov = next(iter(clone.estimate().values()))["candidate"]["outcome_vector"]
@@ -2230,3 +2230,496 @@ def test_declaration_flood_dilutes_never_concentrates_alpha():
     order = {"insufficient_data": 0, "unresolved": 1,
              "beneficial": 2, "harmful": 2}
     assert order[flooded_entry["effect_status"]] <= order[alone_status]
+
+
+# ------------------------------------------------- legacy one-trial invariant
+#
+# Pre-assignment evidence carries no ``experiment_assigned`` event — the
+# trial is only visible through ``experiment``-tagged transitions. The
+# consumer must enforce the same one-trial-per-run rule there instead of
+# trusting the producer.
+
+
+def _legacy_run(run_id, metas, *, success=True):
+    """A pre-assignment run: experiment evidence exists only on transitions."""
+    events = [
+        {"event": "run_started", "run_id": run_id, "task_key": "t", "goal": "g"},
+    ]
+    for meta in metas:
+        events.append({
+            "event": "transition", "run_id": run_id, "task_key": "t",
+            "state": "S", "next_state": "D",
+            "selected": {"id": meta["proposal_id"], "kind": "click"},
+            "candidates": [
+                {"id": meta["proposal_id"], "kind": "click",
+                 "label": "Go", "goal_overlap": 1},
+            ],
+            "page_changed": True, "latency_ms": 0, "model_calls": 1,
+            "tokens": 0, "stale_or_failure": 0, "risk_events": 0,
+            "experiment": meta,
+        })
+    events.append({
+        "event": "run_finished", "run_id": run_id, "task_key": "t",
+        "status": "done" if success else "blocked", "verified": success,
+    })
+    return events
+
+
+def test_legacy_distinct_experiments_quarantine_the_unit():
+    """Two *different* trial decisions stamped on one legacy run means the
+    producer invariant broke (or evidence was spliced) — the unit is
+    quarantined wholesale; neither arm may inherit the shared outcome."""
+    events = _legacy_run("u", [
+        _trial_meta("u-a", "candidate", task_family="f"),
+        _trial_meta("u-b", "candidate", task_family="g"),
+    ])
+    trials = CounterfactualTrials.fit(events)
+    assert trials.invalid_units == 1
+    assert not trials.estimate()
+    # Both spliced decisions still declared their hypotheses — the family
+    # pays for tests that ran, even quarantined ones.
+    assert trials.hypothesis_summary["declared"] == 2
+
+
+def test_legacy_identical_metas_deduplicate_to_one_assignment():
+    """The same decision stamped on two steps is one assignment — recording
+    it twice would double-weight the arm."""
+    meta = _trial_meta("u", "candidate")
+    events = _legacy_run("u", [meta, dict(meta)])
+    trials = CounterfactualTrials.fit(events)
+    assert trials.invalid_units == 0
+    assert trials.duplicates == 1
+    arm = trials.estimate()[next(iter(trials.estimate()))]["candidate"]
+    assert arm["assigned"] == 1
+
+
+def test_legacy_malformed_meta_rejects_at_the_unit_gate():
+    """A legacy meta failing the arm/propensity gate is rejected and counted,
+    exactly like a malformed modern assignment."""
+    meta = _trial_meta("u", "candidate", propensity=0.0)
+    trials = CounterfactualTrials.fit(_legacy_run("u", [meta]))
+    assert trials.rejected == 1
+    assert not trials.estimate()
+
+
+# --------------------------------------- online alpha allocation (Phase 24)
+#
+# The hypothesis family may grow online, but every declared context's share
+# of the family error budget is allocated irrevocably at first declaration
+# (geometric spending over declaration order). A hypothesis added later can
+# never retroactively widen the threshold an earlier deployment decision
+# was made under — the sequential family-expansion failure mode.
+
+
+def test_alpha_allocation_is_geometric_irrevocable_and_bounded():
+    """First declaration takes ``SEQUENTIAL_ALPHA · ρ``; flooding the family
+    later cannot dilute it (under flat Bonferroni it would shrink to
+    α/k). Total spending stays strictly below the family budget forever."""
+    base_events = _scoped_events()  # one context, family="f", site="h"
+    alone = CounterfactualTrials.fit(list(base_events))
+    alone_entry = next(iter(alone.estimate().values()))
+    assert alone_entry["family_alpha"] == pytest.approx(
+        CounterfactualTrials.SEQUENTIAL_ALPHA
+        * CounterfactualTrials.ALPHA_SPEND_RATE
+    )
+
+    flooded_events = list(base_events)
+    for index in range(400):
+        meta = _trial_meta(
+            f"junk{index}", "candidate", task_family=f"junkfam{index}",
+            site=f"junksite{index}")
+        flooded_events += [
+            {"event": "run_started", "run_id": f"j{index}",
+             "task_key": "t", "goal": "g", "task_family": f"junkfam{index}"},
+            {"event": "experiment_assigned", "run_id": f"j{index}",
+             "task_key": "t", "experiment": meta},
+            {"event": "run_finished", "run_id": f"j{index}",
+             "task_key": "t", "status": "aborted",
+             "reason": "operator_cancel"},
+        ]
+    flooded = CounterfactualTrials.fit(flooded_events)
+    assert flooded.hypothesis_summary["declared"] == 401
+    # The early hypothesis's allocation is untouched — irrevocable.
+    first_ctx = "|".join(next(iter(alone.estimate().keys())).split("|"))
+    flooded_entry = flooded.estimate()[first_ctx]
+    assert flooded_entry["family_alpha"] == pytest.approx(
+        alone_entry["family_alpha"]
+    )
+    # Junk contexts declared later received progressively smaller shares:
+    # the 401st declaration's share is negligible next to the first's.
+    allocations_map = flooded._alpha_allocations()
+    first_key = next(iter(allocations_map))
+    last_key = tuple(flooded.family_order[-1])
+    assert allocations_map[last_key] < allocations_map[first_key] * 1e-100
+    allocations = flooded.hypothesis_summary["alpha_allocation"]
+    assert allocations["scheme"] == "geometric"
+    # The geometric tail underflows in float arithmetic — the sum saturates
+    # at the budget without ever exceeding it. The bound is the guarantee.
+    assert allocations["spent"] <= allocations["budget"]
+    assert allocations["remaining"] >= 0
+    assert allocations["declaration_order"] == 401
+
+
+def test_declaration_order_fixes_each_hypothesiss_share():
+    """Two contexts observed in stream order: the second receives exactly
+    half the first's share — allocation order is declaration order, not
+    estimation order."""
+    first = _scoped_events()
+    second = (
+        _trials("candidate", 24, 24, "d", task_family="g", site="o")
+        + _trials("control", 24, 0, "e", task_family="g", site="o")
+    )
+    trials = CounterfactualTrials.fit(first + second)
+    entries = trials.estimate()
+    by_family = {
+        key.split("|")[0]: entry for key, entry in entries.items()
+    }
+    assert by_family["f"]["family_alpha"] == pytest.approx(0.025)
+    assert by_family["g"]["family_alpha"] == pytest.approx(0.0125)
+    # Round-trip preserves both the cells and the declaration order.
+    restored = CounterfactualTrials.from_dict(trials.to_dict())
+    assert restored.family_order == trials.family_order
+    by_family_r = {
+        key.split("|")[0]: entry for key, entry in restored.estimate().items()
+    }
+    assert by_family_r["g"]["family_alpha"] == pytest.approx(0.0125)
+
+
+def test_legacy_store_without_declaration_order_splits_evenly():
+    """A store serialized before ``family_order`` existed cannot recover
+    chronology — every known context receives the same conservative equal
+    share (the old Bonferroni denominator), deterministic and irrevocable
+    once re-serialized."""
+    events = (
+        _scoped_events()
+        + _trials("candidate", 24, 24, "d", task_family="g", site="o")
+        + _trials("control", 24, 0, "e", task_family="g", site="o")
+    )
+    trials = CounterfactualTrials.fit(events)
+    payload = trials.to_dict()
+    del payload["family_order"]
+    del payload["registered"]
+    legacy = CounterfactualTrials.from_dict(payload)
+    shares = {
+        key.split("|")[0]: entry["family_alpha"]
+        for key, entry in legacy.estimate().items()
+    }
+    assert shares["f"] == pytest.approx(0.025)
+    assert shares["g"] == pytest.approx(0.025)
+
+
+def test_pooled_backoff_spends_only_the_least_funded_share():
+    """A contrast pooled over several declared contexts may spend no more
+    than the *smallest* constituent allocation — pooling thin late
+    hypotheses must never buy back error budget they were never given."""
+    early = _scoped_events()  # context declared first → share 0.025
+    late = (
+        _trials("candidate", 24, 24, "d", task_family="g")
+        + _trials("control", 24, 0, "e", task_family="g")
+    )
+    trials = CounterfactualTrials.fit(early + late)
+    pooled = trials.resolve(
+        model_kind="click", model_overlap=0, proposal_kind="click",
+        proposal_overlap=1,
+    )
+    assert pooled["level"] == "pooled"
+    assert pooled["family_alpha"] == pytest.approx(0.0125)
+
+
+# -------------------------------------- exact-action evidence semantics
+#
+# Presence ("was this action identity randomized here?") and evidence
+# ("what is this action's own measured effect?") are different facts. The
+# action's own contrast lives under ``action_exact``; the active gate can
+# only let it veto or outrank the class estimate, never be overridden by it.
+
+
+def _keyed_trials(arm, count, successes, prefix, key, **kw):
+    """Trials whose assignment meta carries an explicit proposal action key
+    — the live-evidence form of action identity."""
+    events = []
+    for i in range(count):
+        for event in _trial_run(
+            f"{prefix}{i}", arm, success=(i < successes), **kw
+        ):
+            meta = event.get("experiment")
+            if meta is not None:
+                meta["proposal_action_key"] = key
+            events.append(event)
+    return events
+
+
+_SHIP_CANDIDATE = {"id": "s", "kind": "click", "goal_overlap": 1, "label": "Ship"}
+
+
+def _ship_key():
+    from jev_ultrafast._learning.signatures import action_key
+    return action_key(kind="click", label="Ship")
+
+
+def _go_key():
+    from jev_ultrafast._learning.signatures import action_key
+    return action_key(kind="click", label="Go")
+
+
+def test_action_exact_contrast_is_the_actions_own_measurement():
+    """``_scoped_events`` (24+24, all separated) gives the "Go" action both
+    presence *and* a sufficient beneficial contrast of its own."""
+    trials = CounterfactualTrials.fit(_scoped_events())
+    estimate = trials.resolve(
+        task_family="f", site="h", model_kind="click", model_overlap=0,
+        proposal_kind="click", proposal_overlap=1,
+        proposal_action_key=_go_key(),
+    )
+    assert estimate["generalization_level"] == "exact"
+    assert estimate["action_seen_randomized"] is True
+    ae = estimate["action_exact"]
+    assert ae is not None
+    assert ae["support_sufficient"] is True
+    assert ae["effect_status"] == "beneficial"
+    assert estimate["action_exact_ess"] >= CounterfactualTrials.MIN_ESS
+    # The deployment estimate uses the action's own numbers.
+    model = TrialChoiceModel(trials=trials)
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    entry = policy.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    )["proposals"][0]
+    assert entry["executable"] is True
+    assert entry["deployment"]["estimator"] == "exact_action"
+    assert entry["deployment"]["delta"] == pytest.approx(ae["delta"])
+
+
+def test_thin_negative_action_data_vetoes_a_beneficial_class():
+    """The audit's second-order failure: "Go" was randomized here (presence
+    → ``exact``) but its own six trials all failed while the pooled class
+    stayed beneficial on "Ship" data. Under presence-only semantics this
+    executed; now the action's own measured negative delta refutes the
+    generalization."""
+    ship = _keyed_trials("candidate", 48, 48, "sc", _ship_key(),
+                         task_family="f", site="h")
+    ship += _keyed_trials("control", 48, 0, "sk", _ship_key(),
+                          task_family="f", site="h")
+    go = _keyed_trials("candidate", 6, 0, "gc", _go_key(),
+                       task_family="f", site="h")
+    go += _keyed_trials("control", 6, 6, "gk", _go_key(),
+                        task_family="f", site="h")
+    model = TrialChoiceModel(trials=CounterfactualTrials.fit(ship + go))
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    entry = policy.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    )["proposals"][0]
+    assert entry["causal"]["generalization_level"] == "exact"
+    assert entry["causal"]["effect_status"] == "beneficial"
+    assert entry["causal"]["action_exact"]["delta"] < 0
+    assert entry["executable"] is False
+    assert entry["execution_blocker"] == "unverified_generalization"
+    assert policy.proposal(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    ) is None
+
+
+def test_sufficient_undecided_action_data_is_not_overridden_by_the_class():
+    """A per-action contrast with enough support but an interval crossing
+    zero has *answered*: "we measured this action and do not know". Class
+    evidence cannot substitute for that answer."""
+    ship = _keyed_trials("candidate", 24, 24, "sc", _ship_key(),
+                         task_family="f", site="h")
+    ship += _keyed_trials("control", 24, 0, "sk", _ship_key(),
+                          task_family="f", site="h")
+    go = _keyed_trials("candidate", 24, 12, "gc", _go_key(),
+                       task_family="f", site="h")
+    go += _keyed_trials("control", 24, 8, "gk", _go_key(),
+                        task_family="f", site="h")
+    model = TrialChoiceModel(trials=CounterfactualTrials.fit(ship + go))
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    entry = policy.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    )["proposals"][0]
+    ae = entry["causal"]["action_exact"]
+    assert ae is not None and ae["support_sufficient"] is True
+    assert ae["effect_status"] == "unresolved"
+    assert entry["executable"] is False
+    assert entry["execution_blocker"] == "unresolved"
+
+
+def test_thin_positive_action_data_deploys_on_shrinkage():
+    """Thin per-action data with a non-negative point estimate deploys on
+    the documented hierarchical shrinkage estimator — the class effect
+    enters as a prior worth one MIN_ESS cell, and the deployed estimate
+    says so."""
+    ship = _keyed_trials("candidate", 24, 24, "sc", _ship_key(),
+                         task_family="f", site="h")
+    ship += _keyed_trials("control", 24, 0, "sk", _ship_key(),
+                          task_family="f", site="h")
+    go = _keyed_trials("candidate", 4, 3, "gc", _go_key(),
+                       task_family="f", site="h")
+    go += _keyed_trials("control", 4, 0, "gk", _go_key(),
+                        task_family="f", site="h")
+    model = TrialChoiceModel(trials=CounterfactualTrials.fit(ship + go))
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    entry = policy.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    )["proposals"][0]
+    assert entry["causal"]["action_exact"]["support_sufficient"] is False
+    assert entry["executable"] is True
+    assert entry["deployment"]["estimator"] == "hierarchical_shrinkage"
+    shrunk = entry["deployment"]["delta"]
+    assert 0.0 < shrunk < entry["causal"]["expected_delta"]
+
+
+def test_store_without_action_counters_deploys_on_class_evidence():
+    """A payload predating per-action counters keeps presence (the
+    ``action_index`` proves the in-context canary ran) but cannot supply an
+    action contrast — the deployment estimate names the weaker basis it
+    actually used."""
+    trials = CounterfactualTrials.fit(_scoped_events())
+    payload = trials.to_dict()
+    del payload["action_cells"]
+    legacy = CounterfactualTrials.from_dict(payload)
+    model = TrialChoiceModel(trials=legacy)
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    entry = policy.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    )["proposals"][0]
+    assert entry["causal"]["generalization_level"] == "exact"
+    assert entry["causal"]["action_exact"] is None
+    assert entry["executable"] is True
+    assert entry["deployment"]["estimator"] == "class_evidence"
+
+
+def test_action_cells_roundtrip_through_serialization():
+    """v11 stores persist the per-action counter cells; resolution after a
+    round-trip still supplies the action's own contrast."""
+    trials = CounterfactualTrials.fit(_scoped_events())
+    assert trials.action_cells
+    restored = CounterfactualTrials.from_dict(
+        json.loads(json.dumps(trials.to_dict()))
+    )
+    assert restored.action_cells == trials.action_cells
+    estimate = restored.resolve(
+        task_family="f", site="h", model_kind="click", model_overlap=0,
+        proposal_kind="click", proposal_overlap=1,
+        proposal_action_key=_go_key(),
+    )
+    assert estimate["action_exact"]["effect_status"] == "beneficial"
+
+
+# ------------------------------------------- signed action confirmations
+#
+# A same-context class action may bridge to active authority through a
+# completed contextual canary. External attestations are cryptographically
+# bound to action identity, context scope, and the evidence they cite;
+# unsigned, forged, or mis-scoped records fail closed.
+
+
+def _cross_context_go_events():
+    """"Go" randomized only at another site; "Ship" beneficial at f/h — so
+    the "Go" query answers same-context class evidence with no in-context
+    canary record."""
+    ship = _keyed_trials("candidate", 24, 24, "sc", _ship_key(),
+                         task_family="f", site="h")
+    ship += _keyed_trials("control", 24, 0, "sk", _ship_key(),
+                          task_family="f", site="h")
+    go_elsewhere = _keyed_trials("candidate", 24, 24, "oc", _go_key(),
+                                 task_family="f", site="o")
+    go_elsewhere += _keyed_trials("control", 24, 0, "ok", _go_key(),
+                                  task_family="f", site="o")
+    return ship + go_elsewhere
+
+
+def test_same_context_class_needs_a_canary_record():
+    """No in-context randomization and no confirmation → blocked."""
+    model = TrialChoiceModel.fit(_cross_context_go_events())
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    entry = policy.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    )["proposals"][0]
+    assert entry["causal"]["generalization_level"] == "same_context_class"
+    assert entry["causal"]["action_randomized_anywhere"] is True
+    assert entry["causal"]["action_randomized_in_context"] is False
+    assert entry["executable"] is False
+    assert entry["execution_blocker"] == "unverified_generalization"
+
+
+def test_signed_confirmation_bridges_same_context_class():
+    """A confirmation signed by a configured key, scoped to this
+    family/site, attests the out-of-model canary and lets the class
+    estimate deploy under the ``class_evidence`` label."""
+    from jev_ultrafast._learning.policy import (
+        mint_action_confirmation,
+    )
+    signer = EvidenceSigner(b"\x11" * 32)
+    record = mint_action_confirmation(
+        signer, action_key=_go_key(), task_family="f", site="h",
+        evidence_digest="d" * 64,
+    )
+    model = TrialChoiceModel.fit(_cross_context_go_events())
+    policy = CausalChoicePolicy(
+        mode="active", trial_model=model,
+        confirmation_verify_keys=(signer.key_id,),
+        action_confirmations=(record,),
+    )
+    entry = policy.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    )["proposals"][0]
+    assert entry["executable"] is True
+    assert entry["deployment"]["estimator"] == "class_evidence"
+
+
+def test_signed_confirmation_scope_does_not_travel():
+    """A confirmation minted for another family is not evidence here."""
+    from jev_ultrafast._learning.policy import (
+        mint_action_confirmation,
+    )
+    signer = EvidenceSigner(b"\x12" * 32)
+    record = mint_action_confirmation(
+        signer, action_key=_go_key(), task_family="other", site="h",
+    )
+    model = TrialChoiceModel.fit(_cross_context_go_events())
+    policy = CausalChoicePolicy(
+        mode="active", trial_model=model,
+        confirmation_verify_keys=(signer.key_id,),
+        action_confirmations=(record,),
+    )
+    entry = policy.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    )["proposals"][0]
+    assert entry["executable"] is False
+    assert entry["execution_blocker"] == "unverified_generalization"
+
+
+def test_forged_or_tampered_confirmations_fail_closed():
+    """Signatures verify at construction: a record signed by an
+    unconfigured key, or tampered after signing, is rejected before it can
+    ever reach the gate."""
+    from jev_ultrafast._learning.policy import (
+        mint_action_confirmation,
+    )
+    signer = EvidenceSigner(b"\x13" * 32)
+    other = EvidenceSigner(b"\x14" * 32)
+    record = mint_action_confirmation(signer, action_key=_go_key())
+    # Signed by a key the policy does not trust.
+    with pytest.raises(ValueError, match="signature verification"):
+        CausalChoicePolicy(
+            mode="active",
+            confirmation_verify_keys=(other.key_id,),
+            action_confirmations=(record,),
+        )
+    # Tampered after signing — the digest no longer matches.
+    forged = dict(record, task_family="f")
+    with pytest.raises(ValueError, match="signature verification"):
+        CausalChoicePolicy(
+            mode="active",
+            confirmation_verify_keys=(signer.key_id,),
+            action_confirmations=(forged,),
+        )
+    # Signed records without configured verification are never trusted.
+    with pytest.raises(ValueError, match="require confirmation_verify_keys"):
+        CausalChoicePolicy(mode="active", action_confirmations=(record,))
+    # The unsigned compatibility path is closed once verification exists.
+    with pytest.raises(ValueError, match="cannot be combined"):
+        CausalChoicePolicy(
+            mode="active",
+            confirmation_verify_keys=(signer.key_id,),
+            confirmed_action_keys=(_go_key(),),
+        )

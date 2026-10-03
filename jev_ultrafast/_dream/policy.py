@@ -9,6 +9,7 @@ from typing import ClassVar
 
 from ..privacy import action_goal_overlap
 from .common import _stable_hash
+from .policylang import normalize_rules, program_adjustment, program_stop
 
 __all__ = [
     'ExplorationPolicy',
@@ -43,6 +44,16 @@ class ExplorationPolicy:
     select_quota: int = 55
     max_actions: int = 60
     no_progress_window: int = 3
+    # The verified policy program (Phase 20): the structural surface.
+    # ``rules`` is a tuple of ``{"when": <bool expr>, "add": <num expr>}``
+    # ASTs over the fixed ``policylang`` vocabulary, and ``stop_when`` an
+    # optional boolean expression over run features. The knobs are a
+    # parameter vector; the program is a mutable *policy computation* —
+    # validated, serializable, digestible, replayable, and interpreted by
+    # a fixed trusted interpreter (``_dream/policylang.py``). Empty is the
+    # historical default: a program-free policy keeps its digest exactly.
+    rules: tuple = ()
+    stop_when: dict | None = None
 
     # The declarative policy DSL (Phase 18): the entire vocabulary a
     # candidate may write. Each field declares its JSON type and, where
@@ -51,6 +62,8 @@ class ExplorationPolicy:
     # introspection, and mutation cannot drift apart. ``type`` is ``str``,
     # ``int``, or ``number`` (int-or-float); ``bool`` is never an integer
     # here — a flag must not silently satisfy a numeric envelope.
+    # ``program-rules``/``program-expr`` fields carry verified policylang
+    # ASTs, validated by ``policylang.normalize_rules`` at construction.
     _FIELD_SPECS: ClassVar[dict] = {
         "name": {"type": "str", "nonempty": True},
         "version": {"type": "int", "min": 1},
@@ -68,6 +81,8 @@ class ExplorationPolicy:
         "select_quota": {"type": "int", "min": 1, "max": 250},
         "max_actions": {"type": "int", "min": 1, "max": 120},
         "no_progress_window": {"type": "int", "min": 2, "max": 10},
+        "rules": {"type": "program-rules"},
+        "stop_when": {"type": "program-expr"},
     }
 
     @classmethod
@@ -79,9 +94,20 @@ class ExplorationPolicy:
         return {k: dict(v) for k, v in cls._FIELD_SPECS.items()}
 
     def __post_init__(self):
+        # The program validates first: construction is the verification
+        # boundary — a policy object that exists at all carries a proven
+        # AST. Normalized (canonical) forms are stored back so digest and
+        # serialization never depend on the writer's key order.
+        rules, stop = normalize_rules(
+            getattr(self, "rules") or (), getattr(self, "stop_when")
+        )
+        object.__setattr__(self, "rules", rules)
+        object.__setattr__(self, "stop_when", stop)
         for name, spec in self._FIELD_SPECS.items():
-            value = getattr(self, name)
             kind = spec["type"]
+            if kind.startswith("program"):
+                continue
+            value = getattr(self, name)
             if kind == "str":
                 if not isinstance(value, str):
                     raise ValueError(f"{name} must be a string")
@@ -108,7 +134,7 @@ class ExplorationPolicy:
             elif hi is not None and value > hi:
                 raise ValueError(f"{name} must be at most {hi}")
 
-    def candidate_score(self, action: dict, goal_tokens: set[str], order: int, overlap=None) -> float:
+    def candidate_score(self, action: dict, goal_tokens: set[str], order: int, overlap=None, context=None) -> float:
         if overlap is None:
             overlap = action_goal_overlap(action, goal_tokens)
         bonus = {
@@ -116,7 +142,46 @@ class ExplorationPolicy:
             "select": self.select_bonus,
             "click": self.click_bonus,
         }.get(action.get("kind"), 0.0)
-        return (overlap ** self.overlap_exponent) * self.goal_overlap_weight + bonus - order * self.order_penalty
+        base = (overlap ** self.overlap_exponent) * self.goal_overlap_weight + bonus - order * self.order_penalty
+        if not self.rules:
+            return base
+        return base + program_adjustment(
+            self.rules, self._score_features(action, order, overlap, context)
+        )
+
+    @staticmethod
+    def _score_features(action: dict, order: int, overlap, context) -> dict:
+        """The candidate/run feature record the score rules evaluate over.
+
+        Run features (``no_progress``, ``steps_taken``) describe the
+        trajectory *before* this decision — uniform across candidates at a
+        step, and zero when the caller supplies no context.
+        """
+        kind = action.get("kind")
+        ctx = context or {}
+        return {
+            "overlap": float(overlap),
+            "offered_rank": float(order),
+            "is_click": 1.0 if kind == "click" else 0.0,
+            "is_fill": 1.0 if kind == "fill" else 0.0,
+            "is_select": 1.0 if kind == "select" else 0.0,
+            "is_upload": 1.0 if kind == "upload" else 0.0,
+            "is_control": 0.0
+            if kind in {"click", "fill", "select", "upload"}
+            else 1.0,
+            "has_node": 1.0 if action.get("node") is not None else 0.0,
+            "no_progress": float(ctx.get("no_progress", 0.0) or 0.0),
+            "steps_taken": float(ctx.get("steps_taken", 0.0) or 0.0),
+        }
+
+    def should_stop(self, features: dict) -> bool:
+        """The program's extra stopping authority — additive only.
+
+        The base ``no_progress_window`` check applies independently and can
+        never be weakened: ``stop_when`` may block a run earlier, never
+        later.
+        """
+        return program_stop(self.stop_when, features or {})
 
     def quota_for(self, kind: str) -> int:
         return {
@@ -126,7 +191,15 @@ class ExplorationPolicy:
         }.get(kind, self.model_action_limit)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        data = asdict(self)
+        # Program fields serialize only when non-default — a program-free
+        # policy keeps its historical digest byte-for-byte, so every stored
+        # run_started record written before the AST existed still verifies.
+        if not self.rules:
+            data.pop("rules", None)
+        if self.stop_when is None:
+            data.pop("stop_when", None)
+        return data
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ExplorationPolicy":
@@ -139,9 +212,11 @@ class ExplorationPolicy:
         return cls(**payload)
 
     # Behavior fields are the DSL minus identity — derived from the spec
-    # so the two can never drift.
+    # so the two can never drift. Program fields join the digest material
+    # conditionally (see ``behavior_digest``) so a program-free policy
+    # keeps its historical behavior digest.
     _BEHAVIOR_FIELDS: ClassVar[tuple] = tuple(
-        k for k in _FIELD_SPECS if k not in ("name", "version")
+        k for k in _FIELD_SPECS if k not in ("name", "version", "rules", "stop_when")
     )
 
     @property
@@ -157,6 +232,10 @@ class ExplorationPolicy:
         candidates that differ in identity but not in what the agent would do.
         """
         material = {field: getattr(self, field) for field in self._BEHAVIOR_FIELDS}
+        if self.rules:
+            material["rules"] = [dict(rule) for rule in self.rules]
+        if self.stop_when is not None:
+            material["stop_when"] = self.stop_when
         return _stable_hash(json.dumps(material, sort_keys=True, separators=(",", ":")))
 
 
@@ -206,6 +285,39 @@ class ReplayMetrics:
     @property
     def score_per_world(self) -> float:
         return self.score / self.worlds if self.worlds else 0.0
+
+
+def _mutate_first_const(node, factor: float):
+    """Scale the first ``const`` leaf inside a policylang AST by ``factor``.
+
+    Depth-first over the fixed node vocabulary; returns the original
+    object when no constant exists so callers can detect a no-op. The
+    result is *rewritten*, not revalidated — ``ExplorationPolicy``
+    construction validates it like every other candidate.
+    """
+    (op, arg), = node.items()
+    if op == "const":
+        return {"const": float(arg) * factor}
+    children = []
+    if op in {"cmp", "clamp", "if"}:
+        children = [c for c in arg if isinstance(c, dict)]
+    elif op == "pow":
+        children = [arg[0]]
+    elif op in {"neg", "abs", "not"}:
+        children = [arg]
+    elif isinstance(arg, list):
+        children = [c for c in arg if isinstance(c, dict)]
+    for child in children:
+        new = _mutate_first_const(child, factor)
+        if new is not child:
+            if op in {"neg", "abs", "not"}:
+                return {op: new}
+            out = [
+                new if c is child else c
+                for c in arg
+            ]
+            return {op: out}
+    return node
 
 
 def mutate_policies(base: ExplorationPolicy) -> list[ExplorationPolicy]:
@@ -333,6 +445,63 @@ def mutate_policies(base: ExplorationPolicy) -> list[ExplorationPolicy]:
         specs.append({field_name: getattr(defaults, field_name)})
     for field_name in ("click_bonus", "fill_bonus", "select_bonus"):
         specs.append({field_name: 0.0})
+
+    # ------------------------------------------------------------------
+    # Program mutations (Phase 20): real structural moves on the verified
+    # policy AST — introduce a rule, remove a rule, perturb a constant
+    # *inside* an expression tree, change the stopping expression. These
+    # change what the policy computes; no scalar perturbation of the knob
+    # vector expresses "add a conditional rule" or "drop this feature
+    # interaction". Every candidate is written through the declared DSL
+    # surface and validated by the same constructor boundary.
+    # ------------------------------------------------------------------
+    _SEED_RULES = (
+        # Gate: a fill with no goal overlap loses its kind prior.
+        {"when": {"and": [{"feature": "is_fill"},
+                          {"cmp": ["==", {"feature": "overlap"}, {"const": 0}]}]},
+         "add": {"const": -1.0}},
+        # Deep-catalogue actions are suspect.
+        {"when": {"cmp": [">=", {"feature": "offered_rank"}, {"const": 10}]},
+         "add": {"const": -1.0}},
+        # Recovery bias: while progress has stalled, prefer clicks.
+        {"when": {"and": [{"feature": "is_click"},
+                          {"cmp": [">=", {"feature": "no_progress"}, {"const": 2}]}]},
+         "add": {"const": 1.0}},
+        # Interaction: fills earn extra credit per unit of goal overlap.
+        {"when": {"feature": "is_fill"},
+         "add": {"mul": [{"feature": "overlap"}, {"const": 0.5}]}},
+    )
+    _SEED_STOP = {"cmp": [">=", {"feature": "no_progress"}, {"const": 2}]}
+
+    if not base.rules and base.stop_when is None:
+        for rule in _SEED_RULES:
+            specs.append({"rules": (rule,)})
+        specs.append({"rules": _SEED_RULES[:2]})
+        specs.append({"stop_when": _SEED_STOP})
+    else:
+        for index in range(len(base.rules)):
+            # Structural removal: drop rule ``index`` outright.
+            specs.append({
+                "rules": tuple(
+                    rule for j, rule in enumerate(base.rules) if j != index
+                )
+            })
+            # Structural edit: scale the first constant inside this rule's
+            # adjustment expression — an AST node rewrite, not a knob move.
+            for factor in (0.5, 1.5):
+                specs.append({
+                    "rules": tuple(
+                        {**rule, "add": _mutate_first_const(rule["add"], factor)}
+                        if j == index else rule
+                        for j, rule in enumerate(base.rules)
+                    )
+                })
+        # Growth: a new rule joins the existing program.
+        specs.append({"rules": tuple(base.rules) + (_SEED_RULES[0],)})
+        # Stopping-expression moves: introduce one, or remove the existing.
+        specs.append({
+            "stop_when": _SEED_STOP if base.stop_when is None else None
+        })
 
     candidates = []
     seen = {base.behavior_digest}

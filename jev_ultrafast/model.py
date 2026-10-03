@@ -115,16 +115,33 @@ def _goal_tokens(goal):
     return set(tokenize(goal))
 
 
-def _candidate_score(action, goal_tokens, order, exploration_policy=None, overlap=None):
+def _candidate_score(action, goal_tokens, order, exploration_policy=None, overlap=None, context=None):
     if exploration_policy is not None:
-        return exploration_policy.candidate_score(action, goal_tokens, order, overlap=overlap)
+        return exploration_policy.candidate_score(action, goal_tokens, order, overlap=overlap, context=context)
     if overlap is None:
         overlap = action_goal_overlap(action, goal_tokens)
     kind_bonus = {"fill": 1.5, "select": 1.0, "click": 0.5}.get(action.get("kind"), 0)
     return overlap * 10 + kind_bonus - order / 100000
 
 
-def candidate_actions(actions, goal, limit=None, exploration_policy=None, upload_names=()):
+def _policy_run_context(history) -> dict:
+    """The run features a policy program may score against.
+
+    Derived from the same browser-action history the ``no_progress_window``
+    check reads — a streak of consecutive non-wait actions without a page
+    change, and the count of actions taken. Program-free policies skip it.
+    """
+    browser = [h for h in history or () if h.get("kind") not in {"verification", "approval"}]
+    streak = 0
+    for h in reversed(browser):
+        if h.get("kind") != "wait" and h.get("page_changed") is not True:
+            streak += 1
+        else:
+            break
+    return {"no_progress": float(streak), "steps_taken": float(len(browser))}
+
+
+def candidate_actions(actions, goal, limit=None, exploration_policy=None, upload_names=(), context=None):
     """Goal-aware, operation-balanced candidate selection.
 
     System controls (scroll/wait/key) are retained. Per-kind quotas prevent one
@@ -159,7 +176,8 @@ def candidate_actions(actions, goal, limit=None, exploration_policy=None, upload
     ranked = sorted(
         regular,
         key=lambda pair: _candidate_score(
-            pair[1], tokens, pair[0], exploration_policy, overlap=overlaps[id(pair[1])]
+            pair[1], tokens, pair[0], exploration_policy, overlap=overlaps[id(pair[1])],
+            context=context,
         ),
         reverse=True,
     )
@@ -284,6 +302,12 @@ def choose(state, goal, history, backend=None, exploration_policy=None, percepti
         candidates, omitted_for_model = candidate_actions(
             state["actions"], goal, exploration_policy=exploration_policy,
             upload_names=upload_names,
+            context=(
+                _policy_run_context(history)
+                if exploration_policy is not None
+                and getattr(exploration_policy, "rules", None)
+                else None
+            ),
         )
         elements, targets, controls = action_space(candidates, upload_names=upload_names)
     labels = {

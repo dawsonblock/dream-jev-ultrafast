@@ -16,6 +16,12 @@ qualification tooling itself. This check fails closed when:
    must cover the whole trusted base.
 
     uv run python scripts/check_tcb.py            # check, write nothing
+
+This is the *internal* consistency check — it imports ``jev_ultrafast.tcb``
+from the tree it inspects, which is fine for CI drift detection but is not
+an adversarial trust root. Verifying a release you did not build runs
+through ``scripts/verify_release.py``: a self-contained verifier that
+imports nothing from the artifact and can be copied out of the tree.
 """
 
 import hashlib

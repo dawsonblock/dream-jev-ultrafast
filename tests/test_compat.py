@@ -6,6 +6,8 @@ private helper historically importable from the module, monkeypatchability of
 module-level names, and deterministic digest/serialization outputs.
 """
 
+import pytest
+
 import jev_ultrafast._dream as _dream
 import jev_ultrafast._learning as _learning
 import jev_ultrafast.dream as dream
@@ -105,14 +107,15 @@ def test_policy_and_mutation_digests_unchanged():
         "aae1c8f45eb2e7c2e5f1a1dd6102615eb25b69c244d28bea7141181b0cd62226"
     )
     # The scalar candidates still lead — Phase 19 appends structural
-    # moves after them, so the count and tail evolve by design.
+    # moves after them, Phase 20 appends verified program mutations
+    # last, so the count and tail evolve by design.
     digests = [m.digest for m in dream.mutate_policies(dream.ExplorationPolicy())]
-    assert len(digests) == 73
+    assert len(digests) == 79
     assert digests[0] == (
         "828e8d89efb0a08a89f622dad00f2b4678e9e9c6e85c7b26dbdef41547dcad94"
     )
     assert digests[-1] == (
-        "4e426b56863aca83c12495c373ea13f83ba8f715bc4bf043ac12a3cbe34ec1f1"
+        "2c328e09a0e76ee54618399117d418b9d1619ea49d29ed0dcc9e6b10ed2fa5c1"
     )
 
 
@@ -139,9 +142,10 @@ def test_causal_serialization_and_statistics_unchanged():
     assert dreamlearn.TRIAL_CELL_LEN == 43
     assert dreamlearn.TRIAL_COUNT_LEN == 28
     assert dreamlearn.CounterfactualTrials().to_dict() == {
-        "cells": (), "duplicates": 0, "action_index": (),
+        "cells": (), "duplicates": 0, "action_index": (), "action_cells": (),
         "invalid_units": 0, "rejected": 0, "registered": (),
-        "version": "jev-trials/10",
+        "family_order": (),
+        "version": "jev-trials/11",
     }
     masks = dreamlearn._signature_masks(
         ["click", "high", "navigation", "primary", "1", "0-4", "fill"])
@@ -158,7 +162,9 @@ def test_package_import_does_not_pull_browser_stack():
 
     ``Agent``/``Browser`` bind lazily — the learning and dream layers stay
     usable on hosts with no CDP stack. Verified in a subprocess so the
-    suite's own imports cannot contaminate module state.
+    suite's own imports cannot contaminate module state. This test must
+    pass on a host *without* browser_harness installed: it never resolves
+    the lazily-bound names.
     """
     import subprocess
     import sys
@@ -173,10 +179,19 @@ def test_package_import_does_not_pull_browser_stack():
             "assert 'browser_harness' not in sys.modules; "
             "assert 'Browser' in dir(jev_ultrafast); "
             "import jev_ultrafast.dreamlearn, jev_ultrafast.dream; "
-            "from jev_ultrafast import Agent, Browser; "
-            "assert Agent.__name__ == 'Agent'",
+            "assert 'jev_ultrafast.browser' not in sys.modules",
         ],
         capture_output=True,
         text=True,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_lazy_agent_browser_exports_resolve_with_browser_runtime():
+    """The lazy ``Agent``/``Browser`` exports resolve when the browser
+    runtime is installed — a separate fact from import-time isolation."""
+    pytest.importorskip("browser_harness")
+    from jev_ultrafast import Agent, Browser
+
+    assert Agent.__name__ == "Agent"
+    assert Browser.__name__ == "Browser"

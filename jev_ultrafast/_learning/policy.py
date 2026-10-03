@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from ..signing import (
+    CONFIRMATION_DOMAIN,
+    verify_keys_from_env,
+    verify_signature,
+)
+from .causal import CounterfactualTrials
 
 if TYPE_CHECKING:
     from typing import Iterable
@@ -12,8 +21,77 @@ if TYPE_CHECKING:
     from .observational import ChoiceModel
 
 __all__ = [
+    'CONFIRMATION_VERIFY_KEYS_ENV',
     'CausalChoicePolicy',
+    'action_confirmation_digest',
+    'mint_action_confirmation',
 ]
+
+
+CONFIRMATION_VERIFY_KEYS_ENV = "JEV_CONFIRMATION_VERIFY_KEYS"
+
+
+# The shrinkage prior weight: the class estimate enters worth one
+# MIN_ESS cell of evidence against the action's own thin contrast.
+_MIN_ESS = CounterfactualTrials.MIN_ESS
+
+
+def mint_action_confirmation(
+    signer,
+    *,
+    action_key: str,
+    task_family: str | None = None,
+    site: str | None = None,
+    evidence_digest: str | None = None,
+    confirmed_at_ms: int | None = None,
+) -> dict:
+    """Mint a signed ``jev-action-confirmation/1`` record.
+
+    The operator's attestation that a contextual canary of this action
+    completed outside this model — bound to the action identity, an
+    optional task-family/site scope, and the evidence digest it cites.
+    ``signer`` is any object exposing ``key_id`` and ``sign_hex`` (an
+    ``EvidenceSigner``, or a KMS/HSM-backed shim).
+    """
+    import time
+
+    record = {
+        "schema": "jev-action-confirmation/1",
+        "action_key": str(action_key),
+        "task_family": task_family,
+        "site": site,
+        "evidence_digest": evidence_digest,
+        "confirmed_at_ms": int(
+            confirmed_at_ms if confirmed_at_ms is not None else time.time() * 1000
+        ),
+        "key_id": signer.key_id,
+    }
+    record["signature"] = signer.sign_hex(
+        action_confirmation_digest(record), domain=CONFIRMATION_DOMAIN
+    )
+    return record
+
+
+def action_confirmation_digest(record: dict) -> str:
+    """Canonical digest of a signed action-confirmation record.
+
+    The digest covers the attestation — the action identity, its context
+    scope, the evidence it cites, and when it was made — everything except
+    the signature fields themselves.
+    """
+    import hashlib
+
+    payload = {
+        key: record.get(key)
+        for key in (
+            "schema", "action_key", "task_family", "site",
+            "evidence_digest", "confirmed_at_ms",
+        )
+        if key in record
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -92,6 +170,17 @@ class CausalChoicePolicy:
     # level names fail closed at construction.
     active_generalization_levels: tuple[str, ...] = ("exact",)
     confirmed_action_keys: tuple[str, ...] = ()
+    # Signed contextual-canary confirmations (schema
+    # ``jev-action-confirmation/1``): each record attests that a completed
+    # canary of this action identity exists, bound to an evidence digest
+    # and optionally scoped to a task family/site. When
+    # ``confirmation_verify_keys`` is configured — explicitly or through
+    # ``JEV_CONFIRMATION_VERIFY_KEYS`` — only cryptographically verified
+    # records count and the unsigned ``confirmed_action_keys`` compatibility
+    # path is closed; leaving everything unconfigured keeps the legacy
+    # unsigned behavior (documented compatibility, never silently strict).
+    action_confirmations: tuple[dict, ...] = ()
+    confirmation_verify_keys: tuple[str, ...] | None = None
 
     MODES = ("shadow", "canary", "active")
     TRIAL_LEVELS = ("family+site", "site", "family", "pooled")
@@ -121,9 +210,83 @@ class CausalChoicePolicy:
                 f"generalization levels {self.GENERALIZATION_LEVELS}; "
                 f"got {sorted(unknown_gen)}"
             )
+        verify_keys = self.confirmation_verify_keys
+        if verify_keys is None:
+            verify_keys = tuple(sorted(verify_keys_from_env(CONFIRMATION_VERIFY_KEYS_ENV)))
+        verify_keys = tuple(str(k).strip() for k in verify_keys if str(k).strip())
+        object.__setattr__(self, "confirmation_verify_keys", verify_keys)
+        if verify_keys and self.confirmed_action_keys:
+            raise ValueError(
+                "confirmed_action_keys is the unsigned compatibility path — "
+                "it cannot be combined with configured confirmation_verify_keys "
+                "(use signed action_confirmations instead)"
+            )
+        if self.action_confirmations and not verify_keys:
+            raise ValueError(
+                "action_confirmations require confirmation_verify_keys — "
+                "an unverified signed record would be an untrusted bypass"
+            )
+        confirmations = []
+        for record in self.action_confirmations:
+            record = dict(record)
+            if record.get("schema") != "jev-action-confirmation/1":
+                raise ValueError("action_confirmations records must carry schema jev-action-confirmation/1")
+            if not isinstance(record.get("action_key"), str) or not record["action_key"]:
+                raise ValueError("action_confirmations records require an action_key")
+            digest = action_confirmation_digest(record)
+            ok = verify_signature(
+                str(record.get("key_id") or ""),
+                digest,
+                str(record.get("signature") or ""),
+                domain=CONFIRMATION_DOMAIN,
+            ) and str(record.get("key_id") or "") in set(verify_keys)
+            if not ok:
+                raise ValueError(
+                    "action_confirmation failed signature verification — "
+                    "a forged or unsigned confirmation cannot bridge class evidence"
+                )
+            confirmations.append(record)
+        object.__setattr__(self, "action_confirmations", tuple(confirmations))
         object.__setattr__(
             self, "_confirmed_keys", {str(k) for k in self.confirmed_action_keys}
         )
+
+    def _action_confirmed(
+        self, causal_entry: dict, task_family: str | None, site: str | None
+    ) -> bool:
+        """True when a contextual canary of this action is on record.
+
+        Two channels, one semantics — the store's own randomized record
+        (``action_randomized_in_context``: the action *was* the candidate
+        arm inside the answering scope) or an external attestation. The
+        external path is cryptographically bound when verification keys
+        are configured; without them the unsigned ``confirmed_action_keys``
+        compatibility set applies. A signed record's declared scope must
+        also cover this query — a confirmation for a different task family
+        or site does not travel.
+        """
+        if causal_entry.get("action_randomized_in_context"):
+            return True
+        key = causal_entry.get("action_key")
+        if key is None:
+            return False
+        if not self.confirmation_verify_keys:
+            return key in self._confirmed_keys
+        # Signed path: unsigned raw keys are closed the moment verification
+        # keys exist — construction already refused to combine them.
+        family = str(task_family or "").strip().lower()
+        host = str(site or "").strip().lower()
+        for record in self.action_confirmations:
+            if record.get("action_key") != key:
+                continue
+            rf = record.get("task_family")
+            rs = record.get("site")
+            if rf and str(rf).strip().lower() != family:
+                continue
+            if rs and str(rs).strip().lower() != host:
+                continue
+            return True
+        return False
 
     def rank(
         self,
@@ -229,7 +392,12 @@ class CausalChoicePolicy:
                 if causal_entry is not None
                 else None
             )
-            blocker = self._execution_blocker(causal_entry, refuted=refuted)
+            blocker = self._execution_blocker(
+                causal_entry, refuted=refuted, task_family=task_family, site=site,
+            )
+            deployment = None
+            if blocker is None and causal_entry is not None:
+                deployment = self._deployment_estimate(causal_entry)
             entries.append({
                 "id": candidate.get("id"),
                 "kind": candidate.get("kind"),
@@ -266,6 +434,11 @@ class CausalChoicePolicy:
                 "causal": causal_entry,
                 "observational": observational,
                 "execution_blocker": blocker,
+                # The estimate the executable path actually deploys on —
+                # which estimator produced it and its deployed delta /
+                # implied probability. ``None`` when the entry cannot
+                # execute: a blocked candidate has no deployed estimate.
+                "deployment": deployment,
                 "executable": bool(self.mode == "active" and blocker is None),
             })
         tiers = {"beneficial": 0, "unresolved": 1, "insufficient_data": 2}
@@ -316,7 +489,12 @@ class CausalChoicePolicy:
         }
 
     def _execution_blocker(
-        self, causal_entry: dict | None, *, refuted: bool = False
+        self,
+        causal_entry: dict | None,
+        *,
+        refuted: bool = False,
+        task_family: str | None = None,
+        site: str | None = None,
     ) -> str | None:
         """The named reason this candidate cannot execute under ``active`` —
         or ``None`` when every active-evidence requirement holds.
@@ -329,11 +507,30 @@ class CausalChoicePolicy:
         must supply a valid finite causal probability; and the evidence must
         come from a context-specific stratum this policy trusts for active
         use — pooled randomized evidence is a hypothesis source, not
-        execution authority; and the evidence must generalize to *this
-        exact action identity* — class-level evidence for an action that
-        was itself never randomized is a canary hypothesis, not active
-        authority, unless the confirmed list records a completed
-        contextual canary for that identity.
+        execution authority.
+
+        The exactness gate then decides what the class estimate may be
+        *deployed* for — presence and evidence are different facts:
+
+        - the action's own measured contrast (``action_exact``) is checked
+          first and can only veto or outrank: established-harmful on *this*
+          action beats a beneficial class, and a supported contrast that
+          has not established benefit is exact evidence that we do not
+          know — not an invitation for class data to override it;
+        - ``exact`` generalization (the action identity itself randomized
+          under the enforced signature) deploys on the action's own
+          established effect, or — when its own data is thin — on the
+          documented hierarchical shrinkage estimator;
+        - ``same_context_class`` bridges to active authority only through
+          a completed contextual canary of this action (``_action_confirmed``:
+          the store's own in-context randomization record, or a signed /
+          operator-attested confirmation), then through the same
+          shrinkage rule — and when the store has no per-action counters
+          at all, on the class estimate itself under the ``class_evidence``
+          estimator label.
+
+        ``None`` (an entry built before generalization annotation existed)
+        or an unrecognized value fails closed.
         """
         if causal_entry is None:
             return "harmful" if refuted else "no_causal_evidence"
@@ -356,30 +553,124 @@ class CausalChoicePolicy:
         trial_level = causal_entry.get("trial_level")
         if trial_level not in self.active_trial_levels:
             return "pooled_only" if trial_level == "pooled" else "unsupported_stratum"
-        # Exact-action authority: the answering stratum must have
-        # randomized *this action identity* (``generalization_level`` in the
-        # allowed set — ``exact`` by default), or class-level evidence must
-        # be bridged by a contextual canary of this action — either derived
-        # from the trial store itself (``action_randomized_in_context``: the
-        # action was itself the randomized arm inside the answering
-        # context's scope, which *is* a completed contextual canary — the
-        # "successful" half is supplied by the established-beneficial
-        # contrast this gate already required) or recorded explicitly in
-        # ``confirmed_action_keys`` for confirmations whose evidence lives
-        # outside this model. ``None`` (an entry built before generalization
-        # annotation existed) or an unrecognized value fails closed.
         level = causal_entry.get("generalization_level")
         if level is not None and str(level) not in self.GENERALIZATION_LEVELS:
             return "unverified_generalization"
+        action_exact = causal_entry.get("action_exact")
+        if isinstance(action_exact, dict):
+            # The action's own measured data answers first and can only
+            # ever veto or outrank the class estimate: an established-
+            # harmful verdict on *this* action is authoritative, and a
+            # supported but undecided contrast means the action's own
+            # evidence says "unknown" — class data cannot substitute.
+            if action_exact.get("effect_status") == "harmful":
+                return "harmful"
+            if action_exact.get("support_sufficient"):
+                if action_exact.get("effect_status") == "beneficial":
+                    return None
+                return "unresolved"
+        confirmed = self._action_confirmed(causal_entry, task_family, site)
         if str(level or "") not in set(self.active_generalization_levels):
-            confirmed = bool(causal_entry.get("action_randomized_in_context")) or (
-                causal_entry.get("action_key") is not None
-                and causal_entry.get("action_key")
-                in getattr(self, "_confirmed_keys", set())
-            )
             if not (level == "same_context_class" and confirmed):
                 return "unverified_generalization"
-        return None
+        # An active level was reached (``exact`` by default). ``exact``
+        # presence is itself the in-context canary record, so a store that
+        # predates per-action counters degrades to the confirmed path
+        # rather than inventing support — the ``class_evidence`` estimator
+        # reports that weaker basis honestly.
+        return self._shrinkage_gate(causal_entry)
+
+    def _shrinkage_gate(self, causal_entry: dict) -> str | None:
+        """Hierarchical shrinkage deployment rule for thin per-action data.
+
+        When the action's own contrast exists but cannot yet answer, the
+        deployed estimate pools it toward the established class contrast:
+
+            ``δ̂ = (w·δ_action + κ·δ_class) / (w + κ)``
+
+        with ``w = min(candidate_ess, control_ess)`` of the action contrast
+        and ``κ = CounterfactualTrials.MIN_ESS`` — the class estimate enters
+        as a prior worth one MIN_ESS cell. Documented assumptions: the
+        class effect is already established beneficial by the gates above;
+        the action's own point estimate must not contradict it (``δ_action
+        ≥ 0`` — a measured negative delta means the action's own data
+        refutes the generalization and the bridge closes); and the shrunk
+        estimate must still clear ``min_causal_delta``. Without per-action
+        counters (``action_exact is None``) the rule degenerates to the
+        class estimate under the confirmation that already fired — the
+        ``class_evidence`` estimator.
+        """
+        action_exact = causal_entry.get("action_exact")
+        delta_class = float(causal_entry.get("expected_delta") or 0.0)
+        if not isinstance(action_exact, dict):
+            return None if delta_class > self.min_causal_delta else "below_effect_threshold"
+        delta_action = action_exact.get("delta")
+        if delta_action is None or float(delta_action) < 0.0:
+            # The action's own measured outcomes contradict the class
+            # claim — generalization is not verified.
+            return "unverified_generalization"
+        w = min(
+            float(action_exact["candidate"]["ess"]),
+            float(action_exact["control"]["ess"]),
+        )
+        kappa = _MIN_ESS
+        shrunk = (w * float(delta_action) + kappa * delta_class) / (w + kappa)
+        return None if shrunk > self.min_causal_delta else "below_effect_threshold"
+
+    def _deployment_estimate(self, causal_entry: dict) -> dict:
+        """The estimate an executable entry actually deploys on.
+
+        ``estimator`` names which evidence answered — ``exact_action``
+        (the action's own established contrast), ``hierarchical_shrinkage``
+        (thin per-action data pooled toward the class effect), or
+        ``class_evidence`` (no per-action counters; the contextual-canary
+        bridge attests the action under the class estimate). The deployed
+        probability is the measured control rate plus *that* delta.
+        """
+        control_p = causal_entry.get("control_p")
+        try:
+            control_p = float(control_p)
+            if not math.isfinite(control_p):
+                control_p = None
+        except (TypeError, ValueError):
+            control_p = None
+
+        def _p(delta):
+            if control_p is None or delta is None:
+                return None
+            return min(max(control_p + float(delta), 0.0), 1.0)
+
+        delta_class = float(causal_entry.get("expected_delta") or 0.0)
+        action_exact = causal_entry.get("action_exact")
+        if (
+            isinstance(action_exact, dict)
+            and action_exact.get("support_sufficient")
+            and action_exact.get("effect_status") == "beneficial"
+        ):
+            delta = float(action_exact.get("delta") or 0.0)
+            return {
+                "estimator": "exact_action",
+                "delta": delta,
+                "p_progress": _p(delta),
+            }
+        if not isinstance(action_exact, dict):
+            return {
+                "estimator": "class_evidence",
+                "delta": delta_class,
+                "p_progress": _p(delta_class),
+            }
+        w = min(
+            float(action_exact["candidate"]["ess"]),
+            float(action_exact["control"]["ess"]),
+        )
+        shrunk = (
+            w * float(action_exact.get("delta") or 0.0) + _MIN_ESS * delta_class
+        ) / (w + _MIN_ESS)
+        return {
+            "estimator": "hierarchical_shrinkage",
+            "delta": shrunk,
+            "p_progress": _p(shrunk),
+        }
 
     def proposal(
         self,
@@ -464,6 +755,7 @@ class CausalChoicePolicy:
             "hypothesis_count": causal.get("hypothesis_count"),
             "evidence_origin": top.get("evidence_origin"),
             "support_status": top.get("support_status"),
+            "deployment": top.get("deployment"),
             "deployment_score": top.get("deployment_score"),
             "experiment_priority_score": top.get("experiment_priority_score"),
             "source": top["source"],

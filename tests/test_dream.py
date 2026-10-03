@@ -2099,8 +2099,18 @@ def test_policy_dsl_declares_the_write_surface():
     """Phase 18: the field spec is the DSL — the complete vocabulary a
     candidate may write, derived once and reused by validation."""
     schema = ExplorationPolicy.schema()
-    # Every dataclass field is declared, nothing else is.
-    assert sorted(schema) == sorted(ExplorationPolicy().to_dict())
+    # Every declared scalar field serializes; program fields join the
+    # payload only when set — a program-free policy keeps its historical
+    # digest byte-for-byte.
+    assert sorted(
+        name for name, spec in schema.items()
+        if not spec["type"].startswith("program")
+    ) == sorted(ExplorationPolicy().to_dict())
+    # A policy carrying a verified program serializes the whole vocabulary.
+    programmed = ExplorationPolicy(
+        rules=({"when": {"bool": True}, "add": {"const": 1.0}},)
+    )
+    assert "rules" in programmed.to_dict()
     # Envelopes are declared data, not scattered literals.
     assert schema["model_action_limit"] == {
         "type": "int", "min": 16, "max": 250}
@@ -2387,3 +2397,228 @@ def test_staged_slot_rejects_record_claiming_active_status(tmp_path):
     path.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="inconsistent"):
         PolicyRegistry(path).load()
+
+
+# ------------------------------------------------- policy program (Phase 20)
+#
+# The verified AST surface: rules adjust scores, ``stop_when`` adds
+# stopping authority, and structural mutation edits the program itself —
+# the moves no scalar perturbation expresses. Validation fails closed on
+# anything outside the fixed vocabulary.
+
+
+def _rule(guard, add):
+    return {"when": guard, "add": add}
+
+
+def test_policy_program_adjusts_scores_and_serializes():
+    """A conditional rule changes candidate ranking, round-trips through
+    the dict form, and revalidates on load."""
+    gate = _rule(
+        {"cmp": ["==", {"feature": "overlap"}, {"const": 0}]},
+        {"const": -5.0},
+    )
+    policy = ExplorationPolicy(rules=(gate,))
+    irrelevant = policy.candidate_score(
+        {"kind": "click"}, None, 0, overlap=0)
+    relevant = policy.candidate_score(
+        {"kind": "click"}, None, 0, overlap=1)
+    baseline = ExplorationPolicy()
+    assert irrelevant == baseline.candidate_score(
+        {"kind": "click"}, None, 0, overlap=0) - 5.0
+    # The guard does not fire on the relevant action.
+    assert relevant == baseline.candidate_score(
+        {"kind": "click"}, None, 0, overlap=1)
+    payload = policy.to_dict()
+    assert payload["rules"] == (gate,)
+    restored = ExplorationPolicy.from_dict(json.loads(json.dumps(payload)))
+    assert restored.rules == policy.rules
+    assert restored.digest == policy.digest
+
+
+def test_policy_program_interactions_and_if_bridge():
+    """An interaction term and a bool→number ``if`` bridge evaluate."""
+    policy = ExplorationPolicy(rules=(
+        _rule({"feature": "is_fill"},
+              {"mul": [{"feature": "overlap"}, {"const": 0.5}]}),
+        _rule({"feature": "is_control"},
+              {"if": [{"feature": "is_control"}, {"const": 2.0}, {"const": 0.0}]}),
+    ))
+    fill = policy.candidate_score({"kind": "fill"}, None, 0, overlap=4)
+    assert fill == ExplorationPolicy().candidate_score(
+        {"kind": "fill"}, None, 0, overlap=4) + 2.0
+    control = policy.candidate_score({"kind": "key"}, None, 0, overlap=0)
+    assert control == ExplorationPolicy().candidate_score(
+        {"kind": "key"}, None, 0, overlap=0) + 2.0
+
+
+def test_policy_program_rejects_outside_vocabulary():
+    """Every deviation from the fixed grammar fails closed: unknown nodes,
+    unknown features, wrong arity, oversized constants, deep nesting, and
+    type errors — never a partial program."""
+    bad = (
+        {"eval": "x"},
+        {"feature": "password"},
+        {"add": [{"const": 1}]},
+        {"const": 1e9},
+        {"const": float("nan")},
+        {"cmp": ["!=", {"const": 0}, {"const": 1}]},
+        {"add": [{"feature": "is_click"}, {"const": 1}]},  # bool in arith
+        {"when": {"const": 1}, "add": {"const": 1}},       # guard not bool
+        {"if": [{"const": 1}, {"const": 1}, {"const": 0}]},  # cond not bool
+        {"pow": [{"const": 2}, {"const": 9.0}]},             # exponent bound
+        {"div": [{"const": 1}, {"const": 0}]},
+    )
+    for node in bad:
+        with pytest.raises(ValueError):
+            ExplorationPolicy(rules=(_rule(node, {"const": 1})
+                                     if "when" not in node
+                                     else (node if "add" in node
+                                           else _rule(node, {"const": 1})),))
+    # Malformed rule containers and programs over the size cap also reject.
+    with pytest.raises(ValueError):
+        ExplorationPolicy(rules=({"when": {"bool": True}},))
+    with pytest.raises(ValueError):
+        ExplorationPolicy(rules=tuple(
+            _rule({"bool": True}, {"const": 1}) for _ in range(17)))
+    deep = {"const": 1}
+    for _ in range(9):
+        deep = {"neg": deep}
+    with pytest.raises(ValueError):
+        ExplorationPolicy(rules=(_rule({"bool": True}, deep),))
+
+
+def test_policy_program_evaluation_is_total_and_bounded():
+    """The interpreter never raises on feature values — unknown features
+    read as zero, arithmetic stays finite."""
+    wild = ExplorationPolicy(rules=(
+        _rule({"cmp": ["<", {"feature": "overlap"}, {"const": 1}]},
+              {"pow": [{"const": 1000}, {"const": 2.0}]}),
+    ))
+    score = wild.candidate_score({"kind": "click"}, None, 0, overlap=0)
+    assert score == score  # finite
+    assert abs(score) <= 1e12
+
+
+def test_policy_stop_when_is_additive_only():
+    """``stop_when`` may block earlier, never later: the base window still
+    fires on its own and the program cannot un-block it."""
+    early = ExplorationPolicy(
+        no_progress_window=5,
+        stop_when={"cmp": [">=", {"feature": "no_progress"}, {"const": 2}]},
+    )
+    assert early.should_stop({"no_progress": 2, "steps_taken": 10}) is True
+    assert early.should_stop({"no_progress": 1, "steps_taken": 10}) is False
+    # A stop_when-free policy never adds authority.
+    assert ExplorationPolicy().should_stop(
+        {"no_progress": 99, "steps_taken": 99}) is False
+
+
+def test_structural_program_mutations_are_real_ast_moves():
+    """A program-free base gains candidates that introduce rules and a
+    stopping expression; a programmed base gains remove-rule, edit-const,
+    and growth moves — all inside the verified surface."""
+    base = ExplorationPolicy()
+    candidates = mutate_policies(base)
+    with_rules = [c for c in candidates if c.rules]
+    with_stop = [c for c in candidates if c.stop_when is not None]
+    assert with_rules and with_stop
+    for c in with_rules:
+        for rule in c.rules:
+            assert set(rule) == {"when", "add"}
+        ExplorationPolicy.from_dict(c.to_dict())
+
+    seeded = ExplorationPolicy(rules=(
+        _rule({"feature": "is_fill"}, {"const": 1.0}),
+        _rule({"bool": True}, {"const": -0.5}),
+    ), stop_when={"cmp": [">=", {"feature": "steps_taken"}, {"const": 40}]})
+    moves = mutate_policies(seeded)
+    # Removal candidates: exactly the rule-deletion shapes.
+    removals = [c for c in moves if len(c.rules) == 1]
+    assert any(c.rules == seeded.rules[:1] for c in removals)
+    assert any(c.rules == seeded.rules[1:] for c in removals)
+    # Growth: a rule appended.
+    assert any(len(c.rules) == 3 for c in moves)
+    # Stopping-expression removal is a candidate too.
+    assert any(c.stop_when is None for c in moves)
+
+
+def test_program_changes_behavior_digest_not_baseline_identity():
+    """Program fields bind into the behavior digest only when present —
+    the baseline's digests are byte-for-byte historical."""
+    base = ExplorationPolicy()
+    programmed = ExplorationPolicy(
+        rules=(_rule({"bool": True}, {"const": 1.0}),))
+    assert programmed.behavior_digest != base.behavior_digest
+    assert programmed.digest != base.digest
+    same_shape = ExplorationPolicy.from_dict(programmed.to_dict())
+    assert same_shape.behavior_digest == programmed.behavior_digest
+
+
+def test_replay_applies_the_program_to_the_recorded_catalogue(tmp_path):
+    """A rule that filters irrelevant fills reshapes the replayed offer —
+    replay measures the policy that would actually score live."""
+    store = ExperienceStore(tmp_path / "dsl.jsonl")
+    # Twenty goal-relevant clicks plus the irrelevant fill the run actually
+    # took: under the scalar ranking the fill ranks 21st and drops out of
+    # the 16-offer catalogue; a program demoting clicks lifts it in.
+    candidates = [
+        {"id": f"c{i}", "kind": "click", "label": "Go", "goal_overlap": 1}
+        for i in range(20)
+    ] + [{"id": "f0", "kind": "fill", "label": "F", "goal_overlap": 0}]
+    _append_run(store, "w0", "book the flight", [{
+        "state": "S", "next_state": "T",
+        "selected": {"id": "f0", "kind": "fill"},
+        "candidates": candidates,
+        "page_changed": True, "latency_ms": 10, "model_calls": 1,
+        "tokens": 5, "stale_or_failure": 0, "risk_events": 0,
+    }], status="done", verified=True)
+    world = ReplayWorld.from_events(store.load())
+    simulator = ReplaySimulator(world)
+    # Demote clicks below fills — a program that rewrites the ranking.
+    gate = _rule({"feature": "is_click"}, {"const": -100.0})
+    # The AST decides which recorded path the run can replay at all:
+    # scalar scoring never offers f0; the programmed policy does.
+    baseline = simulator.evaluate(ExplorationPolicy(model_action_limit=16))
+    assert baseline.per_world[0]["verdict"] == "coverage_miss"
+    gated = simulator.evaluate(
+        ExplorationPolicy(model_action_limit=16, rules=(gate,)))
+    assert gated.per_world[0]["verdict"] == "verified_success"
+
+
+def test_live_scoring_passes_run_context_to_the_program():
+    """The live catalogue path derives ``no_progress``/``steps_taken``
+    from the same history the stall check reads, and only when a program
+    exists."""
+    recovery = _rule(
+        {"and": [{"feature": "is_click"},
+                 {"cmp": [">=", {"feature": "no_progress"}, {"const": 2}]}]},
+        {"const": 100.0},
+    )
+    policy = ExplorationPolicy(rules=(recovery,), model_action_limit=16)
+    # Seventeen goal-irrelevant clicks and one goal-relevant fill: without
+    # context the fill's overlap wins and it is offered; under a stalled
+    # streak the recovery rule lifts every click above it and it falls out
+    # of the 16-offer catalogue entirely.
+    actions = [
+        {"id": f"c{i}", "kind": "click", "label": "Other"}
+        for i in range(17)
+    ] + [{"id": "f", "kind": "fill", "label": "flight"}]
+    history = [
+        {"kind": "fill", "page_changed": False},
+        {"kind": "click", "page_changed": False},
+        {"kind": "click", "page_changed": False},
+    ]
+    offered, _ = candidate_actions(
+        actions, "book a flight", exploration_policy=policy,
+        context=_ctx_from_history(history))
+    assert "f" not in {a["id"] for a in offered}
+    offered2, _ = candidate_actions(
+        actions, "book a flight", exploration_policy=policy)
+    # No context → the guard cannot fire; the fill's overlap wins.
+    assert "f" in {a["id"] for a in offered2}
+
+
+def _ctx_from_history(history):
+    from jev_ultrafast.model import _policy_run_context
+    return _policy_run_context(history)

@@ -339,6 +339,10 @@ class ReplaySimulator:
             offered = self._retained_candidates(
                 policy, transition.candidate_actions,
                 uploads_declared=transition.uploads_declared,
+                context={
+                    "no_progress": float(no_progress),
+                    "steps_taken": float(summary["actions"]),
+                },
             )
             summary["offered_candidates"] += len(offered)
             if transition.selected_id not in {item["id"] for item in offered}:
@@ -641,7 +645,10 @@ class ReplaySimulator:
                     "verified_success" if summary["success"] else "measured_terminal"
                 )
                 break
-            if no_progress >= policy.no_progress_window:
+            if no_progress >= policy.no_progress_window or policy.should_stop(
+                {"no_progress": float(no_progress),
+                 "steps_taken": float(summary["actions"])}
+            ):
                 summary["status"] = "blocked"
                 summary["verdict"] = "blocked"
                 break
@@ -654,6 +661,7 @@ class ReplaySimulator:
         candidates: Iterable[dict],
         *,
         uploads_declared: bool = False,
+        context: dict | None = None,
     ) -> list[dict]:
         """Re-derive the offered catalogue; must match model.candidate_actions.
 
@@ -682,13 +690,12 @@ class ReplaySimulator:
 
         def score(pair):
             index, action, overlap = pair
-            bonus = {
-                "fill": policy.fill_bonus,
-                "select": policy.select_bonus,
-                "click": policy.click_bonus,
-            }.get(action.get("kind"), 0.0)
-            overlap_term = (overlap ** policy.overlap_exponent) * policy.goal_overlap_weight
-            return overlap_term + bonus - index * policy.order_penalty
+            # The policy's own scorer — the same function the live path
+            # calls, including any verified policy-program adjustments —
+            # so replay measures the policy that would actually run.
+            return policy.candidate_score(
+                action, None, index, overlap=overlap, context=context
+            )
 
         def node_group(index, action):
             node = action.get("node")

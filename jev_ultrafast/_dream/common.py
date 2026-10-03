@@ -35,7 +35,7 @@ SCHEMA_VERSION = "jev-dream/4"
 SUPPORTED_SCHEMAS = {"jev-dream/1", "jev-dream/2", "jev-dream/3", SCHEMA_VERSION}
 
 
-TCB_VERSION = "jev-ultrafast-tcb/0.16"
+TCB_VERSION = "jev-ultrafast-tcb/0.17"
 
 
 SUPPORTED_TCB_VERSIONS = {
@@ -52,6 +52,7 @@ SUPPORTED_TCB_VERSIONS = {
     "jev-ultrafast-tcb/0.13",
     "jev-ultrafast-tcb/0.14",
     "jev-ultrafast-tcb/0.15",
+    "jev-ultrafast-tcb/0.16",
     TCB_VERSION,
 }
 

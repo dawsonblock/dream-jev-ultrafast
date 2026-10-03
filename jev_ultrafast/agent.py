@@ -9,6 +9,8 @@ import inspect
 import json
 import os
 import random
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -36,6 +38,7 @@ from .model import (
 from .policy import DefaultActionPolicy, assess_payload, classify_effect
 from .privacy import (
     action_goal_overlap,
+    hardened_profile,
     redact_text,
     sanitize_url,
     security_profile,
@@ -43,6 +46,7 @@ from .privacy import (
 )
 from .questions import MAX_STEPS
 from .signing import verify_keys_from_env
+from .tcb import verify_installation
 from .trace import DreamTraceRecorder, compact_candidate
 
 TERMINAL_STATUSES = {"claimed_done", "done", "blocked"}
@@ -102,18 +106,63 @@ def _model_call(fn, *args, **kwargs):
     return fn(*args, **{k: v for k, v in kwargs.items() if k in params})
 
 
-def _resolve_uploads(uploads):
+def _stage_upload_file(resolved: Path, index: int, staging_root: Path) -> dict:
+    """Snapshot a declared file into private staging and content-hash it.
+
+    The approval capability must bind *what the file is*, not where it lives:
+    a path+size digest lets a file swapped after approval upload content the
+    operator never reviewed. Each declared file is therefore copied into a
+    per-index subdirectory of a mode-0700 staging root (the subdirectory keeps
+    the original basename — it is the filename the page observes), hashed in
+    the same streaming pass, and the *staged* path is what reaches
+    ``DOM.setFileInputFiles``. Between staging and dispatch the source file
+    may change freely: the uploaded bytes are the snapshot.
+    """
+    target_dir = staging_root / f"{index:02d}"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    staged = target_dir / resolved.name
+    digest = hashlib.sha256()
+    size = 0
+    with resolved.open("rb") as src, staged.open("wb") as dst:
+        while True:
+            chunk = src.read(1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+            dst.write(chunk)
+        dst.flush()
+        os.fsync(dst.fileno())
+    staged.chmod(0o600)
+    return {
+        "name": resolved.name,
+        # The declared path is retained for provenance/audit only — dispatch
+        # always uses ``staged_path``.
+        "path": str(resolved),
+        "staged_path": str(staged),
+        "size": size,
+        "content_sha256": digest.hexdigest(),
+    }
+
+
+def _resolve_uploads(uploads, staging_root=None):
     """Operator-declared upload allowlist.
 
     The model only ever sees basenames and an index; the filesystem path is
     resolved and validated here, at construction, never from page or model
     input. ``JEV_UPLOADS`` (a ``os.pathsep``-separated list) supplies the same
     set when the caller leaves the parameter unset.
+
+    Every entry is snapshotted into private staging immediately: the declared
+    content is copied under ``staging_root`` (a fresh mode-0700 temp dir when
+    none is supplied) and content-hashed, so the bytes that were declared are
+    the bytes any later approval and dispatch must cover.
     """
     if uploads is None:
         raw = os.environ.get("JEV_UPLOADS", "")
         uploads = [part for part in raw.split(os.pathsep) if part.strip()] if raw.strip() else []
     entries, seen = [], set()
+    resolved_paths = []
     for item in uploads:
         path = Path(str(item).strip()).expanduser()
         try:
@@ -125,9 +174,19 @@ def _resolve_uploads(uploads):
         if resolved in seen:
             continue
         seen.add(resolved)
-        entries.append({"name": resolved.name, "path": str(resolved), "size": resolved.stat().st_size})
-    if len(entries) > 32:
+        resolved_paths.append(resolved)
+    if len(resolved_paths) > 32:
         raise ValueError("at most 32 upload files may be declared")
+    if resolved_paths:
+        if staging_root is None:
+            staging_root = Path(tempfile.mkdtemp(prefix="jev-uploads-"))
+        else:
+            staging_root.mkdir(parents=True, exist_ok=True)
+        os.chmod(staging_root, 0o700)
+        entries = [
+            _stage_upload_file(resolved, index, staging_root)
+            for index, resolved in enumerate(resolved_paths)
+        ]
     return entries
 
 
@@ -176,18 +235,36 @@ class Agent:
         # closed at agent construction rather than only when trusted input
         # happens to be requested.
         profile = security_profile()
-        if guarantee == "trusted" and profile == "strict":
+        if profile == "qualified":
+            # A qualified run must prove what is running before it runs:
+            # the installed tree re-verifies against its signed release
+            # manifest under a pinned key, the full release set hashes
+            # correctly, and the trusted-base boundary is intact.
+            release_violations = verify_installation()
+            if release_violations:
+                raise RuntimeError(
+                    "JEV_SECURITY_PROFILE=qualified refuses to start — "
+                    "release verification failed:\n  - "
+                    + "\n  - ".join(release_violations)
+                )
+        if guarantee == "trusted" and hardened_profile():
             raise ValueError(
-                "JEV_SECURITY_PROFILE=strict refuses trusted input — only "
-                "atomic isolated-world execution is a hardened posture."
+                f"JEV_SECURITY_PROFILE={profile} refuses trusted input — "
+                "only atomic isolated-world execution is a hardened posture."
             )
         # The upload allowlist is operator configuration, not page data: each
-        # entry is resolved to a real regular file here so dispatch never maps
-        # model or page input onto the filesystem.
-        self.uploads = _resolve_uploads(uploads)
-        if self.uploads and profile == "strict":
+        # entry is resolved to a real regular file, snapshotted into private
+        # staging, and content-hashed here so dispatch never maps model or
+        # page input onto the filesystem — and post-approval replacement of
+        # the source file cannot change the bytes that were approved.
+        if uploads or os.environ.get("JEV_UPLOADS"):
+            self._upload_staging = Path(tempfile.mkdtemp(prefix="jev-uploads-"))
+        else:
+            self._upload_staging = None
+        self.uploads = _resolve_uploads(uploads, staging_root=self._upload_staging)
+        if self.uploads and hardened_profile():
             raise ValueError(
-                "JEV_SECURITY_PROFILE=strict refuses file upload — "
+                f"JEV_SECURITY_PROFILE={profile} refuses file upload — "
                 "DOM.setFileInputFiles is a browser-mediated mutation with no "
                 "in-world transactional form."
             )
@@ -381,7 +458,41 @@ class Agent:
         uploads = getattr(self, "uploads", None) or []
         if not 0 <= file_index < len(uploads):
             raise ValueError("UPLOAD file selection is outside the declared set")
-        return uploads[file_index]
+        return self._stage_upload(uploads[file_index])
+
+    def _staging_root(self):
+        root = getattr(self, "_upload_staging", None)
+        if root is None:
+            root = Path(tempfile.mkdtemp(prefix="jev-uploads-"))
+            self._upload_staging = root
+        return root
+
+    def _stage_upload(self, entry):
+        """Ensure an upload entry carries a staged content snapshot.
+
+        ``_resolve_uploads`` stages at declaration; entries injected by a
+        caller that bypassed it are staged lazily so every dispatch path
+        still binds file content, never a mutable path.
+        """
+        if entry.get("staged_path") and entry.get("content_sha256"):
+            return entry
+        try:
+            index = next(
+                i for i, candidate in enumerate(self.uploads) if candidate is entry
+            )
+        except StopIteration:
+            index = 0
+        try:
+            resolved = Path(entry["path"]).resolve(strict=True)
+        except OSError:
+            raise ValueError("upload path does not exist") from None
+        if not resolved.is_file():
+            raise ValueError("upload path is not a regular file")
+        staged = _stage_upload_file(resolved, index, self._staging_root())
+        staged["path"] = entry["path"]
+        staged["name"] = entry.get("name") or staged["name"]
+        entry.update(staged)
+        return entry
 
     def _elapsed(self):
         if self.state.get("started_at") is None:
@@ -1170,17 +1281,26 @@ class Agent:
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before file selection. Choose again.")
                 entry = self._resolve_upload(decision)
-                file_path = entry["path"]
+                # Dispatch targets the staged snapshot, not the declared path:
+                # the grant must cover the exact bytes being uploaded, and a
+                # file swapped after approval can never change them.
+                file_path = entry["staged_path"]
                 payload_preview = entry["name"]
 
             payload_result = None
             payload_digest = None
             if file_path is not None:
-                # The approved payload is the resolved file itself — the grant
-                # binds path+size, so a file swapped after approval can never
-                # be the file the operator reviewed.
+                # The approved payload is the staged file's content — re-hash
+                # the snapshot at decision time so tampering with the staged
+                # copy itself also fails the grant comparison closed.
+                staged_hash = hashlib.sha256()
+                with Path(file_path).open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1 << 20), b""):
+                        staged_hash.update(chunk)
+                if staged_hash.hexdigest() != entry["content_sha256"]:
+                    raise ValueError("staged upload content changed since declaration")
                 payload_digest = hashlib.sha256(
-                    f"{file_path}\n{entry['size']}".encode("utf-8")
+                    f"jev-upload/v1\n{entry['content_sha256']}\n{entry['size']}\n{entry['name']}".encode()
                 ).hexdigest()
             elif text is not None:
                 payload_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -1402,10 +1522,27 @@ class Agent:
             browser_history = [h for h in state["history"] if h.get("kind") not in {"verification", "approval"}]
             no_progress_window = getattr(getattr(self, "exploration_policy", None), "no_progress_window", 3)
             repeated = browser_history[-no_progress_window:]
+            # The verified policy program's *additional* stopping authority:
+            # ``stop_when`` may block earlier than the base window, never
+            # later — the OR keeps the base check sovereign.
+            policy = getattr(self, "exploration_policy", None)
+            program_stop = False
+            if policy is not None and getattr(policy, "stop_when", None):
+                streak = 0
+                for h in reversed(browser_history):
+                    if h.get("kind") != "wait" and h.get("page_changed") is not True:
+                        streak += 1
+                    else:
+                        break
+                program_stop = policy.should_stop(
+                    {"no_progress": streak, "steps_taken": len(browser_history)}
+                )
             state["status"] = (
                 "blocked"
-                if len(repeated) == no_progress_window
-                and all(h["page_changed"] is False and h["kind"] != "wait" for h in repeated)
+                if (
+                    len(repeated) == no_progress_window
+                    and all(h["page_changed"] is False and h["kind"] != "wait" for h in repeated)
+                ) or program_stop
                 else "ready"
             )
             if state["status"] == "blocked" and getattr(self, "dream_recorder", None):
@@ -1443,7 +1580,15 @@ class Agent:
                         ),
                     )
         finally:
-            self.browser.close()
+            try:
+                self.browser.close()
+            finally:
+                # Staged upload snapshots are a private temp tree — always
+                # collected with the run so approved content does not linger.
+                staging = getattr(self, "_upload_staging", None)
+                if staging is not None:
+                    self._upload_staging = None
+                    shutil.rmtree(staging, ignore_errors=True)
 
     def __enter__(self):
         return self

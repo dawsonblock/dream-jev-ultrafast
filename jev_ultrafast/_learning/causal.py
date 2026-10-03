@@ -143,6 +143,30 @@ _V6_CELL_LEN = 36
 _V7_CELL_LEN = 37
 
 
+# An action cell is a context (14 coordinates) + action_key + arm + the
+# full counter block — one more key field than a class cell.
+_ACTION_CELL_LEN = _TRIAL_KEY_LEN + 1 + TRIAL_COUNT_LEN
+
+
+# Trial-decision fields that make two experiment-tagged transitions the
+# *same* assignment on the legacy path. Step-scoped fields (``state``,
+# ``phase``, per-step outcomes) deliberately do not participate: one trial
+# stamped on two transitions may legitimately differ there, while any
+# difference in the decision itself means two experiments under one run.
+_LEGACY_TRIAL_IDENTITY_FIELDS = (
+    "experiment_id", "arm", "assignment_probability",
+    "proposal_id", "proposal_kind", "proposal_effect", "proposal_role",
+    "proposal_overlap", "proposal_offered_rank", "proposal_action_key",
+    "proposal_digest", "model_choice_id", "model_choice_kind",
+    "model_choice_effect", "model_choice_role", "model_choice_overlap",
+    "model_choice_offered_rank", "task_key", "task_family", "site",
+    "instance_id", "stamped_digest", "choice_model_digest",
+    "policy_behavior_digest", "offered_catalogue_digest",
+    "expected_delta", "proposal_p_progress", "proposal_uncertainty",
+    "expected_utility_delta",
+)
+
+
 OUTCOME_VECTOR_SCHEMA = "jev-outcome-vector/1"
 
 
@@ -333,6 +357,16 @@ class CounterfactualTrials:
     # reuse the cell machinery; only ``candidate``-arm rows matter for
     # exactness (the candidate arm is what assigned the proposal).
     action_index: tuple[tuple, ...] = ()
+    # Exact-action counters: ``(trial-context, action_key, arm)`` cells
+    # carrying the same sufficient statistics ``cells`` carries. Presence in
+    # ``action_index`` says *that* an action was randomized; these cells
+    # carry *how it fared* — the per-action ESS, delta, and confidence
+    # sequence ``resolve`` reports under ``action_exact``, so "this action
+    # was present in randomized data" can never masquerade as "this action
+    # has established causal evidence". Cells exist only for stores fitted
+    # after this schema — older payloads keep presence and report
+    # ``action_exact: None``.
+    action_cells: tuple[tuple, ...] = ()
     # Experimental-unit diagnostics (Phase 4): runs that presented two or
     # more *distinct* assignments, or an assignment ordered after the run's
     # terminal event, are invalid experimental units — they are excluded
@@ -353,11 +387,28 @@ class CounterfactualTrials:
     # over this registered union with observed cells, never cell count
     # alone.
     registered: tuple[tuple, ...] = ()
-    version: str = "jev-trials/10"
+    # Online alpha allocation (Phase 6): trial contexts in first-
+    # declaration order. Every hypothesis that joins the family — observed
+    # or declared — receives an *irrevocable* geometric share of
+    # ``SEQUENTIAL_ALPHA`` at the ordinal it declared under, so a
+    # hypothesis added after a deployment decision can never retroactively
+    # dilute the threshold that decision was made under. Stores built
+    # before ordering was recorded cannot recover chronology: they receive
+    # a deterministic reconstructed order (sorted contexts) at load, which
+    # is then equally irrevocable once serialized.
+    family_order: tuple[tuple, ...] = ()
+    version: str = "jev-trials/11"
 
     MIN_ESS = 8.0
     MIN_EFFECT = 0.0
     SEQUENTIAL_ALPHA = 0.05
+    # Geometric spending rate for the online hypothesis family: context i
+    # (0-based declaration order) receives ``SEQUENTIAL_ALPHA · ρ·(1−ρ)ⁱ``,
+    # so the sum over any number of hypotheses stays strictly below
+    # ``SEQUENTIAL_ALPHA`` — the allocation is irrevocable and unbounded
+    # family growth is always affordable, at the cost of later hypotheses
+    # receiving exponentially smaller shares.
+    ALPHA_SPEND_RATE = 0.5
     CENSOR_RATE_MAX = 0.5
     CENSOR_RATE_GAP = 0.25
 
@@ -372,8 +423,11 @@ class CounterfactualTrials:
             else:
                 loose.append(event)
         acc: dict[tuple, list] = {}
+        action_acc: dict[tuple, list] = {}
         action_entries: set[tuple] = set()
         registered_entries: set[tuple] = set()
+        declared_order: list[tuple] = []
+        declared_set: set = set()
         duplicates = 0
         invalid_units = 0
         rejected = 0
@@ -387,7 +441,9 @@ class CounterfactualTrials:
             quarantined or censored: a test that ran and produced no
             usable cells still consumed a slot in the family error budget.
             A meta whose context cannot be extracted at all cannot name a
-            hypothesis and is simply not declarable.
+            hypothesis and is simply not declarable. First declaration also
+            fixes the context's position in the online allocation order —
+            its share of the family error budget is irrevocable from here.
             """
             try:
                 context = _trial_context(meta, transition)
@@ -397,6 +453,9 @@ class CounterfactualTrials:
             registered_entries.add(
                 (*context, arm if arm in {"candidate", "control"} else "invalid")
             )
+            if context not in declared_set:
+                declared_set.add(context)
+                declared_order.append(context)
 
         def _proposal_action_key(meta: dict, transition: dict | None) -> str | None:
             """The exact-action identity of the assigned proposal, if known.
@@ -430,37 +489,8 @@ class CounterfactualTrials:
                 label=candidate.get("label"),
             )
 
-        def record(meta, outcome, reason, page_changed, transition, run_costs):
-            """Fold one arm assignment into its context cell.
-
-            ``page_changed`` is the executed step's telemetry (None when the
-            trial never reached the browser); ``outcome`` is the run's class —
-            censored assignments are tallied with their termination reason but
-            carry no endpoint weight. ``run_costs`` are the run's latency,
-            tokens, and approval count, plus the run-level outcome-vector
-            signals (steps used, guard-failure markers, authority touches),
-            used only for the multi-objective utility annotation and the
-            structured secondary/safety report.
-            """
-            # Declare before validating: the assignment event registered
-            # the hypothesis even if the record proves malformed below.
-            _declare(meta, transition)
-            arm = str(meta.get("arm") or "")
-            try:
-                propensity = float(meta.get("assignment_probability"))
-            except (TypeError, ValueError):
-                return False
-            if arm not in {"candidate", "control"} or not 0.0 < propensity <= 1.0:
-                return False
-            context = _trial_context(meta, transition)
-            proposal_key = _proposal_action_key(meta, transition)
-            if proposal_key is not None:
-                action_entries.add((*context, proposal_key, arm))
-            cell = acc.setdefault(
-                (*context, arm),
-                [0] * TRIAL_COUNT_LEN,
-            )
-            weight = 1.0 / propensity
+        def _fold(cell, outcome, reason, page_changed, weight, run_costs):
+            """Add one assignment's statistics into a counter cell."""
             cell[0] += 1  # assigned
             if page_changed is not None:
                 cell[2] += 1  # executed
@@ -473,7 +503,7 @@ class CounterfactualTrials:
                 # outcomes are missing data, but their *mass* is not.
                 cell[9] += weight
                 cell[_COUNT_REASON_BASE + _REASON_INDEX[reason]] += 1
-                return True
+                return
             cell[1] += 1  # analyzed (ITT denominator)
             cell[4] += float(outcome == "success") * weight
             cell[5] += weight
@@ -500,6 +530,45 @@ class CounterfactualTrials:
             )
             cell[_COUNT_OUTCOME_BASE + 4] += authority_touches * weight
             cell[_COUNT_OUTCOME_BASE + 5] += guard_failures * weight
+
+        def record(meta, outcome, reason, page_changed, transition, run_costs):
+            """Fold one arm assignment into its context cell.
+
+            ``page_changed`` is the executed step's telemetry (None when the
+            trial never reached the browser); ``outcome`` is the run's class —
+            censored assignments are tallied with their termination reason but
+            carry no endpoint weight. ``run_costs`` are the run's latency,
+            tokens, and approval count, plus the run-level outcome-vector
+            signals (steps used, guard-failure markers, authority touches),
+            used only for the multi-objective utility annotation and the
+            structured secondary/safety report.
+            """
+            # Declare before validating: the assignment event registered
+            # the hypothesis even if the record proves malformed below.
+            _declare(meta, transition)
+            arm = str(meta.get("arm") or "")
+            try:
+                propensity = float(meta.get("assignment_probability"))
+            except (TypeError, ValueError):
+                return False
+            if arm not in {"candidate", "control"} or not 0.0 < propensity <= 1.0:
+                return False
+            context = _trial_context(meta, transition)
+            weight = 1.0 / propensity
+            targets = [acc.setdefault((*context, arm), [0] * TRIAL_COUNT_LEN)]
+            proposal_key = _proposal_action_key(meta, transition)
+            if proposal_key is not None:
+                action_entries.add((*context, proposal_key, arm))
+                # The same assignment also feeds the action's own counter
+                # cell — both arms of it, since the meta records the
+                # proposal identity regardless of which arm was assigned.
+                targets.append(
+                    action_acc.setdefault(
+                        (*context, proposal_key, arm), [0] * TRIAL_COUNT_LEN
+                    )
+                )
+            for cell in targets:
+                _fold(cell, outcome, reason, page_changed, weight, run_costs)
             return True
 
         for run_id, run_events in runs.items():
@@ -594,9 +663,44 @@ class CounterfactualTrials:
                 # Pre-assignment evidence (pools older than jev-ultrafast-
                 # tcb/0.11): an experiment-tagged transition is the only
                 # assignment record that exists — analyzed as an assignment
-                # observed at execution time.
+                # observed at execution time. The one-trial invariant is
+                # enforced here too, not trusted: steps stamped with the
+                # *same* trial decision are one assignment (deduplicated —
+                # recording each would double-weight the arm), while
+                # *distinct* experiment decisions inside one run quarantine
+                # the whole unit exactly like conflicting modern
+                # assignments. A consumer validates producer assumptions
+                # rather than inheriting them; malformed legacy metas
+                # reject at the same unit gate.
+                legacy_seen: set = set()
+                legacy_distinct: list[tuple[dict, dict]] = []
                 for step in trial_steps:
-                    record(step["experiment"], outcome, reason, step.get("page_changed"), step, run_costs)
+                    meta = step["experiment"]
+                    identity = _legacy_trial_identity(meta)
+                    if identity in legacy_seen:
+                        duplicates += 1
+                        continue
+                    legacy_seen.add(identity)
+                    legacy_distinct.append((step, meta))
+                if len(legacy_distinct) > 1:
+                    for legacy_step, declared_meta in legacy_distinct:
+                        _declare(declared_meta, legacy_step)
+                    invalid_units += 1
+                    continue
+                if legacy_distinct:
+                    step, meta = legacy_distinct[0]
+                    if final is not None and _post_terminal(step, final):
+                        # The tagged step is ordered after the run's
+                        # terminal event — it cannot have produced the
+                        # outcome it would be credited with.
+                        _declare(meta, step)
+                        invalid_units += 1
+                        continue
+                    if not record(
+                        meta, outcome, reason,
+                        step.get("page_changed"), step, run_costs,
+                    ):
+                        rejected += 1
         loose_seen: set = set()
         for event in loose:
             # No run means no measurable outcome — the assignment is real but
@@ -628,9 +732,13 @@ class CounterfactualTrials:
             cells=tuple(sorted(key + tuple(counts) for key, counts in acc.items())),
             duplicates=duplicates,
             action_index=tuple(sorted(action_entries)),
+            action_cells=tuple(
+                sorted(key + tuple(counts) for key, counts in action_acc.items())
+            ),
             invalid_units=invalid_units,
             rejected=rejected,
             registered=tuple(sorted(registered_entries)),
+            family_order=tuple(declared_order),
         )
 
     def _registered_arms(self) -> dict[tuple, set]:
@@ -663,6 +771,61 @@ class CounterfactualTrials:
             | {tuple(cell[: _TRIAL_KEY_LEN - 1]) for cell in self.cells}
         )
 
+    def _alpha_allocations(self) -> dict[tuple, float]:
+        """Each declared context's irrevocable share of the family budget.
+
+        Geometric online allocation in first-declaration order: context i
+        receives ``SEQUENTIAL_ALPHA · ρ·(1−ρ)ⁱ`` with ρ =
+        ``ALPHA_SPEND_RATE`` — bounded by ``SEQUENTIAL_ALPHA`` over *any*
+        number of hypotheses, so a hypothesis added later can never
+        retroactively widen the threshold an earlier deployment decision
+        was made under (the sequential family-expansion failure mode).
+        Stores serialized before ``family_order`` existed cannot recover
+        chronology: every known context then receives the same equal share
+        — deterministic, conservative in the multi-context case, and once
+        re-serialized equally irrevocable.
+        """
+        if self.family_order:
+            allocations = {}
+            for index, context in enumerate(self.family_order):
+                ctx = tuple(context)
+                allocations[ctx] = (
+                    self.SEQUENTIAL_ALPHA
+                    * self.ALPHA_SPEND_RATE
+                    * (1.0 - self.ALPHA_SPEND_RATE) ** index
+                )
+            return allocations
+        contexts = sorted(
+            {
+                tuple(entry[: _TRIAL_KEY_LEN - 1]) for entry in self.registered
+            }
+            | {tuple(cell[: _TRIAL_KEY_LEN - 1]) for cell in self.cells}
+        )
+        if not contexts:
+            return {}
+        share = self.SEQUENTIAL_ALPHA / len(contexts)
+        return {ctx: share for ctx in contexts}
+
+    def _contrast_alpha(self, contributing: set[tuple]) -> float:
+        """The alpha a contrast may spend over its looks.
+
+        A pooled (backoff) contrast folds several declared contexts into
+        one estimate; it may only spend the *least-funded* constituent's
+        irrevocable share — pooling thin late-joining hypotheses must never
+        buy back error budget they were never allocated. A context missing
+        from the allocation map (unregistered, unobserved) receives the
+        smallest share the scheme already committed.
+        """
+        allocations = self._alpha_allocations()
+        if not contributing:
+            return self.SEQUENTIAL_ALPHA
+        tail = (
+            min(allocations.values())
+            if allocations
+            else self.SEQUENTIAL_ALPHA
+        )
+        return min(allocations.get(ctx, tail) for ctx in contributing)
+
     @property
     def hypothesis_summary(self) -> dict:
         """Registration diagnostics: declared family vs analyzed cells."""
@@ -670,6 +833,7 @@ class CounterfactualTrials:
             tuple(entry[: _TRIAL_KEY_LEN - 1]) for entry in self.registered
         }
         cell_ctxs = {tuple(cell[: _TRIAL_KEY_LEN - 1]) for cell in self.cells}
+        spent = sum(self._alpha_allocations().values())
         return {
             "declared": len(registered_ctxs),
             "registered_comparisons": len(self._registered_comparisons()),
@@ -677,6 +841,17 @@ class CounterfactualTrials:
             "declared_unobserved": len(registered_ctxs - cell_ctxs),
             "unregistered_observed": len(cell_ctxs - registered_ctxs),
             "family_size": self._hypothesis_count(),
+            "alpha_allocation": {
+                "scheme": "geometric",
+                "rate": self.ALPHA_SPEND_RATE,
+                "budget": self.SEQUENTIAL_ALPHA,
+                "spent": spent,
+                # The remaining budget is reserved for hypotheses not yet
+                # declared — the online family may grow forever without
+                # exhausting it.
+                "remaining": self.SEQUENTIAL_ALPHA - spent,
+                "declaration_order": len(self.family_order),
+            },
         }
 
     @staticmethod
@@ -763,6 +938,7 @@ class CounterfactualTrials:
                 bucket,
                 hypothesis_count=hypothesis_count,
                 hypothesis_registered=ctx in registered,
+                family_alpha=self._contrast_alpha({ctx}),
             )
         return arms
 
@@ -897,6 +1073,7 @@ class CounterfactualTrials:
         weights=None,
         hypothesis_count: int = 1,
         hypothesis_registered: bool = False,
+        family_alpha=None,
     ) -> dict:
         """Per-arm estimates plus the candidate−control contrast.
 
@@ -909,10 +1086,12 @@ class CounterfactualTrials:
         subtler case where balanced censoring could still flip the sign.
 
         ``hypothesis_count`` is the number of simultaneously tracked
-        divergences — the *registered* family unioned with observed cells;
-        the family's ``SEQUENTIAL_ALPHA`` is Bonferroni-split across them
-        before the per-look spending is applied, so no fleet of parallel
-        hypotheses can inflate the false-establishment rate.
+        divergences — the *registered* family unioned with observed cells —
+        reported for provenance. The alpha actually spent is
+        ``family_alpha``: this hypothesis's own irrevocable geometric share
+        of the family budget, fixed at declaration time, which later-joined
+        hypotheses can never dilute. Callers that cannot supply an
+        allocation fall back to an even Bonferroni split of the family.
         ``hypothesis_registered`` reports whether the comparison being
         contrasted was itself declared by both arms — preregistration
         provenance, not a gate: randomized assignment precedes outcome by
@@ -933,9 +1112,13 @@ class CounterfactualTrials:
         ]
         k = max(1, int(hypothesis_count))
         entry["hypothesis_count"] = k
-        # The family's error budget is split over the concurrent hypotheses
-        # (Bonferroni); each hypothesis then spends its share over looks.
-        family_alpha = cls.SEQUENTIAL_ALPHA / k
+        # Each hypothesis spends only its own irrevocable allocation over
+        # looks. The allocation was fixed at declaration, so the family can
+        # grow unboundedly without retroactively widening this threshold.
+        if family_alpha is None:
+            family_alpha = cls.SEQUENTIAL_ALPHA / k
+        family_alpha = min(float(family_alpha), cls.SEQUENTIAL_ALPHA)
+        entry["family_alpha"] = family_alpha
         if candidate["ess"] and control["ess"]:
             entry["delta_ci"] = _newcombe(candidate, control)
             # Establishment uses the confidence sequence: the fixed-sample
@@ -1144,18 +1327,24 @@ class CounterfactualTrials:
         def _annotate(contrast, level, enforced):
             """Attach exact-action generalization provenance to a contrast.
 
-            Three facts are reported independently, never conflated:
+            Four facts are reported independently, never conflated:
             ``action_randomized_anywhere`` (the key appears as a candidate
             arm anywhere in the store), ``action_randomized_in_context``
             (it appears inside the *answering stratum's* scope — the
             evidence-derived record that a contextual canary of this action
-            actually ran), and ``exact_action_randomized`` — which mirrors
-            ``generalization_level == "exact"`` exactly, so the flag always
-            means "deployable-precision evidence", never the looser
-            "randomized somewhere". ``generalization_level`` itself is
-            ``none`` when the query supplied no provable action identity:
-            exactness is proven, never assumed — and "identity unknown"
-            is reported distinctly from "provably only class evidence".
+            actually ran), ``action_seen_randomized`` — presence under the
+            enforced signature inside the answering stratum, identical to
+            ``generalization_level == "exact"`` — and ``action_exact``, the
+            action's *own* measured contrast over the answering scope (its
+            ESS, delta, and confidence sequence, or ``None`` when the store
+            cannot supply one). Presence and evidence are deliberately
+            different fields: "this action was randomized here" is a
+            weaker fact than "this action's own measured effect is
+            established", and only the latter is exact-action evidence.
+            ``generalization_level`` itself is ``none`` when the query
+            supplied no provable action identity: exactness is proven,
+            never assumed — and "identity unknown" is reported distinctly
+            from "provably only class evidence".
             """
             if contrast is None:
                 return None
@@ -1163,6 +1352,7 @@ class CounterfactualTrials:
             randomized_anywhere = False
             randomized_in_context = False
             contextual = level in {"family+site", "site", "family"}
+            action_contrast = None
             if proposal_action_key:
                 for entry in self.action_index:
                     if len(entry) != _TRIAL_KEY_LEN + 1:
@@ -1185,6 +1375,40 @@ class CounterfactualTrials:
                     ):
                         exact = True
                         break
+                # The action's own measured contrast: same stratum scope
+                # and enforced-signature filter as the class contrast, but
+                # keyed on this action identity alone. The cell layout is
+                # (context, action_key, arm, *counts) — counts identical to
+                # a class cell's, so the same estimator applies verbatim.
+                abucket: dict[str, list] = {}
+                acontributing: set[tuple] = set()
+                for cell in self.action_cells:
+                    if cell[_TRIAL_KEY_LEN - 1] != proposal_action_key:
+                        continue
+                    if not self._stratum_matches(cell, level, family, host):
+                        continue
+                    if any(
+                        cell[_SIGNATURE_INDEX[field]] != query[field]
+                        for field in enforced
+                    ):
+                        continue
+                    arm = cell[_TRIAL_KEY_LEN]
+                    if arm not in {"candidate", "control"}:
+                        continue
+                    slot = abucket.setdefault(arm, [0] * TRIAL_COUNT_LEN)
+                    for i, v in enumerate(cell[_TRIAL_KEY_LEN + 1:]):
+                        slot[i] += v
+                    acontributing.add(tuple(cell[: _TRIAL_KEY_LEN - 1]))
+                if "candidate" in abucket and "control" in abucket:
+                    action_contrast = self._contrast(
+                        abucket,
+                        min_effect=min_effect,
+                        weights=weights,
+                        hypothesis_count=max(1, len(acontributing)),
+                        hypothesis_registered=bool(acontributing)
+                        and acontributing <= registered_comparisons,
+                        family_alpha=self._contrast_alpha(acontributing),
+                    )
             if proposal_action_key is None:
                 generalization = "none"
             elif level == "pooled":
@@ -1196,8 +1420,22 @@ class CounterfactualTrials:
             else:
                 generalization = "same_context_class"
             annotated = dict(contrast)
+            # ``estimator`` names what the top-level contrast actually is:
+            # an estimate over the treatment *signature* (kind, effect
+            # class, role, overlap, rank, phase) — the class-level estimate.
+            # The action's own numbers live under ``action_exact``; the
+            # active gate decides which estimator may deploy.
+            annotated["estimator"] = "treatment_class"
+            annotated["class_effect"] = {
+                "delta": contrast.get("delta"),
+                "delta_cs": contrast.get("delta_cs"),
+                "effect_status": contrast.get("effect_status"),
+            }
+            # Presence under the enforced signature is a *seen* fact — not
+            # an estimate of the action's own effect.
+            annotated["action_seen_randomized"] = exact
             # The flag mirrors the emitted level exactly — deployable-
-            # precision evidence only; the looser "randomized somewhere /
+            # precision presence only; the looser "randomized somewhere /
             # in this context" facts keep their own names below.
             annotated["exact_action_randomized"] = generalization == "exact"
             annotated["action_randomized_anywhere"] = randomized_anywhere
@@ -1206,6 +1444,26 @@ class CounterfactualTrials:
             annotated["context_randomized"] = level in {"family+site", "site", "family"}
             annotated["generalization_level"] = generalization
             annotated["action_key"] = proposal_action_key
+            annotated["action_exact"] = action_contrast
+            if action_contrast is not None:
+                annotated["action_exact_ess"] = min(
+                    action_contrast["candidate"]["ess"],
+                    action_contrast["control"]["ess"],
+                )
+                annotated["action_exact_delta"] = action_contrast.get("delta")
+                annotated["action_exact_cs"] = action_contrast.get("delta_cs")
+                annotated["action_exact_support_sufficient"] = bool(
+                    action_contrast.get("support_sufficient")
+                )
+                annotated["action_exact_effect_status"] = action_contrast.get(
+                    "effect_status"
+                )
+            else:
+                annotated["action_exact_ess"] = None
+                annotated["action_exact_delta"] = None
+                annotated["action_exact_cs"] = None
+                annotated["action_exact_support_sufficient"] = None
+                annotated["action_exact_effect_status"] = None
             return annotated
         def _overlap(value):
             try:
@@ -1283,6 +1541,10 @@ class CounterfactualTrials:
                         # post-hoc and says so.
                         hypothesis_registered=bool(contributing)
                         and contributing <= registered_comparisons,
+                        # Pooled evidence spends only the least-funded
+                        # constituent's irrevocable share — never the full
+                        # family budget its members never held.
+                        family_alpha=self._contrast_alpha(contributing),
                     ),
                     "level": level,
                     "signature_level": signature_level,
@@ -1348,6 +1610,13 @@ class CounterfactualTrials:
                   for i, v in enumerate(entry))
             for entry in payload.get("action_index", ())
         )
+        action_cells = tuple(
+            tuple(str(v).replace("|", " ") if i < _TRIAL_KEY_LEN else v
+                  for i, v in enumerate(entry))
+            for entry in payload.get("action_cells", ())
+        )
+        if any(len(c) != _ACTION_CELL_LEN for c in action_cells):
+            raise ValueError("Unsupported counterfactual-trials action-cell arity")
         # Registration history is not recoverable post-hoc: stores written
         # before ``registered`` existed simply have no declarations — the
         # multiplicity family falls back to observed cells, and every
@@ -1357,15 +1626,37 @@ class CounterfactualTrials:
                   for i, v in enumerate(entry))
             for entry in payload.get("registered", ())
         )
+        family_order = tuple(
+            tuple(str(v).replace("|", " ") for v in context)
+            for context in payload.get("family_order", ())
+        )
         return cls(
             cells=cells,
             duplicates=int(payload.get("duplicates", 0) or 0),
             action_index=action_index,
+            action_cells=action_cells,
             invalid_units=int(payload.get("invalid_units", 0) or 0),
             rejected=int(payload.get("rejected", 0) or 0),
             registered=registered,
+            family_order=family_order,
             version=version,
         )
+
+
+def _legacy_trial_identity(meta: dict) -> str:
+    """Canonical decision identity of a legacy experiment-tagged transition.
+
+    Only decision fields participate — step-scoped fields like ``state``
+    and ``phase`` legitimately differ between two transitions stamped by
+    the same trial. Two *distinct* decisions under one run quarantine the
+    unit; identical ones deduplicate to a single assignment.
+    """
+    return json.dumps(
+        {field: meta.get(field) for field in _LEGACY_TRIAL_IDENTITY_FIELDS},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _post_terminal(assignment_event: dict, final: dict) -> bool:
@@ -1592,11 +1883,22 @@ class TrialChoiceModel:
             "delta_ci": ci,
             "generalization_level": estimate.get("generalization_level"),
             "exact_action_randomized": estimate.get("exact_action_randomized"),
+            "action_seen_randomized": estimate.get("action_seen_randomized"),
             "context_randomized": estimate.get("context_randomized"),
             "treatment_class_randomized": estimate.get("treatment_class_randomized"),
             "action_randomized_anywhere": estimate.get("action_randomized_anywhere"),
             "action_randomized_in_context": estimate.get("action_randomized_in_context"),
             "action_key": estimate.get("action_key"),
+            "action_exact": estimate.get("action_exact"),
+            "action_exact_ess": estimate.get("action_exact_ess"),
+            "action_exact_delta": estimate.get("action_exact_delta"),
+            "action_exact_cs": estimate.get("action_exact_cs"),
+            "action_exact_support_sufficient": estimate.get(
+                "action_exact_support_sufficient"
+            ),
+            "action_exact_effect_status": estimate.get("action_exact_effect_status"),
+            "estimator": estimate.get("estimator"),
+            "class_effect": estimate.get("class_effect"),
             "hypothesis_registered": estimate.get("hypothesis_registered"),
             "hypothesis_count": estimate.get("hypothesis_count"),
             # Provenance: this prediction comes only from randomized evidence.
@@ -1781,11 +2083,22 @@ class TrialChoiceModel:
                 # inside the answering stratum, or only its treatment class.
                 "generalization_level": estimate.get("generalization_level"),
                 "exact_action_randomized": estimate.get("exact_action_randomized"),
+                "action_seen_randomized": estimate.get("action_seen_randomized"),
                 "context_randomized": estimate.get("context_randomized"),
                 "treatment_class_randomized": estimate.get("treatment_class_randomized"),
                 "action_randomized_anywhere": estimate.get("action_randomized_anywhere"),
                 "action_randomized_in_context": estimate.get("action_randomized_in_context"),
                 "action_key": estimate.get("action_key"),
+                "action_exact": estimate.get("action_exact"),
+                "action_exact_ess": estimate.get("action_exact_ess"),
+                "action_exact_delta": estimate.get("action_exact_delta"),
+                "action_exact_cs": estimate.get("action_exact_cs"),
+                "action_exact_support_sufficient": estimate.get(
+                    "action_exact_support_sufficient"
+                ),
+                "action_exact_effect_status": estimate.get("action_exact_effect_status"),
+                "estimator": estimate.get("estimator"),
+                "class_effect": estimate.get("class_effect"),
                 "hypothesis_registered": estimate.get("hypothesis_registered"),
                 "hypothesis_count": estimate.get("hypothesis_count"),
                 "source": "randomized",
