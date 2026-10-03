@@ -29,6 +29,7 @@ from .signatures import (
     _signature_masks,
     _termination_reason,
     _trial_context,
+    action_key,
     overlap_bucket,
     phase_bucket,
     rank_bucket,
@@ -324,7 +325,24 @@ class CounterfactualTrials:
     # analysis, and counting it twice would double-weight that arm. Reported
     # so corruption stays visible instead of silently biasing an estimate.
     duplicates: int = 0
-    version: str = "jev-trials/8"
+    # Exact-action evidence index (Phase 3): ``(trial-context, action_key,
+    # arm)`` tuples — one per distinct randomized proposal identity — so
+    # ``resolve`` can tell "this exact action was randomized here" apart from
+    # "an action of this treatment class was". Entries carry the full
+    # 14-coordinate context so stratum scope and enforced-signature matching
+    # reuse the cell machinery; only ``candidate``-arm rows matter for
+    # exactness (the candidate arm is what assigned the proposal).
+    action_index: tuple[tuple, ...] = ()
+    # Experimental-unit diagnostics (Phase 4): runs that presented two or
+    # more *distinct* assignments, or an assignment ordered after the run's
+    # terminal event, are invalid experimental units — they are excluded
+    # from inference entirely and counted here, never silently analyzed.
+    invalid_units: int = 0
+    # Malformed assignment records rejected at the unit gate: bad arm,
+    # propensity outside (0, 1], or runless events that cannot form a
+    # validated experimental unit at all.
+    rejected: int = 0
+    version: str = "jev-trials/9"
 
     MIN_ESS = 8.0
     MIN_EFFECT = 0.0
@@ -343,7 +361,42 @@ class CounterfactualTrials:
             else:
                 loose.append(event)
         acc: dict[tuple, list] = {}
+        action_entries: set[tuple] = set()
         duplicates = 0
+        invalid_units = 0
+        rejected = 0
+
+        def _proposal_action_key(meta: dict, transition: dict | None) -> str | None:
+            """The exact-action identity of the assigned proposal, if known.
+
+            Live assignments (jev-ultrafast-tcb ≥ the Phase-3 recorder) carry
+            ``proposal_action_key`` directly. Older evidence only exposes the
+            proposal's identity through the executed transition's catalogue —
+            recover it from the recorded candidate so meta-only and
+            transition-derived keys share one derivation. An identity that
+            cannot be recovered is ``None``: never invented.
+            """
+            key = meta.get("proposal_action_key")
+            if isinstance(key, str) and key:
+                return key
+            if transition is None:
+                return None
+            candidate = next(
+                (
+                    c
+                    for c in transition.get("candidates") or ()
+                    if c.get("id") == meta.get("proposal_id")
+                ),
+                None,
+            )
+            if candidate is None:
+                return None
+            return action_key(
+                kind=meta.get("proposal_kind") or candidate.get("kind"),
+                effect=meta.get("proposal_effect", candidate.get("effect")),
+                role=meta.get("proposal_role", candidate.get("role")),
+                label=candidate.get("label"),
+            )
 
         def record(meta, outcome, reason, page_changed, transition, run_costs):
             """Fold one arm assignment into its context cell.
@@ -361,11 +414,15 @@ class CounterfactualTrials:
             try:
                 propensity = float(meta.get("assignment_probability"))
             except (TypeError, ValueError):
-                return
+                return False
             if arm not in {"candidate", "control"} or not 0.0 < propensity <= 1.0:
-                return
+                return False
+            context = _trial_context(meta, transition)
+            proposal_key = _proposal_action_key(meta, transition)
+            if proposal_key is not None:
+                action_entries.add((*context, proposal_key, arm))
             cell = acc.setdefault(
-                (*_trial_context(meta, transition), arm),
+                (*context, arm),
                 [0] * TRIAL_COUNT_LEN,
             )
             weight = 1.0 / propensity
@@ -381,7 +438,7 @@ class CounterfactualTrials:
                 # outcomes are missing data, but their *mass* is not.
                 cell[9] += weight
                 cell[_COUNT_REASON_BASE + _REASON_INDEX[reason]] += 1
-                return
+                return True
             cell[1] += 1  # analyzed (ITT denominator)
             cell[4] += float(outcome == "success") * weight
             cell[5] += weight
@@ -408,6 +465,7 @@ class CounterfactualTrials:
             )
             cell[_COUNT_OUTCOME_BASE + 4] += authority_touches * weight
             cell[_COUNT_OUTCOME_BASE + 5] += guard_failures * weight
+            return True
 
         for run_id, run_events in runs.items():
             run_events.sort(key=lambda e: (e.get("sequence", 0), e.get("recorded_at_ms", 0)))
@@ -445,31 +503,52 @@ class CounterfactualTrials:
                 if e.get("event") == "transition" and isinstance(e.get("experiment"), dict)
             ]
             seen: set = set()
-            if assignments:
-                for assigned_event in assignments:
-                    meta = assigned_event["experiment"]
-                    identity = (
-                        meta.get("experiment_id"),
-                        meta.get("proposal_id"),
-                        meta.get("model_choice_id"),
-                        meta.get("arm"),
-                    )
-                    if identity in seen:
-                        # A duplicated assignment record is one unit of
-                        # analysis; counting it twice would double-weight the
-                        # arm. The duplicate count is reported, not hidden.
-                        duplicates += 1
-                        continue
-                    seen.add(identity)
-                    step = cls._execution_step(meta, trial_steps)
-                    record(
-                        meta,
-                        outcome,
-                        reason,
-                        step.get("page_changed") if step is not None else None,
-                        step,
-                        run_costs,
-                    )
+            distinct: list[tuple[dict, dict]] = []
+            for assigned_event in assignments:
+                meta = assigned_event["experiment"]
+                identity = (
+                    meta.get("experiment_id"),
+                    meta.get("proposal_id"),
+                    meta.get("model_choice_id"),
+                    meta.get("arm"),
+                )
+                if identity in seen:
+                    # A duplicated assignment record is one unit of
+                    # analysis; counting it twice would double-weight the
+                    # arm. The duplicate count is reported, not hidden.
+                    duplicates += 1
+                    continue
+                seen.add(identity)
+                distinct.append((assigned_event, meta))
+            if len(distinct) > 1:
+                # One randomized assignment per experimental unit — enforced,
+                # not trusted. Two *different* assignment decisions inside one
+                # run mean the producer invariant broke or evidence was
+                # spliced together; counting both arms against one final
+                # outcome would fabricate a trial that never happened. The
+                # whole unit is quarantined, not partially analyzed.
+                invalid_units += 1
+                continue
+            if distinct:
+                assigned_event, meta = distinct[0]
+                if final is not None and _post_terminal(assigned_event, final):
+                    # An assignment ordered after the run's terminal event is
+                    # not a trial of that run — it cannot have produced the
+                    # outcome it would be credited with. The unit is invalid.
+                    invalid_units += 1
+                    continue
+                step = cls._execution_step(meta, trial_steps)
+                if not record(
+                    meta,
+                    outcome,
+                    reason,
+                    step.get("page_changed") if step is not None else None,
+                    step,
+                    run_costs,
+                ):
+                    # Malformed record (bad arm, missing/invalid propensity):
+                    # rejected at the unit gate, counted, never folded in.
+                    rejected += 1
             else:
                 # Pre-assignment evidence (pools older than jev-ultrafast-
                 # tcb/0.11): an experiment-tagged transition is the only
@@ -480,8 +559,10 @@ class CounterfactualTrials:
         loose_seen: set = set()
         for event in loose:
             # No run means no measurable outcome — the assignment is real but
-            # censored by construction, with no recorded cause. Dedup applies
-            # here too: a loose record replayed twice is still one unit.
+            # censored by construction, with no recorded cause, and its mass
+            # still counts toward the censoring bounds. It is never analyzed
+            # as an outcome. Dedup applies here too: a loose record replayed
+            # twice is still one unit.
             if event.get("event") == "experiment_assigned" and isinstance(
                 event.get("experiment"), dict
             ):
@@ -505,6 +586,9 @@ class CounterfactualTrials:
         return cls(
             cells=tuple(sorted(key + tuple(counts) for key, counts in acc.items())),
             duplicates=duplicates,
+            action_index=tuple(sorted(action_entries)),
+            invalid_units=invalid_units,
+            rejected=rejected,
         )
 
     @staticmethod
@@ -909,6 +993,7 @@ class CounterfactualTrials:
         phase=None,
         min_effect=None,
         weights=None,
+        proposal_action_key=None,
     ) -> dict | None:
         """The best-supported effect estimate for one divergence hypothesis.
 
@@ -938,7 +1023,89 @@ class CounterfactualTrials:
         exists is returned, flagged ``effect_status: insufficient_data``, so
         reporting sees the best-supported data rather than nothing.
         ``level`` and ``signature_level`` name which mask answered.
+
+        ``proposal_action_key`` binds the query to one exact action identity
+        (see ``signatures.action_key``). Every returned contrast carries the
+        Phase-3 generalization report: ``exact_action_randomized`` (this very
+        action was the candidate arm inside the answering stratum under the
+        enforced signature — identical to ``generalization_level ==
+        "exact"``), ``action_randomized_anywhere``,
+        ``action_randomized_in_context`` (the action's own randomized
+        presence inside the answering scope — the evidence-derived
+        contextual-canary record), ``treatment_class_randomized``,
+        ``context_randomized``, and ``generalization_level`` —
+        ``exact`` | ``same_context_class`` | ``cross_context_class`` |
+        ``pooled_class`` | ``none``. A query with no key reports ``none``:
+        exactness is proven, never assumed, and "identity unknown" is
+        distinguishable from "provably only class evidence".
         """
+
+        def _annotate(contrast, level, enforced):
+            """Attach exact-action generalization provenance to a contrast.
+
+            Three facts are reported independently, never conflated:
+            ``action_randomized_anywhere`` (the key appears as a candidate
+            arm anywhere in the store), ``action_randomized_in_context``
+            (it appears inside the *answering stratum's* scope — the
+            evidence-derived record that a contextual canary of this action
+            actually ran), and ``exact_action_randomized`` — which mirrors
+            ``generalization_level == "exact"`` exactly, so the flag always
+            means "deployable-precision evidence", never the looser
+            "randomized somewhere". ``generalization_level`` itself is
+            ``none`` when the query supplied no provable action identity:
+            exactness is proven, never assumed — and "identity unknown"
+            is reported distinctly from "provably only class evidence".
+            """
+            if contrast is None:
+                return None
+            exact = False
+            randomized_anywhere = False
+            randomized_in_context = False
+            contextual = level in {"family+site", "site", "family"}
+            if proposal_action_key:
+                for entry in self.action_index:
+                    if len(entry) != _TRIAL_KEY_LEN + 1:
+                        continue
+                    if (
+                        entry[_TRIAL_KEY_LEN - 1] != proposal_action_key
+                        or entry[_TRIAL_KEY_LEN] != "candidate"
+                    ):
+                        continue
+                    randomized_anywhere = True
+                    if not self._stratum_matches(entry, level, family, host):
+                        continue
+                    # ``in_context`` is a context-specific fact only: at the
+                    # pooled stratum every entry matches and the flag would
+                    # degenerate into ``randomized_anywhere``.
+                    randomized_in_context = randomized_in_context or contextual
+                    if all(
+                        entry[_SIGNATURE_INDEX[field]] == query[field]
+                        for field in enforced
+                    ):
+                        exact = True
+                        break
+            if proposal_action_key is None:
+                generalization = "none"
+            elif level == "pooled":
+                generalization = (
+                    "cross_context_class" if randomized_anywhere else "pooled_class"
+                )
+            elif exact:
+                generalization = "exact"
+            else:
+                generalization = "same_context_class"
+            annotated = dict(contrast)
+            # The flag mirrors the emitted level exactly — deployable-
+            # precision evidence only; the looser "randomized somewhere /
+            # in this context" facts keep their own names below.
+            annotated["exact_action_randomized"] = generalization == "exact"
+            annotated["action_randomized_anywhere"] = randomized_anywhere
+            annotated["action_randomized_in_context"] = randomized_in_context
+            annotated["treatment_class_randomized"] = True
+            annotated["context_randomized"] = level in {"family+site", "site", "family"}
+            annotated["generalization_level"] = generalization
+            annotated["action_key"] = proposal_action_key
+            return annotated
         def _overlap(value):
             try:
                 return overlap_bucket(int(value)) if value is not None else "unknown"
@@ -1011,10 +1178,13 @@ class CounterfactualTrials:
                     "signature_level": signature_level,
                 }
                 if contrast.get("support_sufficient"):
-                    return contrast
+                    return _annotate(contrast, level, enforced)
                 if fallback is None:
-                    fallback = contrast
-        return fallback
+                    fallback = (contrast, level, enforced)
+        if fallback is not None:
+            contrast, level, enforced = fallback
+            return _annotate(contrast, level, enforced)
+        return None
 
     @property
     def digest(self) -> str:
@@ -1063,11 +1233,33 @@ class CounterfactualTrials:
             tuple(str(v).replace("|", " ") for v in cell[:_TRIAL_KEY_LEN]) + cell[_TRIAL_KEY_LEN:]
             for cell in cells
         )
+        action_index = tuple(
+            tuple(str(v).replace("|", " ") if i < _TRIAL_KEY_LEN - 1 else v
+                  for i, v in enumerate(entry))
+            for entry in payload.get("action_index", ())
+        )
         return cls(
             cells=cells,
             duplicates=int(payload.get("duplicates", 0) or 0),
+            action_index=action_index,
+            invalid_units=int(payload.get("invalid_units", 0) or 0),
+            rejected=int(payload.get("rejected", 0) or 0),
             version=version,
         )
+
+
+def _post_terminal(assignment_event: dict, final: dict) -> bool:
+    """True when an assignment record is ordered *after* the terminal event.
+
+    Ordering evidence is ``(sequence, recorded_at_ms)`` — the same sort key
+    ``fit`` applies. Records that carry neither coordinate cannot be ordered
+    against the terminal and are *not* flagged: an old store that never
+    recorded order is not evidence of a violation, only of absence.
+    """
+    def _key(event):
+        return (event.get("sequence", 0) or 0, event.get("recorded_at_ms", 0) or 0)
+
+    return _key(assignment_event) > _key(final)
 
 
 def _candidate_probability(estimate: dict | None) -> tuple[float | None, float | None]:
@@ -1141,7 +1333,7 @@ class TrialChoiceModel:
     # alone is not enough: a family may demand a practically meaningful
     # improvement before a divergence counts as beneficial there.
     minimum_effects: tuple[tuple[str, float], ...] = ()
-    version: str = "jev-causal/2"
+    version: str = "jev-causal/3"
 
     @classmethod
     def fit(cls, events: Iterable[dict]) -> "TrialChoiceModel":
@@ -1172,6 +1364,7 @@ class TrialChoiceModel:
         task_family: str | None = None,
         site: str | None = None,
         min_effect: float | None = None,
+        proposal_label=None,
     ) -> dict | None:
         return self.trials.resolve(
             task_family=task_family,
@@ -1188,6 +1381,12 @@ class TrialChoiceModel:
             proposal_rank=proposal_rank,
             phase=phase,
             min_effect=(self.min_effect_for(task_family) if min_effect is None else min_effect),
+            proposal_action_key=action_key(
+                kind=proposal_kind,
+                effect=proposal_effect,
+                role=proposal_role,
+                label=proposal_label,
+            ),
         )
 
     def choose(
@@ -1231,6 +1430,7 @@ class TrialChoiceModel:
                 proposal_effect=candidate.get("effect"),
                 proposal_role=candidate.get("role"),
                 proposal_rank=p_rank,
+                proposal_label=candidate.get("label"),
                 model_kind=mc_kind,
                 model_overlap=mc_overlap,
                 model_effect=mc_effect,
@@ -1270,6 +1470,13 @@ class TrialChoiceModel:
             "delta_cs": estimate.get("delta_cs"),
             "delta_bounds": estimate.get("delta_bounds"),
             "delta_ci": ci,
+            "generalization_level": estimate.get("generalization_level"),
+            "exact_action_randomized": estimate.get("exact_action_randomized"),
+            "context_randomized": estimate.get("context_randomized"),
+            "treatment_class_randomized": estimate.get("treatment_class_randomized"),
+            "action_randomized_anywhere": estimate.get("action_randomized_anywhere"),
+            "action_randomized_in_context": estimate.get("action_randomized_in_context"),
+            "action_key": estimate.get("action_key"),
             # Provenance: this prediction comes only from randomized evidence.
             "source": "randomized",
         }
@@ -1290,6 +1497,7 @@ class TrialChoiceModel:
         proposal_effect=None,
         proposal_role=None,
         phase=None,
+        label=None,
     ) -> dict:
         """The candidate-side implied success probability for one action.
 
@@ -1306,6 +1514,7 @@ class TrialChoiceModel:
             proposal_effect=proposal_effect,
             proposal_role=proposal_role,
             proposal_rank=rank,
+            proposal_label=label,
             model_kind=model_kind,
             model_overlap=model_overlap,
             model_effect=model_effect,
@@ -1324,6 +1533,7 @@ class TrialChoiceModel:
                 "signature_level": None,
                 "effect_status": "insufficient_data",
                 "support_sufficient": False,
+                "generalization_level": None,
                 "source": "randomized",
             }
         delta = estimate.get("delta")
@@ -1340,6 +1550,7 @@ class TrialChoiceModel:
                 "signature_level": estimate.get("signature_level"),
                 "effect_status": estimate.get("effect_status") or "insufficient_data",
                 "support_sufficient": bool(estimate.get("support_sufficient")),
+                "generalization_level": estimate.get("generalization_level"),
                 "source": "randomized",
             }
         control_p, p_progress = _candidate_probability(estimate)
@@ -1352,6 +1563,9 @@ class TrialChoiceModel:
             "signature_level": estimate.get("signature_level"),
             "effect_status": estimate.get("effect_status"),
             "support_sufficient": estimate.get("support_sufficient"),
+            "generalization_level": estimate.get("generalization_level"),
+            "exact_action_randomized": estimate.get("exact_action_randomized"),
+            "action_key": estimate.get("action_key"),
             "source": "randomized",
         }
 
@@ -1393,6 +1607,7 @@ class TrialChoiceModel:
                 proposal_effect=candidate.get("effect"),
                 proposal_role=candidate.get("role"),
                 proposal_rank=p_rank,
+                proposal_label=candidate.get("label"),
                 model_kind=mc_kind,
                 model_overlap=mc_overlap,
                 model_effect=mc_effect,
@@ -1437,6 +1652,16 @@ class TrialChoiceModel:
                 "safety_regression": (estimate.get("safety") or {}).get("regression"),
                 "secondary_delta": estimate.get("secondary_delta"),
                 "outcome_vector": (estimate.get("candidate") or {}).get("outcome_vector"),
+                # Exact-action generalization provenance (Phase 3): whether
+                # this very action identity was the randomized candidate arm
+                # inside the answering stratum, or only its treatment class.
+                "generalization_level": estimate.get("generalization_level"),
+                "exact_action_randomized": estimate.get("exact_action_randomized"),
+                "context_randomized": estimate.get("context_randomized"),
+                "treatment_class_randomized": estimate.get("treatment_class_randomized"),
+                "action_randomized_anywhere": estimate.get("action_randomized_anywhere"),
+                "action_randomized_in_context": estimate.get("action_randomized_in_context"),
+                "action_key": estimate.get("action_key"),
                 "source": "randomized",
                 "_tier": tiers.get(status, 3),
             })

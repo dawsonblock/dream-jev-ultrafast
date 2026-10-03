@@ -137,7 +137,8 @@ def test_causal_serialization_and_statistics_unchanged():
     assert dreamlearn.TRIAL_CELL_LEN == 43
     assert dreamlearn.TRIAL_COUNT_LEN == 28
     assert dreamlearn.CounterfactualTrials().to_dict() == {
-        "cells": (), "duplicates": 0, "version": "jev-trials/8",
+        "cells": (), "duplicates": 0, "action_index": (),
+        "invalid_units": 0, "rejected": 0, "version": "jev-trials/9",
     }
     masks = dreamlearn._signature_masks(
         ["click", "high", "navigation", "primary", "1", "0-4", "fill"])

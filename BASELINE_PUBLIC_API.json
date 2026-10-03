@@ -1,0 +1,1676 @@
+{
+ "modules": {
+  "jev_ultrafast": {
+   "Agent": {
+    "kind": "class",
+    "methods": [
+     "close",
+     "command",
+     "run",
+     "snapshot"
+    ]
+   },
+   "Browser": {
+    "kind": "class",
+    "methods": [
+     "act",
+     "call",
+     "close",
+     "evaluate",
+     "fresh",
+     "observe"
+    ]
+   },
+   "CanaryEvidence": {
+    "fields": [
+     "baseline",
+     "candidate",
+     "paired_task_families",
+     "candidate_wins",
+     "baseline_wins",
+     "ties",
+     "event_head_hash",
+     "evidence_digest",
+     "baseline_digest",
+     "candidate_digest",
+     "paired_instances",
+     "sign_test_p_value"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "CanaryGate": {
+    "kind": "class",
+    "methods": [
+     "assess"
+    ]
+   },
+   "CanaryMetrics": {
+    "fields": [
+     "tasks",
+     "verified_successes",
+     "failures",
+     "risk_events",
+     "latency_ms",
+     "actions",
+     "model_calls",
+     "tokens",
+     "offered_candidates",
+     "task_families",
+     "run_ids",
+     "task_keys",
+     "family_keys",
+     "instance_ids"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "CausalChoicePolicy": {
+    "fields": [
+     "mode",
+     "trial_model",
+     "choice_model",
+     "w_causal",
+     "w_observational",
+     "min_causal_delta",
+     "active_trial_levels"
+    ],
+    "kind": "class",
+    "methods": [
+     "proposal",
+     "rank"
+    ]
+   },
+   "ChoiceModel": {
+    "fields": [
+     "samples",
+     "cells",
+     "family_cells",
+     "kind_totals",
+     "global_positive",
+     "version"
+    ],
+    "kind": "class",
+    "methods": [
+     "choose",
+     "predict",
+     "to_dict"
+    ]
+   },
+   "CostModel": {
+    "fields": [
+     "samples",
+     "token_intercept",
+     "token_per_candidate",
+     "token_residual",
+     "latency_intercept_ms",
+     "latency_per_candidate_ms",
+     "latency_residual_ms",
+     "offered_min",
+     "offered_max",
+     "distinct_offered",
+     "version"
+    ],
+    "kind": "class",
+    "methods": [
+     "predict",
+     "to_dict"
+    ]
+   },
+   "CounterfactualTrials": {
+    "fields": [
+     "cells",
+     "duplicates",
+     "version"
+    ],
+    "kind": "class",
+    "methods": [
+     "estimate",
+     "resolve",
+     "to_dict"
+    ]
+   },
+   "DecisionBackend": {
+    "kind": "class",
+    "methods": [
+     "decide"
+    ]
+   },
+   "DefaultActionPolicy": {
+    "kind": "class",
+    "methods": [
+     "assess"
+    ]
+   },
+   "DreamImprover": {
+    "kind": "class",
+    "methods": [
+     "improve"
+    ]
+   },
+   "Effect": {
+    "kind": "class",
+    "methods": []
+   },
+   "EvidenceSigner": {
+    "kind": "class",
+    "methods": [
+     "sign_hex"
+    ]
+   },
+   "ExperienceStore": {
+    "kind": "class",
+    "methods": [
+     "append",
+     "head_hash",
+     "load",
+     "reanchor",
+     "verify"
+    ]
+   },
+   "ExperimentScheduler": {
+    "fields": [
+     "budget",
+     "min_importance",
+     "coverage_scale"
+    ],
+    "kind": "class",
+    "methods": [
+     "rank"
+    ]
+   },
+   "ExplorationPolicy": {
+    "fields": [
+     "name",
+     "version",
+     "goal_overlap_weight",
+     "overlap_exponent",
+     "order_penalty",
+     "click_bonus",
+     "fill_bonus",
+     "select_bonus",
+     "model_action_limit",
+     "duplicate_node_cap",
+     "min_goal_overlap",
+     "click_quota",
+     "fill_quota",
+     "select_quota",
+     "max_actions",
+     "no_progress_window"
+    ],
+    "kind": "class",
+    "methods": [
+     "candidate_score",
+     "quota_for",
+     "to_dict"
+    ]
+   },
+   "HealthGate": {
+    "kind": "class",
+    "methods": [
+     "assess"
+    ]
+   },
+   "ObjectiveWeights": {
+    "fields": [
+     "success",
+     "verified",
+     "page_progress",
+     "latency_seconds",
+     "action",
+     "model_call",
+     "thousand_tokens",
+     "offered_candidate",
+     "stale_or_failure",
+     "risk_event",
+     "coverage_miss"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "OutcomeModel": {
+    "fields": [
+     "samples",
+     "cells",
+     "kind_totals",
+     "global_changed",
+     "version"
+    ],
+    "kind": "class",
+    "methods": [
+     "predict",
+     "to_dict"
+    ]
+   },
+   "PolicyDecision": {
+    "fields": [
+     "level",
+     "reason",
+     "effect"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "PolicyRegistry": {
+    "kind": "class",
+    "methods": [
+     "active_policy",
+     "health_from_store",
+     "load",
+     "promote",
+     "promote_from_store",
+     "reanchor",
+     "resume",
+     "rollback",
+     "stage",
+     "staged_policy",
+     "suspend"
+    ]
+   },
+   "PromotionGate": {
+    "kind": "class",
+    "methods": [
+     "assess"
+    ]
+   },
+   "ReplaySimulator": {
+    "kind": "class",
+    "methods": [
+     "evaluate"
+    ]
+   },
+   "ReplayWorld": {
+    "fields": [
+     "key",
+     "task_key",
+     "goal",
+     "start_state",
+     "tcb_version",
+     "trajectory",
+     "family_key"
+    ],
+    "kind": "class",
+    "methods": [
+     "recorded_actions"
+    ]
+   },
+   "SystemOneBackend": {
+    "fields": [
+     "url",
+     "api_key"
+    ],
+    "kind": "class",
+    "methods": [
+     "decide"
+    ]
+   },
+   "TrialChoiceModel": {
+    "fields": [
+     "trials",
+     "minimum_effects",
+     "version"
+    ],
+    "kind": "class",
+    "methods": [
+     "choose",
+     "min_effect_for",
+     "predict",
+     "rank",
+     "refuted",
+     "to_dict"
+    ]
+   },
+   "UtilityWeights": {
+    "fields": [
+     "success",
+     "failures",
+     "latency_ms",
+     "tokens",
+     "approvals",
+     "censoring"
+    ],
+    "kind": "class",
+    "methods": [
+     "arm_utility"
+    ]
+   },
+   "assess_payload": {
+    "kind": "function"
+   },
+   "classify_effect": {
+    "kind": "function"
+   },
+   "classify_payload": {
+    "kind": "function"
+   }
+  },
+  "jev_ultrafast.agent": {
+   "Agent": {
+    "kind": "class",
+    "methods": [
+     "close",
+     "command",
+     "run",
+     "snapshot"
+    ]
+   },
+   "Browser": {
+    "kind": "class",
+    "methods": [
+     "act",
+     "call",
+     "close",
+     "evaluate",
+     "fresh",
+     "observe"
+    ]
+   },
+   "BrowserError": {
+    "kind": "class",
+    "methods": []
+   },
+   "DefaultActionPolicy": {
+    "kind": "class",
+    "methods": [
+     "assess"
+    ]
+   },
+   "DreamTraceRecorder": {
+    "kind": "class",
+    "methods": [
+     "event",
+     "finish",
+     "start",
+     "transition"
+    ]
+   },
+   "ExperienceStore": {
+    "kind": "class",
+    "methods": [
+     "append",
+     "head_hash",
+     "load",
+     "reanchor",
+     "verify"
+    ]
+   },
+   "ExplorationPolicy": {
+    "fields": [
+     "name",
+     "version",
+     "goal_overlap_weight",
+     "overlap_exponent",
+     "order_penalty",
+     "click_bonus",
+     "fill_bonus",
+     "select_bonus",
+     "model_action_limit",
+     "duplicate_node_cap",
+     "min_goal_overlap",
+     "click_quota",
+     "fill_quota",
+     "select_quota",
+     "max_actions",
+     "no_progress_window"
+    ],
+    "kind": "class",
+    "methods": [
+     "candidate_score",
+     "quota_for",
+     "to_dict"
+    ]
+   },
+   "IndeterminateMutation": {
+    "kind": "class",
+    "methods": []
+   },
+   "MAX_STEPS": {
+    "kind": "int"
+   },
+   "MIN_EXPERIMENT_ARM_RATE": {
+    "kind": "float"
+   },
+   "ModelConnectionError": {
+    "kind": "class",
+    "methods": []
+   },
+   "ModelTimeoutError": {
+    "kind": "class",
+    "methods": []
+   },
+   "Path": {
+    "kind": "class",
+    "methods": [
+     "absolute",
+     "chmod",
+     "exists",
+     "expanduser",
+     "glob",
+     "group",
+     "hardlink_to",
+     "is_block_device",
+     "is_char_device",
+     "is_dir",
+     "is_fifo",
+     "is_file",
+     "is_junction",
+     "is_mount",
+     "is_socket",
+     "is_symlink",
+     "iterdir",
+     "lchmod",
+     "lstat",
+     "mkdir",
+     "open",
+     "owner",
+     "read_bytes",
+     "read_text",
+     "readlink",
+     "rename",
+     "replace",
+     "resolve",
+     "rglob",
+     "rmdir",
+     "samefile",
+     "stat",
+     "symlink_to",
+     "touch",
+     "unlink",
+     "walk",
+     "write_bytes",
+     "write_text"
+    ]
+   },
+   "PolicyRegistry": {
+    "kind": "class",
+    "methods": [
+     "active_policy",
+     "health_from_store",
+     "load",
+     "promote",
+     "promote_from_store",
+     "reanchor",
+     "resume",
+     "rollback",
+     "stage",
+     "staged_policy",
+     "suspend"
+    ]
+   },
+   "StalePage": {
+    "kind": "class",
+    "methods": []
+   },
+   "TERMINAL_STATUSES": {
+    "kind": "set"
+   },
+   "action_goal_overlap": {
+    "kind": "function"
+   },
+   "action_space": {
+    "kind": "function"
+   },
+   "annotations": {
+    "kind": "_Feature"
+   },
+   "assess_payload": {
+    "kind": "function"
+   },
+   "candidate_actions": {
+    "kind": "function"
+   },
+   "candidate_catalog_digest": {
+    "kind": "function"
+   },
+   "choose": {
+    "kind": "function"
+   },
+   "classify_effect": {
+    "kind": "function"
+   },
+   "compact_candidate": {
+    "kind": "function"
+   },
+   "experiment_plan_authority": {
+    "kind": "function"
+   },
+   "experiment_plan_digest": {
+    "kind": "function"
+   },
+   "field_context": {
+    "kind": "function"
+   },
+   "field_text": {
+    "kind": "function"
+   },
+   "redact_text": {
+    "kind": "function"
+   },
+   "sanitize_url": {
+    "kind": "function"
+   },
+   "task_key": {
+    "kind": "function"
+   },
+   "tokenize": {
+    "kind": "function"
+   },
+   "urlsplit": {
+    "kind": "function"
+   },
+   "verify_keys_from_env": {
+    "kind": "function"
+   }
+  },
+  "jev_ultrafast.browser": {
+   "Browser": {
+    "kind": "class",
+    "methods": [
+     "act",
+     "call",
+     "close",
+     "evaluate",
+     "fresh",
+     "observe"
+    ]
+   },
+   "BrowserError": {
+    "kind": "class",
+    "methods": []
+   },
+   "IndeterminateMutation": {
+    "kind": "class",
+    "methods": []
+   },
+   "MARKER": {
+    "kind": "str"
+   },
+   "Path": {
+    "kind": "class",
+    "methods": [
+     "absolute",
+     "chmod",
+     "exists",
+     "expanduser",
+     "glob",
+     "group",
+     "hardlink_to",
+     "is_block_device",
+     "is_char_device",
+     "is_dir",
+     "is_fifo",
+     "is_file",
+     "is_junction",
+     "is_mount",
+     "is_socket",
+     "is_symlink",
+     "iterdir",
+     "lchmod",
+     "lstat",
+     "mkdir",
+     "open",
+     "owner",
+     "read_bytes",
+     "read_text",
+     "readlink",
+     "rename",
+     "replace",
+     "resolve",
+     "rglob",
+     "rmdir",
+     "samefile",
+     "stat",
+     "symlink_to",
+     "touch",
+     "unlink",
+     "walk",
+     "write_bytes",
+     "write_text"
+    ]
+   },
+   "READ_STATE": {
+    "kind": "str"
+   },
+   "StalePage": {
+    "kind": "class",
+    "methods": []
+   },
+   "WORLD_NAME": {
+    "kind": "str"
+   },
+   "annotations": {
+    "kind": "_Feature"
+   },
+   "browser_operation": {
+    "kind": "function"
+   },
+   "cdp": {
+    "kind": "function"
+   },
+   "ensure_daemon": {
+    "kind": "function"
+   },
+   "fingerprint": {
+    "kind": "function"
+   }
+  },
+  "jev_ultrafast.dream": {
+   "ACTION_KINDS": {
+    "kind": "tuple"
+   },
+   "ATTESTATION_DOMAIN": {
+    "kind": "str"
+   },
+   "CanaryDecision": {
+    "fields": [
+     "approved",
+     "reason"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "CanaryEvidence": {
+    "fields": [
+     "baseline",
+     "candidate",
+     "paired_task_families",
+     "candidate_wins",
+     "baseline_wins",
+     "ties",
+     "event_head_hash",
+     "evidence_digest",
+     "baseline_digest",
+     "candidate_digest",
+     "paired_instances",
+     "sign_test_p_value"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "CanaryGate": {
+    "kind": "class",
+    "methods": [
+     "assess"
+    ]
+   },
+   "CanaryMetrics": {
+    "fields": [
+     "tasks",
+     "verified_successes",
+     "failures",
+     "risk_events",
+     "latency_ms",
+     "actions",
+     "model_calls",
+     "tokens",
+     "offered_candidates",
+     "task_families",
+     "run_ids",
+     "task_keys",
+     "family_keys",
+     "instance_ids"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "CanaryRunSummary": {
+    "fields": [
+     "run_id",
+     "task_key",
+     "verified_success",
+     "risk_events",
+     "latency_ms",
+     "actions",
+     "model_calls",
+     "tokens",
+     "offered_candidates",
+     "finished_at_ms",
+     "task_family",
+     "instance_id",
+     "pair_key"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "DreamImprover": {
+    "kind": "class",
+    "methods": [
+     "improve"
+    ]
+   },
+   "DreamReport": {
+    "fields": [
+     "selected",
+     "baseline",
+     "promotion",
+     "candidates",
+     "split_sizes",
+     "world_pool_digest",
+     "split_manifest_digest",
+     "evidence_head_hash",
+     "tcb_versions",
+     "live_canary_required",
+     "cost_model_digest",
+     "outcome_model_digest",
+     "choice_model_digest",
+     "trial_model_digest",
+     "experiment_proposals",
+     "trials_digest",
+     "trial_estimates"
+    ],
+    "kind": "class",
+    "methods": [
+     "to_dict"
+    ]
+   },
+   "EXPERIMENT_PLAN_SCHEMA": {
+    "kind": "str"
+   },
+   "ExperienceStore": {
+    "kind": "class",
+    "methods": [
+     "append",
+     "head_hash",
+     "load",
+     "reanchor",
+     "verify"
+    ]
+   },
+   "ExplorationPolicy": {
+    "fields": [
+     "name",
+     "version",
+     "goal_overlap_weight",
+     "overlap_exponent",
+     "order_penalty",
+     "click_bonus",
+     "fill_bonus",
+     "select_bonus",
+     "model_action_limit",
+     "duplicate_node_cap",
+     "min_goal_overlap",
+     "click_quota",
+     "fill_quota",
+     "select_quota",
+     "max_actions",
+     "no_progress_window"
+    ],
+    "kind": "class",
+    "methods": [
+     "candidate_score",
+     "quota_for",
+     "to_dict"
+    ]
+   },
+   "HealthDecision": {
+    "fields": [
+     "healthy",
+     "reason",
+     "reference",
+     "observed",
+     "sufficient"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "HealthGate": {
+    "kind": "class",
+    "methods": [
+     "assess"
+    ]
+   },
+   "ObjectiveWeights": {
+    "fields": [
+     "success",
+     "verified",
+     "page_progress",
+     "latency_seconds",
+     "action",
+     "model_call",
+     "thousand_tokens",
+     "offered_candidate",
+     "stale_or_failure",
+     "risk_event",
+     "coverage_miss"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "PolicyRegistry": {
+    "kind": "class",
+    "methods": [
+     "active_policy",
+     "health_from_store",
+     "load",
+     "promote",
+     "promote_from_store",
+     "reanchor",
+     "resume",
+     "rollback",
+     "stage",
+     "staged_policy",
+     "suspend"
+    ]
+   },
+   "PromotionDecision": {
+    "fields": [
+     "approved",
+     "reason",
+     "baseline",
+     "candidate",
+     "validation",
+     "holdout"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "PromotionGate": {
+    "kind": "class",
+    "methods": [
+     "assess"
+    ]
+   },
+   "RecordedTransition": {
+    "fields": [
+     "run_id",
+     "task_key",
+     "state",
+     "next_state",
+     "selected_id",
+     "selected_kind",
+     "candidate_actions",
+     "candidate_digest",
+     "selected_observed_rank",
+     "page_changed",
+     "latency_ms",
+     "model_calls",
+     "tokens",
+     "stale_or_failure",
+     "risk_events",
+     "terminal",
+     "verified",
+     "catalog",
+     "offered_digest",
+     "offered_count",
+     "selected_offered_rank",
+     "selected_propensity",
+     "experiment",
+     "causal_override"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "ReplayMetrics": {
+    "fields": [
+     "score",
+     "worlds",
+     "successes",
+     "verified_successes",
+     "actions",
+     "model_calls",
+     "tokens",
+     "latency_ms",
+     "offered_candidates",
+     "page_progress",
+     "stale_or_failures",
+     "risk_events",
+     "coverage_misses",
+     "coverage",
+     "estimated_tokens",
+     "estimated_latency_ms",
+     "estimated_score"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "ReplayResult": {
+    "fields": [
+     "metrics",
+     "per_world"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "ReplaySimulator": {
+    "kind": "class",
+    "methods": [
+     "evaluate"
+    ]
+   },
+   "ReplayWorld": {
+    "fields": [
+     "key",
+     "task_key",
+     "goal",
+     "start_state",
+     "tcb_version",
+     "trajectory",
+     "family_key"
+    ],
+    "kind": "class",
+    "methods": [
+     "recorded_actions"
+    ]
+   },
+   "SCHEMA_VERSION": {
+    "kind": "str"
+   },
+   "SUPPORTED_SCHEMAS": {
+    "kind": "set"
+   },
+   "SUPPORTED_TCB_VERSIONS": {
+    "kind": "set"
+   },
+   "TCB_VERSION": {
+    "kind": "str"
+   },
+   "_canary_run_summaries": {
+    "kind": "function"
+   },
+   "_file_lock": {
+    "kind": "function"
+   },
+   "_fsync_dir": {
+    "kind": "function"
+   },
+   "_metrics_from_canary_runs": {
+    "kind": "function"
+   },
+   "_sign_test_p_value": {
+    "kind": "function"
+   },
+   "_stable_hash": {
+    "kind": "function"
+   },
+   "candidate_catalog_digest": {
+    "kind": "function"
+   },
+   "experiment_plan_authority": {
+    "kind": "function"
+   },
+   "experiment_plan_digest": {
+    "kind": "function"
+   },
+   "experiment_plan_signature": {
+    "kind": "function"
+   },
+   "experiment_plan_signer_from_env": {
+    "kind": "function"
+   },
+   "mutate_policies": {
+    "kind": "function"
+   },
+   "new_run_id": {
+    "kind": "function"
+   },
+   "replay_pool_digest": {
+    "kind": "function"
+   },
+   "split_manifest_digest": {
+    "kind": "function"
+   },
+   "split_worlds": {
+    "kind": "function"
+   },
+   "summarize_usage": {
+    "kind": "function"
+   },
+   "task_key": {
+    "kind": "function"
+   }
+  },
+  "jev_ultrafast.dreamlearn": {
+   "CausalChoicePolicy": {
+    "fields": [
+     "mode",
+     "trial_model",
+     "choice_model",
+     "w_causal",
+     "w_observational",
+     "min_causal_delta",
+     "active_trial_levels"
+    ],
+    "kind": "class",
+    "methods": [
+     "proposal",
+     "rank"
+    ]
+   },
+   "ChoiceModel": {
+    "fields": [
+     "samples",
+     "cells",
+     "family_cells",
+     "kind_totals",
+     "global_positive",
+     "version"
+    ],
+    "kind": "class",
+    "methods": [
+     "choose",
+     "predict",
+     "to_dict"
+    ]
+   },
+   "CostModel": {
+    "fields": [
+     "samples",
+     "token_intercept",
+     "token_per_candidate",
+     "token_residual",
+     "latency_intercept_ms",
+     "latency_per_candidate_ms",
+     "latency_residual_ms",
+     "offered_min",
+     "offered_max",
+     "distinct_offered",
+     "version"
+    ],
+    "kind": "class",
+    "methods": [
+     "predict",
+     "to_dict"
+    ]
+   },
+   "CounterfactualTrials": {
+    "fields": [
+     "cells",
+     "duplicates",
+     "version"
+    ],
+    "kind": "class",
+    "methods": [
+     "estimate",
+     "resolve",
+     "to_dict"
+    ]
+   },
+   "ExperimentScheduler": {
+    "fields": [
+     "budget",
+     "min_importance",
+     "coverage_scale"
+    ],
+    "kind": "class",
+    "methods": [
+     "rank"
+    ]
+   },
+   "OUTCOME_VECTOR_SCHEMA": {
+    "kind": "str"
+   },
+   "OutcomeModel": {
+    "fields": [
+     "samples",
+     "cells",
+     "kind_totals",
+     "global_changed",
+     "version"
+    ],
+    "kind": "class",
+    "methods": [
+     "predict",
+     "to_dict"
+    ]
+   },
+   "TERMINATION_REASONS": {
+    "kind": "tuple"
+   },
+   "TRIAL_CELL_LEN": {
+    "kind": "int"
+   },
+   "TRIAL_COUNT_LEN": {
+    "kind": "int"
+   },
+   "TrialChoiceModel": {
+    "fields": [
+     "trials",
+     "minimum_effects",
+     "version"
+    ],
+    "kind": "class",
+    "methods": [
+     "choose",
+     "min_effect_for",
+     "predict",
+     "rank",
+     "refuted",
+     "to_dict"
+    ]
+   },
+   "UtilityWeights": {
+    "fields": [
+     "success",
+     "failures",
+     "latency_ms",
+     "tokens",
+     "approvals",
+     "censoring"
+    ],
+    "kind": "class",
+    "methods": [
+     "arm_utility"
+    ]
+   },
+   "_COST_BASE": {
+    "kind": "int"
+   },
+   "_COUNT_REASON_BASE": {
+    "kind": "int"
+   },
+   "_OVERLAP_BUCKETS": {
+    "kind": "tuple"
+   },
+   "_PHASE_BUCKETS": {
+    "kind": "tuple"
+   },
+   "_RANK_BUCKETS": {
+    "kind": "tuple"
+   },
+   "_REASON_BASE": {
+    "kind": "int"
+   },
+   "_REASON_INDEX": {
+    "kind": "dict"
+   },
+   "_SEQUENTIAL_SPEND": {
+    "kind": "float"
+   },
+   "_SIGNATURE_DROP_FIELDS": {
+    "kind": "tuple"
+   },
+   "_SIGNATURE_FIELDS": {
+    "kind": "tuple"
+   },
+   "_SIGNATURE_INDEX": {
+    "kind": "dict"
+   },
+   "_TRIAL_COSTS": {
+    "kind": "int"
+   },
+   "_TRIAL_KEY_LEN": {
+    "kind": "int"
+   },
+   "_TRIAL_STATS": {
+    "kind": "int"
+   },
+   "_V4_CELL_LEN": {
+    "kind": "int"
+   },
+   "_V5_CELL_LEN": {
+    "kind": "int"
+   },
+   "_V6_CELL_LEN": {
+    "kind": "int"
+   },
+   "_ZETA_1_5": {
+    "kind": "float"
+   },
+   "_arm_confidence_bounds": {
+    "kind": "function"
+   },
+   "_arm_ws": {
+    "kind": "function"
+   },
+   "_arm_wsq": {
+    "kind": "function"
+   },
+   "_arm_wsum": {
+    "kind": "function"
+   },
+   "_bernoulli_kl": {
+    "kind": "function"
+   },
+   "_bucket": {
+    "kind": "function"
+   },
+   "_candidate_probability": {
+    "kind": "function"
+   },
+   "_coord": {
+    "kind": "function"
+   },
+   "_effect_bucket": {
+    "kind": "function"
+   },
+   "_fit_cells": {
+    "kind": "function"
+   },
+   "_fit_line": {
+    "kind": "function"
+   },
+   "_kl_bound": {
+    "kind": "function"
+   },
+   "_migrate_v4_trial_cells": {
+    "kind": "function"
+   },
+   "_migrate_v5_trial_cells": {
+    "kind": "function"
+   },
+   "_migrate_v6_trial_cells": {
+    "kind": "function"
+   },
+   "_newcombe": {
+    "kind": "function"
+   },
+   "_offered_count": {
+    "kind": "function"
+   },
+   "_overlap_of": {
+    "kind": "function"
+   },
+   "_rank_of": {
+    "kind": "function"
+   },
+   "_role_bucket": {
+    "kind": "function"
+   },
+   "_run_outcome": {
+    "kind": "function"
+   },
+   "_selected_offered_rank": {
+    "kind": "function"
+   },
+   "_sequential_alpha": {
+    "kind": "function"
+   },
+   "_signature_masks": {
+    "kind": "function"
+   },
+   "_stable_hash": {
+    "kind": "function"
+   },
+   "_termination_reason": {
+    "kind": "function"
+   },
+   "_transitions": {
+    "kind": "function"
+   },
+   "_trial_context": {
+    "kind": "function"
+   },
+   "_wilson_interval": {
+    "kind": "function"
+   },
+   "_z_for_alpha": {
+    "kind": "function"
+   },
+   "overlap_bucket": {
+    "kind": "function"
+   },
+   "phase_bucket": {
+    "kind": "function"
+   },
+   "rank_bucket": {
+    "kind": "function"
+   }
+  },
+  "jev_ultrafast.model": {
+   "CLIENT": {
+    "kind": "Client"
+   },
+   "DecisionBackend": {
+    "kind": "class",
+    "methods": [
+     "decide"
+    ]
+   },
+   "MODEL_ACTION_LIMIT": {
+    "kind": "int"
+   },
+   "MODEL_BODY_LIMIT": {
+    "kind": "int"
+   },
+   "ModelConnectionError": {
+    "kind": "class",
+    "methods": []
+   },
+   "ModelTimeoutError": {
+    "kind": "class",
+    "methods": []
+   },
+   "NEXT_ACTION": {
+    "kind": "str"
+   },
+   "Protocol": {
+    "kind": "class",
+    "methods": []
+   },
+   "SystemOneBackend": {
+    "fields": [
+     "url",
+     "api_key"
+    ],
+    "kind": "class",
+    "methods": [
+     "decide"
+    ]
+   },
+   "TARGET": {
+    "kind": "str"
+   },
+   "TEXT_VALUE": {
+    "kind": "str"
+   },
+   "action_goal_overlap": {
+    "kind": "function"
+   },
+   "action_space": {
+    "kind": "function"
+   },
+   "annotations": {
+    "kind": "_Feature"
+   },
+   "assert_endpoint_allowed": {
+    "kind": "function"
+   },
+   "assert_transport_secure": {
+    "kind": "function"
+   },
+   "candidate_actions": {
+    "kind": "function"
+   },
+   "choose": {
+    "kind": "function"
+   },
+   "dataclass": {
+    "kind": "function"
+   },
+   "field_context": {
+    "kind": "function"
+   },
+   "field_text": {
+    "kind": "function"
+   },
+   "loopback_endpoint": {
+    "kind": "function"
+   },
+   "outbound_text": {
+    "kind": "function"
+   },
+   "post_json": {
+    "kind": "function"
+   },
+   "redact_text": {
+    "kind": "function"
+   },
+   "sanitize_action": {
+    "kind": "function"
+   },
+   "sanitize_page": {
+    "kind": "function"
+   },
+   "tokenize": {
+    "kind": "function"
+   },
+   "validate_choice": {
+    "kind": "function"
+   }
+  },
+  "jev_ultrafast.policy": {
+   "DefaultActionPolicy": {
+    "kind": "class",
+    "methods": [
+     "assess"
+    ]
+   },
+   "Effect": {
+    "kind": "class",
+    "methods": []
+   },
+   "Enum": {
+    "kind": "class",
+    "methods": []
+   },
+   "PolicyDecision": {
+    "fields": [
+     "level",
+     "reason",
+     "effect"
+    ],
+    "kind": "class",
+    "methods": []
+   },
+   "annotations": {
+    "kind": "_Feature"
+   },
+   "assess_payload": {
+    "kind": "function"
+   },
+   "classify_effect": {
+    "kind": "function"
+   },
+   "classify_payload": {
+    "kind": "function"
+   },
+   "dataclass": {
+    "kind": "function"
+   }
+  },
+  "jev_ultrafast.privacy": {
+   "ROUTING_LEVELS": {
+    "kind": "tuple"
+   },
+   "action_goal_overlap": {
+    "kind": "function"
+   },
+   "annotations": {
+    "kind": "_Feature"
+   },
+   "assert_endpoint_allowed": {
+    "kind": "function"
+   },
+   "assert_transport_secure": {
+    "kind": "function"
+   },
+   "loopback_endpoint": {
+    "kind": "function"
+   },
+   "outbound_text": {
+    "kind": "function"
+   },
+   "parse_qsl": {
+    "kind": "function"
+   },
+   "redact_text": {
+    "kind": "function"
+   },
+   "routing_level": {
+    "kind": "function"
+   },
+   "sanitize_action": {
+    "kind": "function"
+   },
+   "sanitize_page": {
+    "kind": "function"
+   },
+   "sanitize_url": {
+    "kind": "function"
+   },
+   "tokenize": {
+    "kind": "function"
+   },
+   "unquote": {
+    "kind": "function"
+   },
+   "urlencode": {
+    "kind": "function"
+   },
+   "urlsplit": {
+    "kind": "function"
+   },
+   "urlunsplit": {
+    "kind": "function"
+   }
+  },
+  "jev_ultrafast.signing": {
+   "ANCHOR_DOMAIN": {
+    "kind": "bytes"
+   },
+   "ATTESTATION_DOMAIN": {
+    "kind": "bytes"
+   },
+   "EXPERIMENT_PLAN_DOMAIN": {
+    "kind": "bytes"
+   },
+   "EXPERIMENT_SIGNING_KEY_ENV": {
+    "kind": "str"
+   },
+   "EXPERIMENT_VERIFY_KEYS_ENV": {
+    "kind": "str"
+   },
+   "EXPERIMENT_VERIFY_KEY_ENV": {
+    "kind": "str"
+   },
+   "Ed25519PrivateKey": {
+    "kind": "class",
+    "methods": [
+     "private_bytes",
+     "private_bytes_raw",
+     "public_key",
+     "sign"
+    ]
+   },
+   "Ed25519PublicKey": {
+    "kind": "class",
+    "methods": [
+     "public_bytes",
+     "public_bytes_raw",
+     "verify"
+    ]
+   },
+   "Encoding": {
+    "kind": "class",
+    "methods": []
+   },
+   "EvidenceSigner": {
+    "kind": "class",
+    "methods": [
+     "sign_hex"
+    ]
+   },
+   "InvalidSignature": {
+    "kind": "class",
+    "methods": []
+   },
+   "PROMOTION_SIGNING_KEY_ENV": {
+    "kind": "str"
+   },
+   "PROMOTION_VERIFY_KEYS_ENV": {
+    "kind": "str"
+   },
+   "PublicFormat": {
+    "kind": "class",
+    "methods": []
+   },
+   "REGISTRY_ANCHOR_DOMAIN": {
+    "kind": "bytes"
+   },
+   "REGISTRY_STATE_DOMAIN": {
+    "kind": "bytes"
+   },
+   "SIGNING_DOMAIN": {
+    "kind": "bytes"
+   },
+   "SIGNING_KEY_ENV": {
+    "kind": "str"
+   },
+   "VERIFY_KEYS_ENV": {
+    "kind": "str"
+   },
+   "VERIFY_KEY_ENV": {
+    "kind": "str"
+   },
+   "annotations": {
+    "kind": "_Feature"
+   },
+   "frame_digest": {
+    "kind": "function"
+   },
+   "key_id_for": {
+    "kind": "function"
+   },
+   "verify_keys_from_env": {
+    "kind": "function"
+   },
+   "verify_signature": {
+    "kind": "function"
+   }
+  },
+  "jev_ultrafast.trace": {
+   "DreamTraceRecorder": {
+    "kind": "class",
+    "methods": [
+     "event",
+     "finish",
+     "start",
+     "transition"
+    ]
+   },
+   "ExperienceStore": {
+    "kind": "class",
+    "methods": [
+     "append",
+     "head_hash",
+     "load",
+     "reanchor",
+     "verify"
+    ]
+   },
+   "action_goal_overlap": {
+    "kind": "function"
+   },
+   "annotations": {
+    "kind": "_Feature"
+   },
+   "candidate_catalog_digest": {
+    "kind": "function"
+   },
+   "classify_effect": {
+    "kind": "function"
+   },
+   "compact_candidate": {
+    "kind": "function"
+   },
+   "new_run_id": {
+    "kind": "function"
+   },
+   "redact_text": {
+    "kind": "function"
+   },
+   "sanitize_action": {
+    "kind": "function"
+   },
+   "sanitize_url": {
+    "kind": "function"
+   },
+   "summarize_usage": {
+    "kind": "function"
+   },
+   "task_key": {
+    "kind": "function"
+   },
+   "tokenize": {
+    "kind": "function"
+   }
+  }
+ },
+ "package": "jev_ultrafast",
+ "schema": "jev-baseline-api/1",
+ "schemas_on_disk": [
+  "jev-dream/4",
+  "jev-experiment-plan/1",
+  "jev-trials/8",
+  "jev-causal/2",
+  "jev-cost/2",
+  "jev-outcome/2",
+  "jev-choice/5",
+  "jev-qualify/3",
+  "jev-qualify-sig/1",
+  "jev-manifest-sig/1",
+  "jev-env-digest/1",
+  "jev-outcome-vector/1"
+ ],
+ "version": "0.9.2"
+}

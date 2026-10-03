@@ -394,42 +394,52 @@ def test_treatment_signature_backoff_reports_its_level():
 
 
 def test_never_randomized_action_class_is_flagged_not_assumed():
-    """A never-randomized action inherits a *class-level* estimate with
-    provenance, and the policy layer refuses to execute it deterministically
-    unless the estimate is established."""
+    """A never-randomized exact action inherits only *class-level* evidence.
+
+    The estimate still resolves — shadow and canary see the class effect —
+    but ``generalization_level`` reports ``same_context_class`` /
+    ``pooled_class``, never ``exact``, and the active gate refuses a
+    deterministic override: class-level exchangeability is a canary
+    hypothesis, not deployment authority. Only a completed contextual
+    canary (recorded in ``confirmed_action_keys``) or genuinely exact
+    randomized evidence opens the active path.
+    """
+    from jev_ultrafast.dreamlearn import action_key
+
     events = []
     for i in range(24):
         events += _trial_run(f"c{i}", "candidate", success=True, proposal_effect="navigate")
         events += _trial_run(f"k{i}", "control", success=False, proposal_effect="navigate")
     model = TrialChoiceModel.fit(events)
     candidates = [
-        {"id": "m", "kind": "click", "goal_overlap": 0},
-        # Same treatment *class* (kind + effect) as the measured evidence —
-        # role/rank/phase may back off, but a different effect class could
-        # never inherit this estimate.
+        {"id": "m", "kind": "click", "goal_overlap": 0, "label": "M"},
+        # Same treatment *class* (kind + effect) as the measured evidence,
+        # but a different semantic identity — this exact action was never
+        # the randomized arm.
         {"id": "never-randomized-before", "kind": "click", "goal_overlap": 1,
-         "effect": "navigate"},
+         "effect": "navigate", "label": "Checkout"},
     ]
-    ranked = model.rank(candidates, model_choice={"id": "m", "kind": "click", "goal_overlap": 0})
+    model_choice = {"id": "m", "kind": "click", "goal_overlap": 0}
+    ranked = model.rank(candidates, model_choice=model_choice)
     assert ranked and ranked[0]["id"] == "never-randomized-before"
     assert ranked[0]["source"] == "randomized"
-    # The action ID was never randomized, but its full treatment signature is
-    # exactly the measured class — kind + effect is the identity the estimate
-    # generalizes over, so this answers at "full" with randomized provenance.
-    assert ranked[0]["signature_level"] == "full"
+    # The class estimate still generalizes — the signature machinery is
+    # unchanged — but provenance now names it class-level, never exact.
     assert ranked[0]["effect_status"] == "beneficial"
+    assert ranked[0]["generalization_level"] in {
+        "same_context_class", "pooled_class"}
+    assert ranked[0]["exact_action_randomized"] is False
 
     shadow = CausalChoicePolicy(mode="shadow", trial_model=model)
-    assert shadow.proposal(
-        candidates, model_choice={"id": "m", "kind": "click", "goal_overlap": 0}
-    ) is None  # shadow observes, never acts
-    # Established but *pooled* evidence annotates and nominates canaries — it
-    # cannot drive a deterministic override in a context it never measured.
+    assert shadow.proposal(candidates, model_choice=model_choice) is None
+    # Pooled class evidence annotates and nominates canaries — it cannot
+    # drive a deterministic override in a context it never measured.
     active = CausalChoicePolicy(mode="active", trial_model=model)
-    assert active.proposal(
-        candidates, model_choice={"id": "m", "kind": "click", "goal_overlap": 0}
-    ) is None
-    # The same estimate at a context-specific stratum may execute.
+    pooled_entry = active.rank(candidates, model_choice=model_choice)["proposals"][0]
+    assert pooled_entry["execution_blocker"] == "pooled_only"
+    assert active.proposal(candidates, model_choice=model_choice) is None
+    # Even at a context-specific stratum, class-level evidence alone is not
+    # active authority for an action that was never itself randomized.
     family_events = []
     for i in range(24):
         family_events += _trial_run(
@@ -440,15 +450,226 @@ def test_never_randomized_action_class_is_flagged_not_assumed():
             task_family="f")
     family_model = TrialChoiceModel.fit(family_events)
     scoped = CausalChoicePolicy(mode="active", trial_model=family_model)
+    class_entry = scoped.rank(
+        candidates, model_choice=model_choice, task_family="f",
+    )["proposals"][0]
+    assert class_entry["causal"]["trial_level"] == "family"
+    assert class_entry["causal"]["generalization_level"] == "same_context_class"
+    assert class_entry["execution_blocker"] == "unverified_generalization"
     assert scoped.proposal(
-        candidates, model_choice={"id": "m", "kind": "click", "goal_overlap": 0},
-        task_family="f",
+        candidates, model_choice=model_choice, task_family="f",
+    ) is None
+    # A completed contextual canary — recorded by the operator as the action
+    # key it confirmed — is the explicit bridge from class evidence to
+    # active authority for this exact action.
+    novel_key = action_key(kind="click", effect="navigate", label="Checkout")
+    confirmed = CausalChoicePolicy(
+        mode="active", trial_model=family_model,
+        confirmed_action_keys=(novel_key,),
+    )
+    confirmed_entry = confirmed.rank(
+        candidates, model_choice=model_choice, task_family="f",
+    )["proposals"][0]
+    assert confirmed_entry["executable"] is True
+    assert confirmed.proposal(
+        candidates, model_choice=model_choice, task_family="f",
     ) is not None
+    # And genuinely exact evidence — the same semantic identity that was
+    # randomized — needs no confirmation at all.
+    exact_candidates = [
+        candidates[0],
+        {"id": "p2", "kind": "click", "goal_overlap": 1,
+         "effect": "navigate", "label": "Go"},
+    ]
+    exact_entry = scoped.rank(
+        exact_candidates, model_choice=model_choice, task_family="f",
+    )["proposals"][0]
+    assert exact_entry["causal"]["generalization_level"] == "exact"
+    assert exact_entry["causal"]["exact_action_randomized"] is True
+    assert exact_entry["executable"] is True
     # An *unresolved* class-level estimate blocks deterministic execution.
     thin = TrialChoiceModel.fit(_trial_run("a", "candidate") + _trial_run("b", "control"))
     assert CausalChoicePolicy(mode="active", trial_model=thin).proposal(
-        candidates, model_choice={"id": "m", "kind": "click", "goal_overlap": 0}
+        candidates, model_choice=model_choice
     ) is None
+
+
+def test_generalization_level_tracks_site_and_semantic_identity():
+    """Site-level class evidence is ``same_context_class`` at the site
+    stratum; a materially changed label is a different action entirely —
+    neither becomes ``exact`` without that identity being randomized."""
+    events = []
+    for i in range(24):
+        events += _trial_run(f"c{i}", "candidate", success=True,
+                             proposal_effect="navigate", site="h")
+        events += _trial_run(f"k{i}", "control", success=False,
+                             proposal_effect="navigate", site="h")
+    model = TrialChoiceModel.fit(events)
+    model_choice = {"id": "m", "kind": "click", "goal_overlap": 0, "label": "M"}
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+
+    # The randomized action itself — exact at the site stratum.
+    exact = policy.rank(
+        [{"id": "m", "kind": "click", "goal_overlap": 0, "label": "M"},
+         {"id": "p", "kind": "click", "goal_overlap": 1,
+          "effect": "navigate", "label": "Go"}],
+        model_choice=model_choice, site="h",
+    )["proposals"][0]
+    assert exact["causal"]["trial_level"] == "site"
+    assert exact["causal"]["generalization_level"] == "exact"
+    assert exact["executable"] is True
+
+    # Same class, different site evidence: at family scope the site cells
+    # still answer (family backs off to pooled when no family coordinate
+    # exists) — the action key was randomized *somewhere*, so the pooled
+    # stratum reports cross-context class evidence, never pooled-fresh.
+    other_site = policy.rank(
+        [{"id": "m", "kind": "click", "goal_overlap": 0, "label": "M"},
+         {"id": "p", "kind": "click", "goal_overlap": 1,
+          "effect": "navigate", "label": "Go"}],
+        model_choice=model_choice, site="other",
+    )["proposals"][0]
+    assert other_site["causal"]["trial_level"] == "pooled"
+    assert other_site["causal"]["generalization_level"] == "cross_context_class"
+    # ``exact_action_randomized`` mirrors ``exact`` exactly — deployable-
+    # precision evidence only. The broader fact lives under its own name.
+    assert other_site["causal"]["exact_action_randomized"] is False
+    assert other_site["causal"]["action_randomized_anywhere"] is True
+    assert other_site["execution_blocker"] == "pooled_only"
+
+    # Materially changed semantics — same id shape, different label — is a
+    # different action: class-level evidence only, blocked for active.
+    relabeled = policy.rank(
+        [{"id": "m", "kind": "click", "goal_overlap": 0, "label": "M"},
+         {"id": "p", "kind": "click", "goal_overlap": 1,
+          "effect": "navigate", "label": "Proceed to payment"}],
+        model_choice=model_choice, site="h",
+    )["proposals"][0]
+    assert relabeled["causal"]["generalization_level"] == "same_context_class"
+    assert relabeled["execution_blocker"] == "unverified_generalization"
+    assert relabeled["executable"] is False
+
+    # A different element role is a different action identity too — a
+    # randomized "Go" *link* never proves a "Go" *button*.
+    different_role = policy.rank(
+        [{"id": "m", "kind": "click", "goal_overlap": 0, "label": "M"},
+         {"id": "p", "kind": "click", "goal_overlap": 1, "role": "link",
+          "effect": "navigate", "label": "Go"}],
+        model_choice=model_choice, site="h",
+    )["proposals"][0]
+    assert different_role["causal"]["generalization_level"] == "same_context_class"
+    assert different_role["execution_blocker"] == "unverified_generalization"
+
+
+def test_unkeyed_query_reports_none_and_fails_closed():
+    """A proposal with no provable action identity reports
+    ``generalization_level: "none"`` — distinguishable from provably
+    class-only evidence — and the active gate refuses it."""
+    model = TrialChoiceModel.fit(_scoped_events())
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    unlabeled = [
+        {"id": "m", "kind": "click", "goal_overlap": 0},
+        {"id": "p", "kind": "click", "goal_overlap": 1},
+    ]
+    entry = policy.rank(
+        unlabeled, model_choice={"id": "m", "kind": "click", "goal_overlap": 0},
+        task_family="f", site="h",
+    )["proposals"][0]
+    assert entry["causal"]["generalization_level"] == "none"
+    assert entry["causal"]["exact_action_randomized"] is False
+    assert entry["execution_blocker"] == "unverified_generalization"
+    assert entry["executable"] is False
+
+
+def test_contextual_canary_bridge_is_evidence_derived():
+    """``action_randomized_in_context`` is the in-model canary record: an
+    action that was itself randomized inside the answering context — even
+    under a different enforced signature — bridges class-level evidence to
+    active authority, with no operator-supplied confirmation needed."""
+    from jev_ultrafast.dreamlearn import action_key
+
+    def _assigned(run_id, arm, *, key_label, p_overlap, success):
+        meta = _trial_meta(run_id, arm, task_family="f", site="h")
+        meta["proposal_effect"] = "navigate"
+        meta["model_choice_offered_rank"] = 0
+        meta["proposal_offered_rank"] = 1
+        meta["proposal_overlap"] = p_overlap
+        meta["proposal_action_key"] = action_key(
+            kind="click", effect="navigate", label=key_label)
+        return [
+            {"event": "run_started", "run_id": run_id, "task_key": "t",
+             "goal": "g", "task_family": "f"},
+            {"event": "experiment_assigned", "run_id": run_id, "task_key": "t",
+             "experiment": meta},
+            {"event": "run_finished", "run_id": run_id, "task_key": "t",
+             "status": "done" if success else "blocked", "verified": success},
+        ]
+
+    events = []
+    # "Ship" was randomized at overlap 1 — the class evidence the strict
+    # mask will answer from for an overlap-1 query.
+    for i in range(24):
+        events += _assigned(f"sc{i}", "candidate", key_label="Ship",
+                            p_overlap=1, success=True)
+        events += _assigned(f"sk{i}", "control", key_label="Ship",
+                            p_overlap=1, success=False)
+    # "Go" was itself randomized in this context — a real contextual canary —
+    # but under overlap 0, outside the enforced signature that answers.
+    for i in range(6):
+        events += _assigned(f"gc{i}", "candidate", key_label="Go",
+                            p_overlap=0, success=True)
+        events += _assigned(f"gk{i}", "control", key_label="Go",
+                            p_overlap=0, success=False)
+    model = TrialChoiceModel.fit(events)
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    model_choice = {"id": "m", "kind": "click", "goal_overlap": 0,
+                    "label": "M"}
+    candidates = [
+        {"id": "m", "kind": "click", "goal_overlap": 0, "label": "M"},
+        {"id": "go", "kind": "click", "goal_overlap": 1,
+         "effect": "navigate", "label": "Go"},
+    ]
+    entry = policy.rank(
+        candidates, model_choice=model_choice,
+        task_family="f", site="h")["proposals"][0]
+    assert entry["causal"]["generalization_level"] == "same_context_class"
+    assert entry["causal"]["exact_action_randomized"] is False
+    assert entry["causal"]["action_randomized_in_context"] is True
+    assert entry["execution_blocker"] is None
+    assert entry["executable"] is True
+    # An action that was never randomized in this context still fails —
+    # confirmation is derived, never assumed.
+    novel = [
+        candidates[0],
+        {"id": "n", "kind": "click", "goal_overlap": 1,
+         "effect": "navigate", "label": "Never tried"},
+    ]
+    blocked = policy.rank(
+        novel, model_choice=model_choice,
+        task_family="f", site="h")["proposals"][0]
+    assert blocked["causal"]["action_randomized_in_context"] is False
+    assert blocked["execution_blocker"] == "unverified_generalization"
+
+
+def test_generalization_level_survives_serialization():
+    """``action_index`` round-trips through to_dict/from_dict — a stored
+    model answers exactness questions exactly as the fitted one did."""
+    events = _trials("candidate", 24, 24, "c", task_family="f") + _trials(
+        "control", 24, 0, "k", task_family="f")
+    fitted = TrialChoiceModel.fit(events)
+    clone = TrialChoiceModel.from_dict(fitted.to_dict())
+    entry = clone.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f")[0]
+    assert entry["generalization_level"] == "exact"
+    assert entry["exact_action_randomized"] is True
+    # Older payloads without the index degrade to class-level, never exact.
+    payload = fitted.to_dict()
+    payload["trials"]["action_index"] = ()
+    degraded = TrialChoiceModel.from_dict(payload)
+    old = degraded.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f")[0]
+    assert old["generalization_level"] == "same_context_class"
+    assert old["exact_action_randomized"] is False
 
 
 # ------------------------------------------------------ duplicates / integrity
@@ -462,6 +683,100 @@ def test_duplicate_assignment_records_count_once():
     arm = trials.estimate()[next(iter(trials.estimate()))]["candidate"]
     assert arm["assigned"] == 1
     assert trials.duplicates == 1
+
+
+def test_two_distinct_assignments_invalidate_the_experimental_unit():
+    """One randomized assignment per run — enforced, not trusted.
+
+    Two *different* assignment decisions inside one run cannot each be
+    credited with the run's single outcome; the whole unit is quarantined,
+    counted under ``invalid_units``, and contributes nothing to any arm.
+    """
+    meta_a = _trial_meta("u", "candidate")
+    meta_b = _trial_meta("u", "control")
+    meta_b["experiment_id"] = "xu-other"  # a *different* assignment decision
+    events = [
+        {"event": "run_started", "run_id": "u", "task_key": "t", "goal": "g"},
+        {"event": "experiment_assigned", "run_id": "u", "task_key": "t",
+         "experiment": meta_a},
+        {"event": "experiment_assigned", "run_id": "u", "task_key": "t",
+         "experiment": meta_b},
+        {"event": "run_finished", "run_id": "u", "task_key": "t",
+         "status": "done", "verified": True},
+    ]
+    trials = CounterfactualTrials.fit(events)
+    assert trials.invalid_units == 1
+    assert not trials.estimate()  # no arm may absorb the spliced unit
+    # Three distinct assignments are rejected the same way.
+    meta_c = _trial_meta("u", "candidate")
+    meta_c["experiment_id"] = "xu-third"
+    events.insert(4, {"event": "experiment_assigned", "run_id": "u",
+                      "task_key": "t", "experiment": meta_c})
+    trials3 = CounterfactualTrials.fit(events)
+    assert trials3.invalid_units == 1
+    assert not trials3.estimate()
+
+
+def test_identical_duplicate_assignments_still_form_one_unit():
+    """Deduplication is by assignment *identity*: the same decision written
+    twice is one unit (``duplicates``), not an invalid experiment."""
+    meta = _trial_meta("u", "candidate")
+    events = [
+        {"event": "run_started", "run_id": "u", "task_key": "t", "goal": "g"},
+        {"event": "experiment_assigned", "run_id": "u", "task_key": "t",
+         "experiment": meta},
+        {"event": "experiment_assigned", "run_id": "u", "task_key": "t",
+         "experiment": dict(meta)},
+        {"event": "run_finished", "run_id": "u", "task_key": "t",
+         "status": "done", "verified": True},
+    ]
+    trials = CounterfactualTrials.fit(events)
+    assert trials.invalid_units == 0
+    assert trials.duplicates == 1
+    arm = trials.estimate()[next(iter(trials.estimate()))]["candidate"]
+    assert arm["assigned"] == 1
+
+
+def test_assignment_after_terminal_is_not_a_trial_of_that_run():
+    """An assignment ordered after the run's terminal event cannot have
+    produced the outcome it would be credited with — the unit is invalid."""
+    meta = _trial_meta("u", "candidate")
+    events = [
+        {"event": "run_started", "run_id": "u", "task_key": "t", "goal": "g",
+         "sequence": 0},
+        {"event": "run_finished", "run_id": "u", "task_key": "t",
+         "status": "done", "verified": True, "sequence": 1},
+        {"event": "experiment_assigned", "run_id": "u", "task_key": "t",
+         "experiment": meta, "sequence": 2},
+    ]
+    trials = CounterfactualTrials.fit(events)
+    assert trials.invalid_units == 1
+    assert not trials.estimate()
+
+
+def test_malformed_assignment_records_are_rejected_and_counted():
+    """A record that fails the unit gate — arm outside {candidate, control}
+    or propensity outside (0, 1] — is rejected before it can shape a cell."""
+    good = _trial_run("g", "candidate", success=True) + _trial_run(
+        "h", "control", success=False)
+    bad_meta = _trial_meta("b", "candidate", propensity=0.0)
+    events = good + [
+        {"event": "run_started", "run_id": "b", "task_key": "t", "goal": "g"},
+        {"event": "experiment_assigned", "run_id": "b", "task_key": "t",
+         "experiment": bad_meta},
+        {"event": "run_finished", "run_id": "b", "task_key": "t",
+         "status": "done", "verified": True},
+    ]
+    trials = CounterfactualTrials.fit(events)
+    assert trials.rejected == 1
+    # The valid runs still analyze; the malformed one contributed nothing.
+    total = sum(
+        cell[arm]["assigned"]
+        for cell in trials.estimate().values()
+        for arm in ("candidate", "control")
+        if isinstance(cell.get(arm), dict)
+    )
+    assert total == 2
 
 
 def test_resolve_never_answers_a_contrast_from_one_arm():
@@ -518,7 +833,7 @@ def test_v4_cells_migrate_to_split_coordinates():
         10, 8, 8, 2, 6.0, 8.0, 8.0, 8.0, 8.0,
     )
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/4", "cells": [v4]})
-    assert trials.version == "jev-trials/8"
+    assert trials.version == "jev-trials/9"
     cell = trials.cells[0]
     assert cell[0] == "flights" and cell[1] == ""
     assert cell[3] == "unknown" and cell[6] == "unknown"  # effect/rank wildcards
@@ -538,7 +853,9 @@ def test_v5_cells_migrate_with_zeroed_indeterminate_counter():
     including the unverified_claim counter that used to sit at the same tail
     position — keeps its count."""
     from jev_ultrafast.dreamlearn import (
-        _REASON_BASE, TERMINATION_REASONS, TRIAL_CELL_LEN,
+        _REASON_BASE,
+        TERMINATION_REASONS,
+        TRIAL_CELL_LEN,
     )
 
     reasons_v5 = [0, 1, 0, 0, 0, 0, 3, 2]  # v5 tail order, ending unverified/unknown
@@ -548,7 +865,7 @@ def test_v5_cells_migrate_with_zeroed_indeterminate_counter():
     v5 = (*key, *stats_v5, 1.0, 2.0, 0.5, *reasons_v5)
     assert len(v5) == 35
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/5", "cells": [v5]})
-    assert trials.version == "jev-trials/8"
+    assert trials.version == "jev-trials/9"
     cell = trials.cells[0]
     assert len(cell) == TRIAL_CELL_LEN
     # The v8 outcome-vector block is appended after the reason tail; the
@@ -1073,8 +1390,11 @@ def _trials(arm, count, successes, prefix, **kw):
 
 
 _CANDIDATES = [
-    {"id": "m", "kind": "click", "goal_overlap": 0},
-    {"id": "p", "kind": "click", "goal_overlap": 1},
+    {"id": "m", "kind": "click", "goal_overlap": 0, "label": "M"},
+    # The label matches what _trial_run records in its transition catalogue —
+    # exact-action evidence (Phase 3) is only provable when the offered
+    # action's identity equals a randomized one.
+    {"id": "p", "kind": "click", "goal_overlap": 1, "label": "Go"},
 ]
 _MODEL_CHOICE = {"id": "m", "kind": "click", "goal_overlap": 0}
 
@@ -1262,6 +1582,94 @@ def test_observational_and_causal_probabilities_keep_separate_provenance():
     assert proposal["p_progress"] == pytest.approx(0.30)
     assert proposal["source"] == "pooled_randomized"
     assert proposal["expected_delta"] == pytest.approx(0.20)
+
+
+def test_active_ranking_follows_causal_not_observational_signal():
+    """Two candidates where the channels deliberately disagree: the
+    observational prior loves ``weak`` and shrugs at ``strong``, but the
+    randomized evidence says ``strong`` is the larger established effect.
+    Active ordering must deploy on causal terms — the observational score
+    annotates the entry, it cannot reorder it."""
+    class _DisagreeTrials:
+        def rank(self, candidates, **kwargs):
+            return [
+                {"id": "strong", "kind": "click", "expected_delta": 0.25,
+                 "control_p": 0.5, "p_progress": 0.75, "uncertainty": 0.1,
+                 "delta_ci": [0.1, 0.4], "utility_delta": 0.2,
+                 "effect_status": "beneficial", "support_sufficient": True,
+                 "trial_level": "family", "signature_level": "full",
+                 "generalization_level": "exact", "action_key": "k-strong",
+                 "source": "randomized"},
+                {"id": "weak", "kind": "click", "expected_delta": 0.05,
+                 "control_p": 0.5, "p_progress": 0.55, "uncertainty": 0.1,
+                 "delta_ci": [0.0, 0.1], "utility_delta": 0.04,
+                 "effect_status": "beneficial", "support_sufficient": True,
+                 "trial_level": "family", "signature_level": "full",
+                 "generalization_level": "exact", "action_key": "k-weak",
+                 "source": "randomized"},
+            ]
+
+    class _DisagreeChoice:
+        def predict(self, *, rank=None, **kwargs):
+            # Observational posterior favors the causally-weaker candidate
+            # (offered at rank 1) over the causally-stronger one (rank 2).
+            if rank == 1:
+                return {"p_progress": 0.95, "uncertainty": 0.02,
+                        "confident": True, "source": "observational"}
+            return {"p_progress": 0.51, "uncertainty": 0.4,
+                    "confident": False, "source": "observational"}
+
+    candidates = [
+        {"id": "m", "kind": "click", "goal_overlap": 0, "label": "M"},
+        {"id": "weak", "kind": "click", "goal_overlap": 1, "label": "W"},
+        {"id": "strong", "kind": "click", "goal_overlap": 1, "label": "S"},
+    ]
+    model_choice = {"id": "m", "kind": "click", "goal_overlap": 0}
+    policy = CausalChoicePolicy(
+        mode="active", trial_model=_DisagreeTrials(), choice_model=_DisagreeChoice()
+    )
+    proposals = policy.rank(
+        candidates, model_choice=model_choice, task_family="f")["proposals"]
+    # Combined shadow score would favor ``weak`` (0.05 + 0.5*(0.95-0.5)
+    # beats 0.25 + 0.5*(0.51-0.5)); active ordering ignores it.
+    assert proposals[0]["id"] == "strong"
+    assert proposals[0]["deployment_score"] == pytest.approx(0.25)
+    assert proposals[0]["observational_score"] < proposals[1]["observational_score"]
+    # Separate score fields are populated — one overloaded ``score`` is no
+    # longer the only ranking signal downstream consumers can see.
+    for entry in proposals:
+        assert {"causal_score", "observational_score",
+                "experiment_priority_score", "deployment_score"} <= set(entry)
+    assert policy.proposal(
+        candidates, model_choice=model_choice, task_family="f")["id"] == "strong"
+
+
+def test_provenance_dimensions_stay_separate_from_support():
+    """An *unsupported* pooled contrast is still randomized evidence at the
+    pooled level: ``evidence_origin`` and ``trial_level`` describe where it
+    came from, ``support_status`` describes whether it sufficed — a thin
+    pooled estimate is never relabeled as if it were context-specific."""
+    thin = _trials("candidate", 3, 3, "c") + _trials("control", 3, 0, "k")
+    model = TrialChoiceModel.fit(thin)
+    policy = CausalChoicePolicy(mode="shadow", trial_model=model)
+    entry = policy.rank(_CANDIDATES, model_choice=_MODEL_CHOICE)["proposals"][0]
+    assert entry["causal"]["trial_level"] == "pooled"
+    assert entry["causal"]["support_sufficient"] is False
+    assert entry["source"] == "pooled_randomized"
+    assert entry["evidence_origin"] == "randomized"
+    assert entry["trial_level"] == "pooled"
+    assert entry["support_status"] == "insufficient"
+    assert entry["generalization_level"] in {"cross_context_class", "pooled_class"}
+    # And a context-level supported entry reports the structured form too.
+    strong = TrialChoiceModel.fit(_scoped_events())
+    active = CausalChoicePolicy(mode="active", trial_model=strong)
+    ok = active.rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE,
+        task_family="f", site="h")["proposals"][0]
+    assert ok["evidence_origin"] == "randomized"
+    assert ok["trial_level"] == "family+site"
+    assert ok["support_status"] == "sufficient"
+    assert ok["generalization_level"] == "exact"
 
 
 # ----------------------------------------- active-mode evidence strata
@@ -1532,7 +1940,7 @@ def test_unmeasured_arms_report_null_not_zero():
     fields. Secondary and safety endpoints must report ``None`` — a migrated
     zero is absence of evidence, not a measured zero — and the safety
     verdict is unknown, not clean."""
-    from jev_ultrafast.dreamlearn import _REASON_BASE, TERMINATION_REASONS
+    from jev_ultrafast.dreamlearn import TERMINATION_REASONS
     key = ("f", "s", "click", "navigate", "button", "0", "0-4", "0-2",
            "click", "navigate", "link", "1", "0-4", "0-2", "candidate")
     stats = [10, 10, 10, 0, 9.0, 10.0, 10.0, 10.0, 10.0, 0.0]
@@ -1544,7 +1952,7 @@ def test_unmeasured_arms_report_null_not_zero():
     v7k = (*ctrl, *stats, *costs, *reasons)
     trials = CounterfactualTrials.from_dict(
         {"version": "jev-trials/7", "cells": [v7, v7k]})
-    assert trials.version == "jev-trials/8"
+    assert trials.version == "jev-trials/9"
     entry = next(iter(trials.estimate().values()))
     for arm in ("candidate", "control"):
         ov = entry[arm]["outcome_vector"]
@@ -1628,7 +2036,7 @@ def test_v8_roundtrip_preserves_outcome_counters():
                      stale_or_failure=1, risk_events=1, extra_transitions=2)
     trials = CounterfactualTrials.fit(events)
     clone = CounterfactualTrials.from_dict(trials.to_dict())
-    assert clone.version == "jev-trials/8"
+    assert clone.version == "jev-trials/9"
     assert clone.cells == trials.cells
     assert clone.estimate() == trials.estimate()
     ov = next(iter(clone.estimate().values()))["candidate"]["outcome_vector"]

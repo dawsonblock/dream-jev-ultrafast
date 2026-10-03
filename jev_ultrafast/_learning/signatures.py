@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from ..privacy import redact_text
+from .common import _stable_hash
+
 __all__ = [
     'TERMINATION_REASONS',
     '_OVERLAP_BUCKETS',
@@ -20,6 +23,7 @@ __all__ = [
     '_signature_masks',
     '_termination_reason',
     '_trial_context',
+    'action_key',
     'overlap_bucket',
     'phase_bucket',
     'rank_bucket',
@@ -225,6 +229,33 @@ def _trial_context(meta: dict, transition: dict | None) -> tuple[str, ...]:
 
 
 _SIGNATURE_INDEX = {field: 2 + index for index, field in enumerate(_SIGNATURE_FIELDS)}
+
+
+def action_key(kind=None, effect=None, role=None, label=None) -> str | None:
+    """Stable semantic identity of one concrete action, across runs.
+
+    Treatment-signature coordinates answer "was an action of this *class*
+    randomized?"; ``action_key`` answers the stricter Phase-3 question "was
+    *this exact action* randomized?" — the distinction between an established
+    class effect and treatment-class exchangeability assumed for a
+    never-randomized control. The key binds operation kind, effect class,
+    element role, and the same redacted label the evidence store records, so
+    a same-class action with different semantics (a changed label, a
+    re-labelled control) is a different key, and an action with no readable
+    identity at all returns ``None`` — never a fabricated identity.
+    """
+    if label is None or not str(label).strip():
+        return None
+    text = " ".join(str(redact_text(str(label), 256)).split()).lower()
+    if not text:
+        return None
+    components = (
+        str(kind or "unknown").replace("|", " ") or "unknown",
+        _effect_bucket(effect),
+        _role_bucket(role),
+        text,
+    )
+    return _stable_hash("|".join(components))
 
 
 _SIGNATURE_DROP_FIELDS = (

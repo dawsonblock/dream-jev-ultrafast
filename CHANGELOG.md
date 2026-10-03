@@ -4,6 +4,51 @@ Detailed release history for Jev Ultrafast. Cut releases live on the
 [GitHub releases page](https://github.com/dawsonblock/dream-jev-ultrafast/releases);
 this file documents what changed and why, in the project's own words.
 
+## Unreleased — exact-action generalization and experimental-unit enforcement
+
+A fifth-pass scientific audit found two causal-evidence gaps plus a ranking
+ambiguity, all fixed inside the existing causal layer:
+
+- **Class-level evidence can no longer masquerade as exact-action
+  evidence** (`jev-trials/9`, `jev-causal/3`). `CounterfactualTrials.fit`
+  now indexes every randomized proposal's `action_key` — a stable hash of
+  kind + effect class + role + the `redact_text`-normalized label — and
+  `resolve` annotates each contrast with `generalization_level`
+  (`exact` / `same_context_class` / `cross_context_class` /
+  `pooled_class` / `none` — the last for queries with no provable action
+  identity), `exact_action_randomized` (mirroring `exact` exactly),
+  `action_randomized_anywhere`, `action_randomized_in_context`,
+  `context_randomized`, `treatment_class_randomized`, and `action_key`.
+  The agent stamps `proposal_action_key` into `experiment_assigned`
+  metadata; older evidence recovers the identity from the executed
+  transition's catalogue, and an unrecoverable identity is never invented.
+  `CausalChoicePolicy` gains `active_generalization_levels` (default
+  `("exact",)`) plus two canary-confirmation channels for
+  `same_context_class` evidence — `action_randomized_in_context`, derived
+  from the trial store itself, and `confirmed_action_keys` for
+  confirmations evidenced outside this model — so a never-randomized
+  action cannot enter `active` on class-level evidence alone; unknown
+  generalization names fail closed at construction, and unverifiable
+  levels report `unverified_generalization`.
+- **One randomized assignment per experimental unit — enforced, not
+  trusted.** Two *different* assignment decisions in one run quarantine
+  the whole unit under the new `invalid_units` counter (identical rewrites
+  still deduplicate under `duplicates`); an assignment ordered after the
+  run's terminal event is likewise invalid; malformed arms or propensities
+  outside (0, 1] are `rejected` before they can shape a cell. Runless
+  records remain censored-by-construction — their mass still feeds the
+  censoring bounds — which is stricter than silently dropping them.
+- **Ranking scores are separated by purpose.** Every ranked entry now
+  carries `causal_score`, `observational_score`,
+  `experiment_priority_score`, and `deployment_score` instead of one
+  overloaded `score`, and `active` ordering uses causal terms only — an
+  observational prior can annotate an entry but can never outrank superior
+  causal evidence. Provenance is reported as independent dimensions
+  (`evidence_origin`, `trial_level`, `support_status`, `effect_status`,
+  `generalization_level`): an *unsupported* pooled contrast is now
+  honestly `pooled_randomized`/`insufficient` rather than wearing the
+  context-specific `randomized` label.
+
 ## v0.9.2 — adversarial-page authority binding
 
 A fourth-pass source audit found that the authority plane was weaker at the

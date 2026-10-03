@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from ._learning.signatures import action_key
 from .browser import Browser, BrowserError, IndeterminateMutation, StalePage
 from .dream import (
     ExperienceStore,
@@ -892,6 +893,7 @@ class Agent:
                                 proposal_role=action.get("role"),
                                 task_family=getattr(self, "task_family", None),
                                 site=_page_site(page),
+                                label=action.get("label"),
                             )
                             if (
                                 isinstance(baseline_pred, dict)
@@ -952,6 +954,28 @@ class Agent:
                             ),
                             "proposal_id": proposal["id"],
                             "proposal_kind": proposal.get("kind"),
+                            # Exact-action identity (Phase 3): the same key
+                            # the causal layer derives when a proposal is
+                            # evaluated — so "was *this* action randomized"
+                            # is a stored fact, not a post-hoc inference.
+                            "proposal_action_key": action_key(
+                                kind=proposal.get("kind"),
+                                effect=(
+                                    classify_effect(proposal_action).value
+                                    if proposal_action is not None
+                                    else None
+                                ),
+                                role=(
+                                    proposal_action.get("role")
+                                    if proposal_action is not None
+                                    else None
+                                ),
+                                label=(
+                                    proposal_action.get("label")
+                                    if proposal_action is not None
+                                    else None
+                                ),
+                            ),
                             "proposal_effect": (
                                 classify_effect(proposal_action).value
                                 if proposal_action is not None

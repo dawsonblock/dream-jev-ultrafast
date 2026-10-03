@@ -1458,6 +1458,7 @@ def _causal_evidence():
     for the divergence premise (model picked a low-overlap click). Enough
     per arm for the confidence sequence to establish the sign."""
     from jev_ultrafast.dream import ExplorationPolicy
+    from jev_ultrafast.dreamlearn import action_key
 
     events = []
     for i in range(24):
@@ -1469,6 +1470,11 @@ def _causal_evidence():
                 "proposal_id": "e3",
                 "proposal_kind": "click",
                 "proposal_effect": "search",
+                # Exact-action identity, stamped the way the agent stamps it:
+                # e3 is {"kind": "click", "label": "Go", "role": "button"}.
+                "proposal_action_key": action_key(
+                    kind="click", effect="search", role="button", label="Go"
+                ),
                 "proposal_role": "button",
                 "proposal_overlap": 0,
                 "proposal_offered_rank": 1,
