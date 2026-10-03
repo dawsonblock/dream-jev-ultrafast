@@ -9,7 +9,13 @@ from typing import ClassVar
 
 from ..privacy import action_goal_overlap
 from .common import _stable_hash
-from .policylang import normalize_rules, program_adjustment, program_stop
+from .policylang import (
+    BOOL_FEATURES,
+    NUMERIC_FEATURES,
+    normalize_rules,
+    program_adjustment,
+    program_stop,
+)
 
 __all__ = [
     'ExplorationPolicy',
@@ -320,6 +326,192 @@ def _mutate_first_const(node, factor: float):
     return node
 
 
+# ---------------------------------------------------------------------------
+# Grammar-aware program search.
+#
+# The operators below are the structural-search layer the language was built
+# for: one-position rewrites of the verified AST — operator swaps inside a
+# signature family, relation and operand moves on comparisons, feature and
+# constant leaves exchanged within their type, unary wrappers added or
+# stripped, composite nodes pruned to a child, and growth wraps that add a
+# grammar context around an existing subtree. Nothing here inserts a seed
+# template: a mutant is the base program with one node position rewritten,
+# and the constructor's validation boundary drops any rewrite that would
+# break depth, budget, or type rules — the search can never produce a
+# program the verifier would not also accept.
+# ---------------------------------------------------------------------------
+
+_ARITH_2_OPS = ("add", "sub", "mul", "min", "max")
+_BOOL_2_OPS = ("and", "or")
+_UNARY_NUM_OPS = ("neg", "abs")
+_CMP_RELS = ("<", "<=", "==", ">=", ">")
+# Search breadth, not exhaustiveness: one generation emits at most this
+# many grammar-level mutants, interleaved across every expression position
+# so no single rule consumes the whole budget.
+_PROGRAM_MUTANT_CAP = 48
+_POW_EXPONENT_RANGE = (0.25, 2.0)
+
+
+def _expr_positions(node, path=()):
+    """Yield ``(path, node)`` for every dict subtree, pre-order.
+
+    ``path`` is the child-index route ``_expr_replace`` follows. The
+    ``pow`` exponent position is excluded — it must stay a const leaf, so
+    it is perturbed by the ``pow`` node's own mutants rather than opened
+    to subtree replacement.
+    """
+    yield path, node
+    (op, arg), = node.items()
+    if op in {"neg", "abs", "not"}:
+        children = ((0, arg),) if isinstance(arg, dict) else ()
+    elif op == "pow":
+        children = ((0, arg[0]),) if isinstance(arg[0], dict) else ()
+    elif isinstance(arg, list):
+        children = tuple(
+            (index, child)
+            for index, child in enumerate(arg)
+            if isinstance(child, dict)
+        )
+    else:
+        children = ()
+    for index, child in children:
+        yield from _expr_positions(child, path + (index,))
+
+
+def _expr_replace(node, path, new_sub):
+    """A copy of ``node`` with the subtree at ``path`` swapped for ``new_sub``."""
+    if not path:
+        return new_sub
+    (op, arg), = node.items()
+    index = path[0]
+    if op in {"neg", "abs", "not"}:
+        return {op: _expr_replace(arg, path[1:], new_sub)}
+    out = [
+        _expr_replace(child, path[1:], new_sub)
+        if isinstance(child, dict) and j == index
+        else child
+        for j, child in enumerate(arg)
+    ]
+    return {op: out}
+
+
+def _node_type(node) -> str:
+    (op, arg), = node.items()
+    if op == "feature":
+        return "num" if arg in NUMERIC_FEATURES else "bool"
+    if op == "bool" or op in _BOOL_2_OPS or op in {"cmp", "not"}:
+        return "bool"
+    return "num"
+
+
+def _node_mutants(node) -> list:
+    """Every same-typed one-node rewrite — the grammar-aware operator set."""
+    (op, arg), = node.items()
+    out = []
+    if op == "const":
+        for factor in (0.5, 1.5, -1.0):
+            value = float(arg) * factor
+            if math.isfinite(value) and abs(value) <= 1.0e6:
+                out.append({"const": value})
+    elif op == "feature":
+        pool = NUMERIC_FEATURES if arg in NUMERIC_FEATURES else BOOL_FEATURES
+        out += [{"feature": name} for name in pool if name != arg]
+    elif op == "bool":
+        out.append({"bool": not arg})
+    elif op in _ARITH_2_OPS or op in _BOOL_2_OPS:
+        family = _ARITH_2_OPS if op in _ARITH_2_OPS else _BOOL_2_OPS
+        out += [
+            {other: [arg[0], arg[1]]} for other in family if other != op
+        ]
+        out += list(arg)  # prune to an operand (same static type)
+    elif op in _UNARY_NUM_OPS:
+        other = "abs" if op == "neg" else "neg"
+        out += [{other: arg}, arg]  # swap the wrapper, or drop it
+    elif op == "not":
+        out.append(arg)  # strip the negation
+    elif op == "cmp":
+        out += [
+            {"cmp": [rel, arg[1], arg[2]]}
+            for rel in _CMP_RELS
+            if rel != arg[0]
+        ]
+        out.append({"cmp": [arg[0], arg[2], arg[1]]})  # operand order
+    elif op == "if":
+        out.append({"if": [arg[0], arg[2], arg[1]]})  # branch swap
+        out += [arg[1], arg[2]]  # collapse to a branch
+    elif op == "clamp":
+        out.append(arg[0])  # drop the bounds
+    elif op == "pow":
+        out.append(arg[0])  # drop the exponent
+        for factor in (0.5, 1.5):
+            exponent = float(arg[1].get("const", 1.0)) * factor
+            if _POW_EXPONENT_RANGE[0] <= exponent <= _POW_EXPONENT_RANGE[1]:
+                out.append({"pow": [arg[0], {"const": exponent}]})
+    # Growth wraps: a grammar context placed around the node itself.
+    if _node_type(node) == "num":
+        out += [
+            {"abs": node},
+            {"neg": node},
+            {"mul": [node, {"const": 2.0}]},
+            {"add": [node, {"const": -1.0}]},
+            {"min": [node, {"const": 0.0}]},
+        ]
+    else:
+        out.append({"not": node})
+    return out
+
+
+def _expr_mutants(expr):
+    """Yield every one-position rewrite of an expression, pre-order."""
+    seen = set()
+    for path, node in _expr_positions(expr):
+        for new_sub in _node_mutants(node):
+            if new_sub == node:
+                continue
+            candidate = _expr_replace(expr, path, new_sub)
+            key = json.dumps(candidate, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                yield candidate
+
+
+def _program_mutants(base: ExplorationPolicy, cap: int = _PROGRAM_MUTANT_CAP) -> list[dict]:
+    """Grammar-aware mutants of the policy program as constructor specs.
+
+    Mutants from every rule's ``when`` and ``add`` are interleaved
+    round-robin so the first ``cap`` candidates cover positions across the
+    whole program rather than exhausting the first rule's moves.
+    ``stop_when`` mutants follow the same rules.
+    """
+    generators = []
+    for index, rule in enumerate(base.rules):
+        generators.append((index, "when", iter(_expr_mutants(rule["when"]))))
+        generators.append((index, "add", iter(_expr_mutants(rule["add"]))))
+    specs: list[dict] = []
+    while len(specs) < cap and generators:
+        for entry in list(generators):
+            index, field_name, gen = entry
+            try:
+                mutant = next(gen)
+            except StopIteration:
+                generators.remove(entry)
+                continue
+            specs.append({
+                "rules": tuple(
+                    {**r, field_name: mutant} if j == index else r
+                    for j, r in enumerate(base.rules)
+                )
+            })
+            if len(specs) >= cap:
+                break
+    if base.stop_when is not None and len(specs) < cap:
+        for mutant in _expr_mutants(base.stop_when):
+            specs.append({"stop_when": mutant})
+            if len(specs) >= cap:
+                break
+    return specs
+
+
 def mutate_policies(base: ExplorationPolicy) -> list[ExplorationPolicy]:
     """Deterministic, bidirectional, bounded candidate generator for offline dreaming.
 
@@ -478,6 +670,20 @@ def mutate_policies(base: ExplorationPolicy) -> list[ExplorationPolicy]:
             specs.append({"rules": (rule,)})
         specs.append({"rules": _SEED_RULES[:2]})
         specs.append({"stop_when": _SEED_STOP})
+        # Generated single-feature seeds — grammar-level probes, not
+        # hand-picked templates: each boolean flag gates a small penalty
+        # and each numeric feature thresholds at a small constant, so an
+        # empty program gains material the subtree mutations can then
+        # combine and reshape.
+        for name in BOOL_FEATURES:
+            specs.append({"rules": (
+                {"when": {"feature": name}, "add": {"const": -0.5}},
+            )})
+        for name in NUMERIC_FEATURES:
+            specs.append({"rules": (
+                {"when": {"cmp": [">=", {"feature": name}, {"const": 2}]},
+                 "add": {"const": -0.5}},
+            )})
     else:
         for index in range(len(base.rules)):
             # Structural removal: drop rule ``index`` outright.
@@ -502,11 +708,20 @@ def mutate_policies(base: ExplorationPolicy) -> list[ExplorationPolicy]:
         specs.append({
             "stop_when": _SEED_STOP if base.stop_when is None else None
         })
+        # Grammar-aware search: subtree/operator-level rewrites at every
+        # expression position — the bounded language the verifier checks,
+        # explored rather than templated.
+        specs += _program_mutants(base)
 
     candidates = []
     seen = {base.behavior_digest}
     for index, changes in enumerate(specs, 1):
-        candidate = replace(base, name=f"{base.name}-dream-{index}", version=base.version + 1, **changes)
+        try:
+            candidate = replace(base, name=f"{base.name}-dream-{index}", version=base.version + 1, **changes)
+        except ValueError:
+            # A rewrite that would break depth, budget, or type rules dies
+            # at the same validation boundary every candidate crosses.
+            continue
         if candidate.behavior_digest in seen:
             continue
         seen.add(candidate.behavior_digest)

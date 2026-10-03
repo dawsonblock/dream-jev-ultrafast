@@ -691,9 +691,14 @@ def main() -> int:
             if "report_signature_invalid" not in report["release_blockers"]:
                 report["release_blockers"].append("report_signature_invalid")
     text = json.dumps(report, indent=2, sort_keys=True)
-    if args.out:
-        Path(args.out).write_text(text + "\n")
-        print(f"\nreport → {args.out}")
+    # A --full run's verdict is the release's qualification evidence: emit
+    # the canonical report name the runtime qualified profile and the
+    # external verifier both check (it binds the manifest digest, so it
+    # travels beside the manifest, never inside it).
+    out = args.out or ("RELEASE_QUALIFICATION.json" if full else None)
+    if out:
+        Path(out).write_text(text + "\n")
+        print(f"\nreport → {out}")
     if args.report_md:
         _write_markdown(report, Path(args.report_md))
         print(f"validation report → {args.report_md}")

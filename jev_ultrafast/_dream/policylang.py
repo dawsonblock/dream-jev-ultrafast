@@ -40,6 +40,7 @@ import json
 import math
 
 __all__ = [
+    "BOOL_FEATURES",
     "MAX_DEPTH",
     "MAX_NODES",
     "MAX_RULES",
@@ -159,20 +160,30 @@ def validate_expr(node, *, depth: int = 0, budget: list | None = None) -> str:
         if (
             not isinstance(arg, list)
             or len(arg) != 3
-            or not all(_is_num(a) and math.isfinite(a) for a in arg[1:])
+            or not all(
+                _is_num(a) and math.isfinite(a) and abs(float(a)) <= _MAX_CONST
+                for a in arg[1:]
+            )
         ):
-            raise ValueError("clamp takes [expr, const_lo, const_hi]")
+            raise ValueError(
+                f"clamp takes [expr, const_lo, const_hi] bounded to {_MAX_CONST}"
+            )
         _num(arg[0])
         return "num"
     if op == "pow":
+        if not isinstance(arg, list) or len(arg) != 2:
+            raise ValueError("pow takes [expr, const] with a const exponent")
+        _num(arg[0])
+        # The exponent must pass the ordinary validator — an exact single-key
+        # const node inside the shared node budget — before the narrower
+        # exponent range applies. Anything extra in that object is smuggled
+        # payload, not an exponent.
         if (
-            not isinstance(arg, list)
-            or len(arg) != 2
-            or not isinstance(arg[1], dict)
-            or validate_expr(arg[0], depth=depth + 1, budget=budget) != "num"
-            or arg[1].get("const") is None
-            or not _is_num(arg[1]["const"])
-            or not _POW_EXPONENT_RANGE[0] <= float(arg[1]["const"]) <= _POW_EXPONENT_RANGE[1]
+            validate_expr(arg[1], depth=depth + 1, budget=budget) != "num"
+            or "const" not in arg[1]
+            or not _POW_EXPONENT_RANGE[0]
+            <= float(arg[1]["const"])
+            <= _POW_EXPONENT_RANGE[1]
         ):
             raise ValueError(
                 "pow takes [expr, const] with the exponent bounded to "

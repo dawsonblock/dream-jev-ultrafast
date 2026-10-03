@@ -1,6 +1,6 @@
 # Validation — Jev Ultrafast v0.9.2 DREAM-Jev
 
-Validation date: 2026-09-30, updated for the v0.7.1 hardening pass, the v0.8.0 audit-correction pass, the v0.8.1 stability patch, the v0.8.2 causal-integrity pass, the v0.8.3 causal-model/hierarchical-context pass, and the v0.9.1 post-release hardening pass (v0.5.1 applied the independent-audit authority patch; v0.6.0 added the `ChoiceModel` counterfactual layer; v0.7.0 added real randomized counterfactual trials; v0.7.1 fixed trial-approval resume and registry lineage; v0.8.0 restores the v0.6.2 hardening this line had dropped — trajectory-success labeling, honest propensity fields, the registry head anchor, pre-authority assignment recording, and the run-level trial endpoint — and wires stamped `experiment_proposals` into the agent; v0.8.1 fixes select-option target-key stability, OpenAI-compatible server compatibility for the text helper, and adds a local Ollama decision backend for key-free runs; v0.8.2 makes trial analysis intention-to-treat over assignment events, makes stamped plans genuinely immutable and bound, censors unmeasured run outcomes in learned models, and hardens the local backend request path; v0.8.3 adds the separate causal `TrialChoiceModel` decision prior and hierarchical task-family/site context across `ChoiceModel` and `CounterfactualTrials`; v0.9.0 makes the causal layer validity-first — support vs. effect certainty, sequentially valid establishment, structured censoring with an imbalance gate, true family/site coordinates with a bounded treatment signature, bound and optionally signed experiment plans, a hypothesis scheduler, multi-objective utility, and the operator-gated `CausalChoicePolicy`), and the qualification-correctness pass (action-catalogue node-fairness, a real holdout, non-degenerate experiment allocation, censoring bounds, a formally anytime-valid confidence sequence with multiplicity control, operator-declared input guarantees, model-routing security levels, provenance/anchor gates, and generated validation reporting).
+Validation date: 2026-09-30, updated for the v0.7.1 hardening pass, the v0.8.0 audit-correction pass, the v0.8.1 stability patch, the v0.8.2 causal-integrity pass, the v0.8.3 causal-model/hierarchical-context pass, and the v0.9.1 post-release hardening pass (v0.5.1 applied the independent-audit authority patch; v0.6.0 added the `ChoiceModel` counterfactual layer; v0.7.0 added real randomized counterfactual trials; v0.7.1 fixed trial-approval resume and registry lineage; v0.8.0 restores the v0.6.2 hardening this line had dropped — trajectory-success labeling, honest propensity fields, the registry head anchor, pre-authority assignment recording, and the run-level trial endpoint — and wires stamped `experiment_proposals` into the agent; v0.8.1 fixes select-option target-key stability, OpenAI-compatible server compatibility for the text helper, and adds a local Ollama decision backend for key-free runs; v0.8.2 makes trial analysis intention-to-treat over assignment events, makes stamped plans genuinely immutable and bound, censors unmeasured run outcomes in learned models, and hardens the local backend request path; v0.8.3 adds the separate causal `TrialChoiceModel` decision prior and hierarchical task-family/site context across `ChoiceModel` and `CounterfactualTrials`; v0.9.0 makes the causal layer validity-first — support vs. effect certainty, sequentially valid establishment, structured censoring with an imbalance gate, true family/site coordinates with a bounded treatment signature, bound and optionally signed experiment plans, a hypothesis scheduler, multi-objective utility, and the operator-gated `CausalChoicePolicy`), the qualification-correctness pass (action-catalogue node-fairness, a real holdout, non-degenerate experiment allocation, censoring bounds, a formally anytime-valid confidence sequence with multiplicity control, operator-declared input guarantees, model-routing security levels, provenance/anchor gates, and generated validation reporting), and the second audit pass (per-hypothesis ordered alpha spending on a summable schedule, epoch-stitched anytime-valid bounds, exact-action-only ACTIVE deployment, semantic action identity, signed qualification evidence with anti-rollback pins, full-set release enumeration, a real Q4 statistical gate, and grammar-aware structural search).
 
 Historical run counts below are per-milestone records; the count authoritative for the current tree is the generated report (`scripts/qualify.py --report-md`), produced from the exact artifact under test.
 
@@ -350,6 +350,63 @@ inventory).
   report `coverage: 0` and `None`-valued secondary/safety rates — an
   unmeasured arm says unknown, never a confident zero — and the safety
   verdict itself reports `None` (unknown), not clean.
+
+## Second audit pass — statistical authority and release qualification (unreleased)
+
+A twelve-finding independent re-audit moved the remaining risk into the
+statistical-authority layer and the gap between *signed* and *qualified*:
+
+- **`pow` verifier bypass closed**: the exponent now passes the ordinary
+  AST validator as an exact single-key `const` inside the shared node
+  budget (smuggled members are rejected, not ignored), and `clamp` bounds
+  share the `_MAX_CONST` envelope — no arbitrary-size JSON survives
+  validation inside an exponent object.
+- **α spending is ordered and per-hypothesis** (`jev-trials/12`):
+  declaration order is `(recorded_at_ms, meta digest, tag rank)` — never
+  run-encounter order — and each declaration funds a treatment-class
+  *and* an exact-action hypothesis separately, so within-context adaptive
+  analyses can no longer share one context α. The geometric `0.5^i`
+  schedule became the summable `i⁻²/ζ(2)` normalization: same family
+  bound, without making late-context learning practically impossible.
+- **Confidence sequences are epoch-stitched**: powers-of-two epoch
+  spending replaces the per-look `n^-1.5` schedule (τ grows ≈ ln log n
+  instead of 1.5 ln n) and IPW weights are mean-normalized inside the
+  bound — measurable power (`≈92%` at `+0.30, n=300`; `100%` at
+  `+0.60, n=100`) under the same anytime-valid guarantee.
+- **Q4 is a real gate**: `simulate_causal.py` uses deterministic
+  SHA-256-derived seeds and asserts six bounded groups — null
+  false-establishment (CP95 ≤ α), power at documented operating points,
+  harm/extreme-propensity, censoring imbalance and symmetric censoring,
+  delta calibration, and family-wise multiplicity — printing each bound
+  and exiting non-zero on any violation.
+- **`action_key` is semantic identity**: kind, effect, role, the
+  pre-redaction normalized label, site, and an authority-context digest —
+  redaction-colliding or same-labeled controls no longer share an
+  "exact" evidence pool.
+- **ACTIVE deploys only on the action's own established contrast**:
+  stores without per-action cells cannot establish ACTIVE
+  (`insufficient_action_evidence` — legacy evidence stays valid for
+  shadow/canary nomination), thin per-action data keeps the canary
+  running instead of deploying an uncontrolled shrinkage estimate, and
+  signed confirmations surface as `action_confirmed` provenance with no
+  deployment authority.
+- **Qualified verifies qualification evidence**:
+  `RELEASE_QUALIFICATION.json` (a signed `jev-qualify/*` report with
+  `release_qualified: true` bound to the manifest digest) is required by
+  `JEV_SECURITY_PROFILE=qualified` at startup and by
+  `verify_release.py --require-qualification` under
+  `JEV_QUALIFY_VERIFY_KEYS`/`--qualify-key`; `qualify.py --full` emits
+  it. `JEV_EXPECT_TCB_VERSION`/`JEV_EXPECT_MANIFEST_DIGEST` (and the
+  matching verifier flags) pin the approved release against rollback, and
+  the external verifier now rejects any unmanifested file anywhere in
+  the tree — a signed release proves integrity, the signed report proves
+  qualification.
+- **Structural search explores the grammar**: `mutate_policies` rewrites
+  single AST positions (operator/relation/operand swaps, same-typed
+  feature and constant exchanges, unary wraps/strips, subtree pruning,
+  growth wraps) round-robin across every expression — the optimizer now
+  searches the bounded language the verifier checks instead of rotating
+  four seed templates.
 
 ## Deployment gate
 

@@ -1471,9 +1471,11 @@ def _causal_evidence():
                 "proposal_kind": "click",
                 "proposal_effect": "search",
                 # Exact-action identity, stamped the way the agent stamps it:
-                # e3 is {"kind": "click", "label": "Go", "role": "button"}.
+                # e3 is {"kind": "click", "label": "Go", "role": "button"}
+                # on site "example.test" with no recorded ctx.
                 "proposal_action_key": action_key(
-                    kind="click", effect="search", role="button", label="Go"
+                    kind="click", effect="search", role="button", label="Go",
+                    site="example.test",
                 ),
                 "proposal_role": "button",
                 "proposal_overlap": 0,

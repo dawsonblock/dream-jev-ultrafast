@@ -110,12 +110,12 @@ def test_policy_and_mutation_digests_unchanged():
     # moves after them, Phase 20 appends verified program mutations
     # last, so the count and tail evolve by design.
     digests = [m.digest for m in dream.mutate_policies(dream.ExplorationPolicy())]
-    assert len(digests) == 79
+    assert len(digests) == 89
     assert digests[0] == (
         "828e8d89efb0a08a89f622dad00f2b4678e9e9c6e85c7b26dbdef41547dcad94"
     )
     assert digests[-1] == (
-        "2c328e09a0e76ee54618399117d418b9d1619ea49d29ed0dcc9e6b10ed2fa5c1"
+        "01cfe147d303ac804d02247fe1624a76bf3feedc3bab554fe055421880e50b4b"
     )
 
 
@@ -144,8 +144,8 @@ def test_causal_serialization_and_statistics_unchanged():
     assert dreamlearn.CounterfactualTrials().to_dict() == {
         "cells": (), "duplicates": 0, "action_index": (), "action_cells": (),
         "invalid_units": 0, "rejected": 0, "registered": (),
-        "family_order": (),
-        "version": "jev-trials/11",
+        "family_order": (), "action_registered": (),
+        "version": "jev-trials/12",
     }
     masks = dreamlearn._signature_masks(
         ["click", "high", "navigation", "primary", "1", "0-4", "fill"])

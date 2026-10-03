@@ -133,8 +133,8 @@ class CausalChoicePolicy:
     cannot execute deterministically (``no_causal_evidence``,
     ``insufficient_support``, ``unresolved``, ``below_effect_threshold``,
     ``missing_probability``, ``safety_regression``, ``pooled_only``,
-    ``unsupported_stratum``, ``unverified_generalization``, ``harmful``),
-    or ``None``.
+    ``unsupported_stratum``, ``unverified_generalization``,
+    ``insufficient_action_evidence``, ``harmful``), or ``None``.
 
     Scores are separated by purpose instead of one overloaded value:
     ``causal_score`` (weighted measured effect), ``observational_score``
@@ -158,16 +158,15 @@ class CausalChoicePolicy:
     # execution authority — an operator may weaken this list explicitly, but
     # never accidentally: unknown level names fail closed at construction.
     active_trial_levels: tuple[str, ...] = ("family+site", "site", "family")
-    # Generalization levels whose evidence may drive an *active* override.
-    # ``exact`` — this exact action identity was itself the randomized
-    # candidate arm in the answering stratum — is the only default: a
-    # never-randomized action cannot deploy solely because its treatment
-    # class looked beneficial. ``same_context_class`` evidence earns active
-    # authority only when a contextual canary of this action is on record —
-    # derived from the trial store (``action_randomized_in_context``) or
-    # listed in ``confirmed_action_keys`` for confirmations evidenced
-    # outside this model. An operator may widen the set explicitly; unknown
-    # level names fail closed at construction.
+    # Generalization levels whose *established exact-action* evidence may
+    # drive an *active* override. ``exact`` — this action identity was the
+    # randomized candidate arm under the enforced signature in the
+    # answering stratum — is the only default: ACTIVE requires the action's
+    # own established-beneficial contrast measured at a level in this set.
+    # Class evidence, action presence, and canary confirmations cannot
+    # substitute — they annotate and nominate, never deploy. An operator
+    # may widen the set explicitly; unknown level names fail closed at
+    # construction.
     active_generalization_levels: tuple[str, ...] = ("exact",)
     confirmed_action_keys: tuple[str, ...] = ()
     # Signed contextual-canary confirmations (schema
@@ -179,6 +178,10 @@ class CausalChoicePolicy:
     # records count and the unsigned ``confirmed_action_keys`` compatibility
     # path is closed; leaving everything unconfigured keeps the legacy
     # unsigned behavior (documented compatibility, never silently strict).
+    # Confirmations are canary *provenance* — surfaced as the
+    # ``action_confirmed`` annotation for scheduling and audit. They carry
+    # no deployment authority: ACTIVE still requires the action's own
+    # established exact-action contrast.
     action_confirmations: tuple[dict, ...] = ()
     confirmation_verify_keys: tuple[str, ...] | None = None
 
@@ -264,6 +267,11 @@ class CausalChoicePolicy:
         compatibility set applies. A signed record's declared scope must
         also cover this query — a confirmation for a different task family
         or site does not travel.
+
+        This is provenance, not deployment authority: it surfaces on the
+        ``action_confirmed`` annotation and informs canary scheduling, but
+        ACTIVE execution still requires the action's own established
+        exact-action contrast.
         """
         if causal_entry.get("action_randomized_in_context"):
             return True
@@ -418,6 +426,14 @@ class CausalChoicePolicy:
                 "effect_status": (causal_entry or {}).get("effect_status"),
                 "generalization_level": (causal_entry or {}).get("generalization_level"),
                 "action_key": (causal_entry or {}).get("action_key"),
+                # Canary provenance only — a recorded contextual canary of
+                # this action exists. Annotation for scheduling/audit;
+                # it carries no deployment authority.
+                "action_confirmed": (
+                    self._action_confirmed(causal_entry, task_family, site)
+                    if causal_entry is not None
+                    else False
+                ),
                 "exact_action_randomized": (causal_entry or {}).get(
                     "exact_action_randomized"
                 ),
@@ -517,17 +533,19 @@ class CausalChoicePolicy:
           action beats a beneficial class, and a supported contrast that
           has not established benefit is exact evidence that we do not
           know — not an invitation for class data to override it;
-        - ``exact`` generalization (the action identity itself randomized
-          under the enforced signature) deploys on the action's own
-          established effect, or — when its own data is thin — on the
-          documented hierarchical shrinkage estimator;
-        - ``same_context_class`` bridges to active authority only through
-          a completed contextual canary of this action (``_action_confirmed``:
-          the store's own in-context randomization record, or a signed /
-          operator-attested confirmation), then through the same
-          shrinkage rule — and when the store has no per-action counters
-          at all, on the class estimate itself under the ``class_evidence``
-          estimator label.
+        - only an ``action_exact`` contrast that is itself established
+          beneficial may deploy, and only when the answering
+          generalization level is in ``active_generalization_levels``
+          (``exact`` by default);
+        - thin per-action data keeps the canary running — shrinkage toward
+          the class estimate is a prioritization signal, never a
+          deployment basis, because the class estimate usually contains
+          the action's own observations and the shrunk estimator carries
+          no controlled uncertainty;
+        - a store without per-action counters (pre-v11 evidence) cannot
+          establish ACTIVE at all — its presence/class evidence remains
+          valid for shadow annotation and canary nomination, which is how
+          the fresh exact-action evidence gets gathered.
 
         ``None`` (an entry built before generalization annotation existed)
         or an unrecognized value fails closed.
@@ -557,75 +575,45 @@ class CausalChoicePolicy:
         if level is not None and str(level) not in self.GENERALIZATION_LEVELS:
             return "unverified_generalization"
         action_exact = causal_entry.get("action_exact")
-        if isinstance(action_exact, dict):
-            # The action's own measured data answers first and can only
-            # ever veto or outrank the class estimate: an established-
-            # harmful verdict on *this* action is authoritative, and a
-            # supported but undecided contrast means the action's own
-            # evidence says "unknown" — class data cannot substitute.
-            if action_exact.get("effect_status") == "harmful":
-                return "harmful"
-            if action_exact.get("support_sufficient"):
-                if action_exact.get("effect_status") == "beneficial":
-                    return None
-                return "unresolved"
-        confirmed = self._action_confirmed(causal_entry, task_family, site)
+        # The action's own measured data answers first and can only veto:
+        # an established-harmful verdict on *this* action is authoritative
+        # at any generalization level.
+        if (
+            isinstance(action_exact, dict)
+            and action_exact.get("effect_status") == "harmful"
+        ):
+            return "harmful"
         if str(level or "") not in set(self.active_generalization_levels):
-            if not (level == "same_context_class" and confirmed):
-                return "unverified_generalization"
-        # An active level was reached (``exact`` by default). ``exact``
-        # presence is itself the in-context canary record, so a store that
-        # predates per-action counters degrades to the confirmed path
-        # rather than inventing support — the ``class_evidence`` estimator
-        # reports that weaker basis honestly.
-        return self._shrinkage_gate(causal_entry)
-
-    def _shrinkage_gate(self, causal_entry: dict) -> str | None:
-        """Hierarchical shrinkage deployment rule for thin per-action data.
-
-        When the action's own contrast exists but cannot yet answer, the
-        deployed estimate pools it toward the established class contrast:
-
-            ``δ̂ = (w·δ_action + κ·δ_class) / (w + κ)``
-
-        with ``w = min(candidate_ess, control_ess)`` of the action contrast
-        and ``κ = CounterfactualTrials.MIN_ESS`` — the class estimate enters
-        as a prior worth one MIN_ESS cell. Documented assumptions: the
-        class effect is already established beneficial by the gates above;
-        the action's own point estimate must not contradict it (``δ_action
-        ≥ 0`` — a measured negative delta means the action's own data
-        refutes the generalization and the bridge closes); and the shrunk
-        estimate must still clear ``min_causal_delta``. Without per-action
-        counters (``action_exact is None``) the rule degenerates to the
-        class estimate under the confirmation that already fired — the
-        ``class_evidence`` estimator.
-        """
-        action_exact = causal_entry.get("action_exact")
-        delta_class = float(causal_entry.get("expected_delta") or 0.0)
-        if not isinstance(action_exact, dict):
-            return None if delta_class > self.min_causal_delta else "below_effect_threshold"
-        delta_action = action_exact.get("delta")
-        if delta_action is None or float(delta_action) < 0.0:
-            # The action's own measured outcomes contradict the class
-            # claim — generalization is not verified.
             return "unverified_generalization"
-        w = min(
-            float(action_exact["candidate"]["ess"]),
-            float(action_exact["control"]["ess"]),
-        )
-        kappa = _MIN_ESS
-        shrunk = (w * float(delta_action) + kappa * delta_class) / (w + kappa)
-        return None if shrunk > self.min_causal_delta else "below_effect_threshold"
+        if not isinstance(action_exact, dict):
+            # No per-action counters answer for this action — either a
+            # store that predates the per-action schema or a canary that
+            # has not yet measured this identity. Presence/class evidence
+            # stays valid for shadow annotation and canary nomination, but
+            # ACTIVE deployment requires the action's own established
+            # contrast.
+            return "insufficient_action_evidence"
+        if action_exact.get("support_sufficient"):
+            if action_exact.get("effect_status") == "beneficial":
+                return None
+            # A supported but undecided contrast is exact evidence that we
+            # do not know — class data cannot substitute for it.
+            return "unresolved"
+        # Thin per-action data: the canary continues. Shrinking toward the
+        # class estimate would lend significance the action's own evidence
+        # has not earned — hierarchical estimates remain a prioritization
+        # signal, never a deployment basis.
+        return "unresolved"
 
     def _deployment_estimate(self, causal_entry: dict) -> dict:
         """The estimate an executable entry actually deploys on.
 
-        ``estimator`` names which evidence answered — ``exact_action``
-        (the action's own established contrast), ``hierarchical_shrinkage``
-        (thin per-action data pooled toward the class effect), or
-        ``class_evidence`` (no per-action counters; the contextual-canary
-        bridge attests the action under the class estimate). The deployed
-        probability is the measured control rate plus *that* delta.
+        Only ``exact_action`` — the action's own established contrast —
+        passes the active gate. The other ``estimator`` labels report the
+        weaker basis honestly for annotation/prioritization callers that
+        invoke this directly; they never reach the executable path.
+        The deployed probability is the measured control rate plus *that*
+        delta.
         """
         control_p = causal_entry.get("control_p")
         try:

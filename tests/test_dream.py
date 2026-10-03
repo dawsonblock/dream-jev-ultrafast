@@ -2543,6 +2543,61 @@ def test_structural_program_mutations_are_real_ast_moves():
     assert any(c.stop_when is None for c in moves)
 
 
+def test_grammar_aware_mutations_search_the_language_not_templates():
+    """The structural search is no longer template insertion: one-position
+    rewrites move operators inside their signature family, swap features
+    within a type, retarget comparisons, prune composite nodes to children,
+    and wrap subtrees in grammar contexts — every mutant still inside the
+    verified bounded language."""
+    rule = _rule(
+        {"and": [{"feature": "is_fill"},
+                 {"cmp": [">=", {"feature": "overlap"}, {"const": 1}]}]},
+        {"mul": [{"feature": "overlap"}, {"const": 0.5}]},
+    )
+    seeded = ExplorationPolicy(rules=(rule,))
+    moves = [c for c in mutate_policies(seeded) if len(c.rules) == 1]
+
+    def _subs(node):
+        """All (op, arg) pairs in an expression tree."""
+        (op, arg), = node.items()
+        yield op, arg
+        children = [arg] if isinstance(arg, dict) else (
+            [c for c in arg if isinstance(c, dict)]
+            if isinstance(arg, list) else [])
+        for child in children:
+            yield from _subs(child)
+
+    rule_sets = [c.rules[0] for c in moves]
+    # Operator swap in a signature family: mul -> add/sub/min/max somewhere.
+    assert any(
+        any(op == other for op, _ in _subs(r["add"]))
+        for other in ("add", "sub", "min", "max")
+        for r in rule_sets
+    )
+    # Boolean family swap: and -> or on the guard.
+    assert any(r["when"].get("or") is not None for r in rule_sets)
+    # Feature swap within the numeric type.
+    assert any(
+        (op == "feature" and arg != "overlap")
+        for r in rule_sets for op, arg in _subs(r["add"])
+    )
+    # Comparison retargeted: a different relation or swapped operands.
+    assert any(
+        (op == "cmp" and arg[0] != ">=")
+        or (op == "cmp" and arg[1] == {"const": 1})
+        for r in rule_sets for op, arg in _subs(r["when"])
+    )
+    # Growth wrap: a subtree placed inside a grammar context.
+    assert any(
+        any(op in {"abs", "neg", "min", "add"} and isinstance(arg, dict)
+            for op, arg in _subs(r["add"]))
+        for r in rule_sets
+    )
+    # Every mutant is still a validating, round-trippable program.
+    for c in moves:
+        ExplorationPolicy.from_dict(c.to_dict())
+
+
 def test_program_changes_behavior_digest_not_baseline_identity():
     """Program fields bind into the behavior digest only when present —
     the baseline's digests are byte-for-byte historical."""

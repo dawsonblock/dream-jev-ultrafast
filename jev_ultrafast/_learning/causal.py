@@ -11,12 +11,13 @@ from typing import TYPE_CHECKING
 from .censoring import _run_outcome
 from .common import _stable_hash
 from .confidence import (
-    _arm_confidence_bounds,
+    _arm_cs_bounds,
     _arm_ws,
     _arm_wsq,
     _arm_wsum,
+    _epoch_alpha,
+    _epoch_index,
     _newcombe,
-    _sequential_alpha,
     _wilson_interval,
 )
 from .signatures import (
@@ -297,13 +298,13 @@ class CounterfactualTrials:
     ``delta_ci`` is the fixed-sample Newcombe-Wilson interval for reporting;
     ``delta_cs`` is the interval establishment uses — a **confidence
     sequence** for the candidate−control difference, valid at every look
-    simultaneously. It is built by spending ``SEQUENTIAL_ALPHA`` over all
-    integer looks (``_sequential_alpha``) on *exact* per-look concentration
-    bounds: the Chernoff/KL bound on a Bernoulli mean when the IPW weights
-    are uniform, Hoeffding's weighted bound when they are not. Unlike the
-    previous α-spent Newcombe approximation, the composition is formally
-    anytime-valid, and ``SEQUENTIAL_ALPHA`` is Bonferroni-split across the
-    simultaneously tracked hypothesis family (``hypothesis_count``).
+    simultaneously (``_arm_cs_bounds``): an exponential-supermartingale
+    bound stitched over geometric epochs, with the family's alpha spent
+    ``k^-3/2`` across epochs so the error budget decays like
+    ``1.5·ln log n`` instead of ``1.5·ln n`` — late-arriving evidence
+    remains decisive. Unlike the previous α-spent Newcombe approximation,
+    the composition is formally anytime-valid, and ``SEQUENTIAL_ALPHA`` is
+    funded irrevocably across the declared hypothesis family.
 
     Censoring is a first-class causal concern, not bookkeeping. Three
     mechanisms handle it:
@@ -387,28 +388,43 @@ class CounterfactualTrials:
     # over this registered union with observed cells, never cell count
     # alone.
     registered: tuple[tuple, ...] = ()
-    # Online alpha allocation (Phase 6): trial contexts in first-
-    # declaration order. Every hypothesis that joins the family — observed
-    # or declared — receives an *irrevocable* geometric share of
-    # ``SEQUENTIAL_ALPHA`` at the ordinal it declared under, so a
-    # hypothesis added after a deployment decision can never retroactively
-    # dilute the threshold that decision was made under. Stores built
-    # before ordering was recorded cannot recover chronology: they receive
-    # a deterministic reconstructed order (sorted contexts) at load, which
-    # is then equally irrevocable once serialized.
+    # Online alpha allocation (Phase 6): *hypotheses* in true global
+    # declaration order — the earliest ``recorded_at_ms`` on the declaring
+    # assignment record, digest-tiebroken — never the order an event list
+    # was grouped or ingested in. Every hypothesis that joins the family
+    # receives an *irrevocable* share of ``SEQUENTIAL_ALPHA`` at the
+    # ordinal it declared under, so a hypothesis added after a deployment
+    # decision can never retroactively dilute the threshold that decision
+    # was made under. Entries are ``context + (tag,)``: ``"class"`` for
+    # the context's treatment-class test, ``"action:<key>"`` for each
+    # declared exact-action test — one assignment declares both into the
+    # *same* budget, so an action contrast cannot quietly respend the
+    # context's class alpha (the within-context multiplicity hole). A
+    # serialized context-length entry from an older store normalizes to
+    # the ``class`` tag at load. Stores built before ordering was
+    # recorded cannot recover chronology: they receive a deterministic
+    # reconstructed order (sorted contexts) at load, which is then
+    # equally irrevocable once serialized.
     family_order: tuple[tuple, ...] = ()
-    version: str = "jev-trials/11"
+    # Exact-action declarations (Phase 7): ``(context, action_key, arm)``
+    # tuples recorded at declaration time — including quarantined and
+    # censored units — so an action hypothesis's *registered* status is
+    # provenance about intent, not merely which evidence survived.
+    action_registered: tuple[tuple, ...] = ()
+    version: str = "jev-trials/12"
 
     MIN_ESS = 8.0
     MIN_EFFECT = 0.0
     SEQUENTIAL_ALPHA = 0.05
-    # Geometric spending rate for the online hypothesis family: context i
-    # (0-based declaration order) receives ``SEQUENTIAL_ALPHA · ρ·(1−ρ)ⁱ``,
-    # so the sum over any number of hypotheses stays strictly below
-    # ``SEQUENTIAL_ALPHA`` — the allocation is irrevocable and unbounded
-    # family growth is always affordable, at the cost of later hypotheses
-    # receiving exponentially smaller shares.
-    ALPHA_SPEND_RATE = 0.5
+    # Online spending exponent for the hypothesis family: context i
+    # (1-based declaration order) receives
+    # ``SEQUENTIAL_ALPHA · i⁻ᵖ / ζ(p)`` with p = ``ALPHA_SPEND_EXPONENT``
+    # — a normalized heavy-tail schedule whose infinite sum is exactly the
+    # budget. Unlike a geometric spend, which protects the family by
+    # making later learning practically impossible (α₁₀₀₀ ~ 10⁻³⁰⁰), the
+    # power-law tail keeps remote hypotheses testable: α₁₀₀ ≈ 3·10⁻⁶.
+    ALPHA_SPEND_EXPONENT = 2.0
+    _ALPHA_ZETA = math.pi**2 / 6.0  # ζ(ALPHA_SPEND_EXPONENT)
     CENSOR_RATE_MAX = 0.5
     CENSOR_RATE_GAP = 0.25
 
@@ -426,13 +442,32 @@ class CounterfactualTrials:
         action_acc: dict[tuple, list] = {}
         action_entries: set[tuple] = set()
         registered_entries: set[tuple] = set()
-        declared_order: list[tuple] = []
-        declared_set: set = set()
+        # (context + hypothesis tag) -> (recorded_at_ms, declaration
+        # digest): the *earliest* declaration observed for each hypothesis
+        # fixes its position in the online allocation order — not the
+        # order this event list happened to be grouped or ingested in.
+        # One assignment declares up to two hypotheses in the *same*
+        # family budget: the treatment-class test for its context
+        # (tag ``"class"``) and, when the proposal identity is provable,
+        # the exact-action test for (context, action_key) (tag
+        # ``"action:<key>"``). Separate funding is the whole point: the
+        # context's class alpha can never be silently respent answering
+        # an action-level question (and vice versa). Declarations carry
+        # the timestamp of their own assignment record; equal timestamps
+        # break by the declaration's canonical digest so identical
+        # evidence always allocates identically regardless of input
+        # ordering.
+        declared_ordering: dict[tuple, tuple] = {}
+        # Exact-action declarations: (context, action_key, arm) — recorded
+        # at declaration time like the class registrations, including
+        # units later quarantined or censored. ``action_index`` records
+        # *analyzed* randomized presence; this records *declared* intent.
+        action_registered: set[tuple] = set()
         duplicates = 0
         invalid_units = 0
         rejected = 0
 
-        def _declare(meta, transition):
+        def _declare(meta, transition, event=None):
             """Register the hypothesis an assignment declared, before outcomes.
 
             The assignment record is written before the run's result is
@@ -441,21 +476,48 @@ class CounterfactualTrials:
             quarantined or censored: a test that ran and produced no
             usable cells still consumed a slot in the family error budget.
             A meta whose context cannot be extracted at all cannot name a
-            hypothesis and is simply not declarable. First declaration also
-            fixes the context's position in the online allocation order —
-            its share of the family error budget is irrevocable from here.
+            hypothesis and is simply not declarable. Earliest declaration
+            also fixes the context's position in the online allocation
+            order — its share of the family error budget is irrevocable
+            from here.
             """
             try:
                 context = _trial_context(meta, transition)
             except (TypeError, ValueError, AttributeError):
                 return
             arm = str(meta.get("arm") or "")
-            registered_entries.add(
-                (*context, arm if arm in {"candidate", "control"} else "invalid")
+            arm = arm if arm in {"candidate", "control"} else "invalid"
+            registered_entries.add((*context, arm))
+            record = event if event is not None else transition
+            timestamp = 0
+            if isinstance(record, dict):
+                try:
+                    timestamp = int(record.get("recorded_at_ms") or 0)
+                except (TypeError, ValueError):
+                    timestamp = 0
+            digest = _stable_hash(
+                json.dumps(meta, sort_keys=True, separators=(",", ":"),
+                           default=str)
             )
-            if context not in declared_set:
-                declared_set.add(context)
-                declared_order.append(context)
+            class_key = context + ("class",)
+            # Same-record ties rank the class test first (tag rank 0): it
+            # is what the assignment itself declared; the derived action
+            # test takes the next ordinal (tag rank 1).
+            class_key_order = (timestamp, digest, 0)
+            previous = declared_ordering.get(class_key)
+            if previous is None or class_key_order < previous:
+                declared_ordering[class_key] = class_key_order
+            # The action hypothesis declares at the same instant, funded
+            # from the same budget — a context may declare many distinct
+            # action hypotheses over time and each spends its own share.
+            action = _proposal_action_key(meta, transition)
+            if action is not None:
+                action_registered.add((*context, action, arm))
+                action_key = context + (f"action:{action}",)
+                action_key_order = (timestamp, digest, 1)
+                previous = declared_ordering.get(action_key)
+                if previous is None or action_key_order < previous:
+                    declared_ordering[action_key] = action_key_order
 
         def _proposal_action_key(meta: dict, transition: dict | None) -> str | None:
             """The exact-action identity of the assigned proposal, if known.
@@ -487,6 +549,8 @@ class CounterfactualTrials:
                 effect=meta.get("proposal_effect", candidate.get("effect")),
                 role=meta.get("proposal_role", candidate.get("role")),
                 label=candidate.get("label"),
+                site=meta.get("site"),
+                ctx=candidate.get("ctx"),
             )
 
         def _fold(cell, outcome, reason, page_changed, weight, run_costs):
@@ -531,7 +595,8 @@ class CounterfactualTrials:
             cell[_COUNT_OUTCOME_BASE + 4] += authority_touches * weight
             cell[_COUNT_OUTCOME_BASE + 5] += guard_failures * weight
 
-        def record(meta, outcome, reason, page_changed, transition, run_costs):
+        def record(meta, outcome, reason, page_changed, transition, run_costs,
+                   event=None):
             """Fold one arm assignment into its context cell.
 
             ``page_changed`` is the executed step's telemetry (None when the
@@ -545,7 +610,7 @@ class CounterfactualTrials:
             """
             # Declare before validating: the assignment event registered
             # the hypothesis even if the record proves malformed below.
-            _declare(meta, transition)
+            _declare(meta, transition, event)
             arm = str(meta.get("arm") or "")
             try:
                 propensity = float(meta.get("assignment_probability"))
@@ -634,7 +699,7 @@ class CounterfactualTrials:
                 # each spliced assignment still declared a hypothesis, so
                 # each pays into the registered family.
                 for _assigned_event, declared_meta in distinct:
-                    _declare(declared_meta, None)
+                    _declare(declared_meta, None, _assigned_event)
                 invalid_units += 1
                 continue
             if distinct:
@@ -644,7 +709,7 @@ class CounterfactualTrials:
                     # not a trial of that run — it cannot have produced the
                     # outcome it would be credited with. The unit is invalid;
                     # its declaration still stands.
-                    _declare(meta, None)
+                    _declare(meta, None, assigned_event)
                     invalid_units += 1
                     continue
                 step = cls._execution_step(meta, trial_steps)
@@ -655,6 +720,7 @@ class CounterfactualTrials:
                     step.get("page_changed") if step is not None else None,
                     step,
                     run_costs,
+                    assigned_event,
                 ):
                     # Malformed record (bad arm, missing/invalid propensity):
                     # rejected at the unit gate, counted, never folded in.
@@ -684,7 +750,7 @@ class CounterfactualTrials:
                     legacy_distinct.append((step, meta))
                 if len(legacy_distinct) > 1:
                     for legacy_step, declared_meta in legacy_distinct:
-                        _declare(declared_meta, legacy_step)
+                        _declare(declared_meta, legacy_step, legacy_step)
                     invalid_units += 1
                     continue
                 if legacy_distinct:
@@ -693,12 +759,12 @@ class CounterfactualTrials:
                         # The tagged step is ordered after the run's
                         # terminal event — it cannot have produced the
                         # outcome it would be credited with.
-                        _declare(meta, step)
+                        _declare(meta, step, step)
                         invalid_units += 1
                         continue
                     if not record(
                         meta, outcome, reason,
-                        step.get("page_changed"), step, run_costs,
+                        step.get("page_changed"), step, run_costs, step,
                     ):
                         rejected += 1
         loose_seen: set = set()
@@ -722,11 +788,12 @@ class CounterfactualTrials:
                     duplicates += 1
                     continue
                 loose_seen.add(identity)
-                record(meta, "censored", "unknown_abort", None, None, (0, 0, 0, 0, 0, 0))
+                record(meta, "censored", "unknown_abort", None, None,
+                       (0, 0, 0, 0, 0, 0), event)
             elif event.get("event") == "transition" and isinstance(event.get("experiment"), dict):
                 record(
                     event["experiment"], "censored", "unknown_abort",
-                    event.get("page_changed"), event, (0, 0, 0, 0, 0, 0),
+                    event.get("page_changed"), event, (0, 0, 0, 0, 0, 0), event,
                 )
         return cls(
             cells=tuple(sorted(key + tuple(counts) for key, counts in acc.items())),
@@ -738,7 +805,22 @@ class CounterfactualTrials:
             invalid_units=invalid_units,
             rejected=rejected,
             registered=tuple(sorted(registered_entries)),
-            family_order=tuple(declared_order),
+            action_registered=tuple(sorted(action_registered)),
+            # Global declaration order, not encounter order: each
+            # hypothesis's position is its earliest (recorded_at_ms,
+            # digest) across every run — the same evidence allocates the
+            # same alpha however the event list was grouped or supplied.
+            # Entries are ``context + (tag,)`` — ``"class"`` for the
+            # treatment-class test, ``"action:<key>"`` for each declared
+            # exact-action test — so action hypotheses spend their own
+            # shares, never the context's class allocation.
+            family_order=tuple(
+                hypothesis
+                for hypothesis, _ in sorted(
+                    declared_ordering.items(),
+                    key=lambda item: (item[1], repr(item[0])),
+                )
+            ),
         )
 
     def _registered_arms(self) -> dict[tuple, set]:
@@ -757,64 +839,107 @@ class CounterfactualTrials:
             if {"candidate", "control"} <= arms
         }
 
-    def _hypothesis_count(self) -> int:
-        """The multiplicity family: registered ∪ observed contexts.
+    def _action_comparisons(self) -> set[tuple]:
+        """``(context, action_key)`` pairs where both arms were declared —
+        the preregistered exact-action tests."""
+        arms: dict[tuple, set] = {}
+        for entry in self.action_registered:
+            if len(entry) != _TRIAL_KEY_LEN + 1:
+                continue
+            pair = tuple(entry[: _TRIAL_KEY_LEN - 1]) + (
+                entry[_TRIAL_KEY_LEN - 1],
+            )
+            arms.setdefault(pair, set()).add(entry[_TRIAL_KEY_LEN])
+        return {
+            pair
+            for pair, declared in arms.items()
+            if {"candidate", "control"} <= declared
+        }
 
+    def _hypothesis_count(self) -> int:
+        """The multiplicity family: registered ∪ observed *hypotheses*.
+
+        The family counts hypotheses, not contexts: a context's class test
+        and each of its declared exact-action tests are separate entries.
         Registered declarations that produced no analyzable cells still
         count — the test was declared and run; only the record of what it
         declared survives. Stores built before registration existed fall
-        back to the cell count alone (the previous implicit family), which
-        is exactly the registered-empty case.
+        back to the observed cells alone (the previous implicit family).
         """
-        return len(
-            {tuple(entry[: _TRIAL_KEY_LEN - 1]) for entry in self.registered}
-            | {tuple(cell[: _TRIAL_KEY_LEN - 1]) for cell in self.cells}
-        )
+        declared = {tuple(entry) for entry in self.family_order}
+        declared |= {
+            tuple(entry[: _TRIAL_KEY_LEN - 1]) + ("class",)
+            for entry in self.registered
+        }
+        observed = {
+            tuple(cell[: _TRIAL_KEY_LEN - 1]) + ("class",)
+            for cell in self.cells
+        }
+        observed |= {
+            tuple(cell[: _TRIAL_KEY_LEN - 1])
+            + ("action:" + str(cell[_TRIAL_KEY_LEN - 1]),)
+            for cell in self.action_cells
+        }
+        return len(declared | observed)
 
     def _alpha_allocations(self) -> dict[tuple, float]:
         """Each declared context's irrevocable share of the family budget.
 
-        Geometric online allocation in first-declaration order: context i
-        receives ``SEQUENTIAL_ALPHA · ρ·(1−ρ)ⁱ`` with ρ =
-        ``ALPHA_SPEND_RATE`` — bounded by ``SEQUENTIAL_ALPHA`` over *any*
-        number of hypotheses, so a hypothesis added later can never
-        retroactively widen the threshold an earlier deployment decision
-        was made under (the sequential family-expansion failure mode).
-        Stores serialized before ``family_order`` existed cannot recover
-        chronology: every known context then receives the same equal share
-        — deterministic, conservative in the multi-context case, and once
-        re-serialized equally irrevocable.
+        Normalized heavy-tail online allocation in declaration order:
+        context i (1-based) receives
+        ``SEQUENTIAL_ALPHA · i⁻ᵖ / ζ(p)`` with p =
+        ``ALPHA_SPEND_EXPONENT`` — bounded by ``SEQUENTIAL_ALPHA`` over
+        *any* number of hypotheses (the schedule's infinite sum is exactly
+        the budget), so a hypothesis added later can never retroactively
+        widen the threshold an earlier deployment decision was made under
+        (the sequential family-expansion failure mode) — while the
+        power-law tail, unlike a geometric spend, keeps late-declared
+        hypotheses statistically testable instead of stranding them at
+        10⁻¹⁰⁰ alpha. Stores serialized before ``family_order`` existed
+        cannot recover chronology: every known context then receives the
+        same equal share — deterministic, conservative in the multi-
+        context case, and once re-serialized equally irrevocable.
         """
         if self.family_order:
-            allocations = {}
-            for index, context in enumerate(self.family_order):
-                ctx = tuple(context)
-                allocations[ctx] = (
+            return {
+                tuple(hypothesis): (
                     self.SEQUENTIAL_ALPHA
-                    * self.ALPHA_SPEND_RATE
-                    * (1.0 - self.ALPHA_SPEND_RATE) ** index
+                    / (self._ALPHA_ZETA * (index + 1) ** self.ALPHA_SPEND_EXPONENT)
                 )
-            return allocations
-        contexts = sorted(
-            {
-                tuple(entry[: _TRIAL_KEY_LEN - 1]) for entry in self.registered
+                for index, hypothesis in enumerate(self.family_order)
             }
-            | {tuple(cell[: _TRIAL_KEY_LEN - 1]) for cell in self.cells}
+        hypotheses = sorted(
+            {
+                tuple(entry[: _TRIAL_KEY_LEN - 1]) + ("class",)
+                for entry in self.registered
+            }
+            | {
+                tuple(cell[: _TRIAL_KEY_LEN - 1]) + ("class",)
+                for cell in self.cells
+            }
+            | {
+                tuple(cell[: _TRIAL_KEY_LEN - 1])
+                + ("action:" + str(cell[_TRIAL_KEY_LEN - 1]),)
+                for cell in self.action_cells
+            }
         )
-        if not contexts:
+        if not hypotheses:
             return {}
-        share = self.SEQUENTIAL_ALPHA / len(contexts)
-        return {ctx: share for ctx in contexts}
+        share = self.SEQUENTIAL_ALPHA / len(hypotheses)
+        return {hypothesis: share for hypothesis in hypotheses}
 
-    def _contrast_alpha(self, contributing: set[tuple]) -> float:
+    def _contrast_alpha(self, contributing: set[tuple], tag: str = "class") -> float:
         """The alpha a contrast may spend over its looks.
 
         A pooled (backoff) contrast folds several declared contexts into
         one estimate; it may only spend the *least-funded* constituent's
         irrevocable share — pooling thin late-joining hypotheses must never
-        buy back error budget they were never allocated. A context missing
-        from the allocation map (unregistered, unobserved) receives the
-        smallest share the scheme already committed.
+        buy back error budget they were never allocated. ``tag`` selects
+        the hypothesis being tested: ``"class"`` for treatment-class
+        contrasts, ``"action:<key>"`` for an exact-action contrast — each
+        spends only its own funding. A context missing from the allocation
+        map (unregistered, unobserved) receives the smallest share the
+        scheme already committed.
         """
         allocations = self._alpha_allocations()
         if not contributing:
@@ -824,7 +949,10 @@ class CounterfactualTrials:
             if allocations
             else self.SEQUENTIAL_ALPHA
         )
-        return min(allocations.get(ctx, tail) for ctx in contributing)
+        return min(
+            allocations.get(tuple(ctx) + (tag,), tail)
+            for ctx in contributing
+        )
 
     @property
     def hypothesis_summary(self) -> dict:
@@ -834,16 +962,22 @@ class CounterfactualTrials:
         }
         cell_ctxs = {tuple(cell[: _TRIAL_KEY_LEN - 1]) for cell in self.cells}
         spent = sum(self._alpha_allocations().values())
+        action_ctxs = {
+            tuple(entry[: _TRIAL_KEY_LEN - 1])
+            for entry in self.action_registered
+        }
         return {
             "declared": len(registered_ctxs),
             "registered_comparisons": len(self._registered_comparisons()),
+            "action_declared": len(action_ctxs),
+            "action_registered_comparisons": len(self._action_comparisons()),
             "observed": len(cell_ctxs),
             "declared_unobserved": len(registered_ctxs - cell_ctxs),
             "unregistered_observed": len(cell_ctxs - registered_ctxs),
             "family_size": self._hypothesis_count(),
             "alpha_allocation": {
-                "scheme": "geometric",
-                "rate": self.ALPHA_SPEND_RATE,
+                "scheme": "inverse-power",
+                "exponent": self.ALPHA_SPEND_EXPONENT,
                 "budget": self.SEQUENTIAL_ALPHA,
                 "spent": spent,
                 # The remaining budget is reserved for hypotheses not yet
@@ -1088,7 +1222,7 @@ class CounterfactualTrials:
         ``hypothesis_count`` is the number of simultaneously tracked
         divergences — the *registered* family unioned with observed cells —
         reported for provenance. The alpha actually spent is
-        ``family_alpha``: this hypothesis's own irrevocable geometric share
+        ``family_alpha``: this hypothesis's own irrevocable share
         of the family budget, fixed at declaration time, which later-joined
         hypotheses can never dilute. Callers that cannot supply an
         allocation fall back to an even Bonferroni split of the family.
@@ -1123,22 +1257,25 @@ class CounterfactualTrials:
             entry["delta_ci"] = _newcombe(candidate, control)
             # Establishment uses the confidence sequence: the fixed-sample
             # interval is for reporting, not for deciding that an experiment
-            # is settled after being peeked at every batch.
-            looks = max(1, candidate["trials"] + control["trials"])
-            alpha = _sequential_alpha(looks, base=family_alpha)
-            entry["sequential_alpha"] = alpha
-            # Per-look contrast budget is alpha; each arm gets half, and each
-            # arm's two-sided bound splits that half across its two tails —
-            # per-tail probability e^{-tau} = alpha/4.
-            tau = math.log(4.0 / alpha) if alpha > 0 else math.inf
-            cand_lo, cand_hi = _arm_confidence_bounds(
+            # is settled after being peeked at every batch. The sequence is
+            # epoch-stitched (see ``_arm_cs_bounds``): the family's alpha is
+            # spent k^-3/2 over epochs 2^{k-1} <= n < 2^k rather than over
+            # integer looks, so tau grows like ln log n — late evidence
+            # stays decisive instead of being priced out of the budget.
+            cand_lo, cand_hi = _arm_cs_bounds(
                 candidate["trials"], _arm_wsum(bucket["candidate"]),
-                _arm_wsq(bucket["candidate"]), _arm_ws(bucket["candidate"]), tau,
+                _arm_wsq(bucket["candidate"]), _arm_ws(bucket["candidate"]),
+                family_alpha=family_alpha,
             )
-            ctrl_lo, ctrl_hi = _arm_confidence_bounds(
+            ctrl_lo, ctrl_hi = _arm_cs_bounds(
                 control["trials"], _arm_wsum(bucket["control"]),
-                _arm_wsq(bucket["control"]), _arm_ws(bucket["control"]), tau,
+                _arm_wsq(bucket["control"]), _arm_ws(bucket["control"]),
+                family_alpha=family_alpha,
             )
+            entry["sequential_alpha"] = _epoch_alpha(
+                max(_epoch_index(candidate["trials"]),
+                    _epoch_index(control["trials"])),
+                base=family_alpha)
             entry["delta_cs"] = [cand_lo - ctrl_hi, cand_hi - ctrl_lo]
         else:
             entry["delta_ci"] = None
@@ -1404,10 +1541,20 @@ class CounterfactualTrials:
                         abucket,
                         min_effect=min_effect,
                         weights=weights,
-                        hypothesis_count=max(1, len(acontributing)),
+                        hypothesis_count=self._hypothesis_count(),
+                        # The action hypothesis is its own registered test:
+                        # exact-action establishment cannot borrow the
+                        # context's class preregistration.
                         hypothesis_registered=bool(acontributing)
-                        and acontributing <= registered_comparisons,
-                        family_alpha=self._contrast_alpha(acontributing),
+                        and {
+                            tuple(ctx) + (proposal_action_key,)
+                            for ctx in acontributing
+                        } <= self._action_comparisons(),
+                        # …and its own irrevocable share — the context's
+                        # class allocation cannot be respent here.
+                        family_alpha=self._contrast_alpha(
+                            acontributing, f"action:{proposal_action_key}"
+                        ),
                     )
             if proposal_action_key is None:
                 generalization = "none"
@@ -1627,8 +1774,20 @@ class CounterfactualTrials:
             for entry in payload.get("registered", ())
         )
         family_order = tuple(
-            tuple(str(v).replace("|", " ") for v in context)
-            for context in payload.get("family_order", ())
+            tuple(
+                str(v).replace("|", " ")
+                for v in (
+                    tuple(entry) + ("class",)
+                    if len(entry) == _TRIAL_KEY_LEN - 1
+                    else tuple(entry)
+                )
+            )
+            for entry in payload.get("family_order", ())
+        )
+        action_registered = tuple(
+            tuple(str(v).replace("|", " ") if i < _TRIAL_KEY_LEN else v
+                  for i, v in enumerate(entry))
+            for entry in payload.get("action_registered", ())
         )
         return cls(
             cells=cells,
@@ -1639,6 +1798,7 @@ class CounterfactualTrials:
             rejected=int(payload.get("rejected", 0) or 0),
             registered=registered,
             family_order=family_order,
+            action_registered=action_registered,
             version=version,
         )
 
@@ -1776,6 +1936,7 @@ class TrialChoiceModel:
         site: str | None = None,
         min_effect: float | None = None,
         proposal_label=None,
+        proposal_ctx=None,
     ) -> dict | None:
         return self.trials.resolve(
             task_family=task_family,
@@ -1797,6 +1958,8 @@ class TrialChoiceModel:
                 effect=proposal_effect,
                 role=proposal_role,
                 label=proposal_label,
+                site=site,
+                ctx=proposal_ctx,
             ),
         )
 
@@ -1842,6 +2005,7 @@ class TrialChoiceModel:
                 proposal_role=candidate.get("role"),
                 proposal_rank=p_rank,
                 proposal_label=candidate.get("label"),
+                proposal_ctx=candidate.get("ctx"),
                 model_kind=mc_kind,
                 model_overlap=mc_overlap,
                 model_effect=mc_effect,
@@ -2034,6 +2198,7 @@ class TrialChoiceModel:
                 proposal_role=candidate.get("role"),
                 proposal_rank=p_rank,
                 proposal_label=candidate.get("label"),
+                proposal_ctx=candidate.get("ctx"),
                 model_kind=mc_kind,
                 model_overlap=mc_overlap,
                 model_effect=mc_effect,

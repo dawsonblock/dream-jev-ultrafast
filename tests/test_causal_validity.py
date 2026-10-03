@@ -400,9 +400,9 @@ def test_never_randomized_action_class_is_flagged_not_assumed():
     but ``generalization_level`` reports ``same_context_class`` /
     ``pooled_class``, never ``exact``, and the active gate refuses a
     deterministic override: class-level exchangeability is a canary
-    hypothesis, not deployment authority. Only a completed contextual
-    canary (recorded in ``confirmed_action_keys``) or genuinely exact
-    randomized evidence opens the active path.
+    hypothesis, not deployment authority. Only genuinely exact randomized
+    evidence — the action's own established contrast — opens the active
+    path; canary confirmations annotate provenance, they cannot deploy.
     """
     from jev_ultrafast.dreamlearn import action_key
 
@@ -460,8 +460,9 @@ def test_never_randomized_action_class_is_flagged_not_assumed():
         candidates, model_choice=model_choice, task_family="f",
     ) is None
     # A completed contextual canary — recorded by the operator as the action
-    # key it confirmed — is the explicit bridge from class evidence to
-    # active authority for this exact action.
+    # key it confirmed — annotates canary provenance but cannot bridge
+    # class evidence to active authority: only the action's own
+    # established exact-action contrast may deploy.
     novel_key = action_key(kind="click", effect="navigate", label="Checkout")
     confirmed = CausalChoicePolicy(
         mode="active", trial_model=family_model,
@@ -470,10 +471,11 @@ def test_never_randomized_action_class_is_flagged_not_assumed():
     confirmed_entry = confirmed.rank(
         candidates, model_choice=model_choice, task_family="f",
     )["proposals"][0]
-    assert confirmed_entry["executable"] is True
+    assert confirmed_entry["action_confirmed"] is True
+    assert confirmed_entry["executable"] is False
     assert confirmed.proposal(
         candidates, model_choice=model_choice, task_family="f",
-    ) is not None
+    ) is None
     # And genuinely exact evidence — the same semantic identity that was
     # randomized — needs no confirmation at all.
     exact_candidates = [
@@ -519,10 +521,12 @@ def test_generalization_level_tracks_site_and_semantic_identity():
     assert exact["causal"]["generalization_level"] == "exact"
     assert exact["executable"] is True
 
-    # Same class, different site evidence: at family scope the site cells
-    # still answer (family backs off to pooled when no family coordinate
-    # exists) — the action key was randomized *somewhere*, so the pooled
-    # stratum reports cross-context class evidence, never pooled-fresh.
+    # Same label, different site evidence: site is part of exact-action
+    # identity, so "Go" randomized on site h is a *different action* than
+    # "Go" on site other — the pooled stratum reports treatment-class
+    # evidence only (``pooled_class``), never pooled-fresh, and
+    # ``action_randomized_anywhere`` honestly reports this key was never
+    # randomized.
     other_site = policy.rank(
         [{"id": "m", "kind": "click", "goal_overlap": 0, "label": "M"},
          {"id": "p", "kind": "click", "goal_overlap": 1,
@@ -530,11 +534,9 @@ def test_generalization_level_tracks_site_and_semantic_identity():
         model_choice=model_choice, site="other",
     )["proposals"][0]
     assert other_site["causal"]["trial_level"] == "pooled"
-    assert other_site["causal"]["generalization_level"] == "cross_context_class"
-    # ``exact_action_randomized`` mirrors ``exact`` exactly — deployable-
-    # precision evidence only. The broader fact lives under its own name.
+    assert other_site["causal"]["generalization_level"] == "pooled_class"
     assert other_site["causal"]["exact_action_randomized"] is False
-    assert other_site["causal"]["action_randomized_anywhere"] is True
+    assert other_site["causal"]["action_randomized_anywhere"] is False
     assert other_site["execution_blocker"] == "pooled_only"
 
     # Materially changed semantics — same id shape, different label — is a
@@ -581,11 +583,13 @@ def test_unkeyed_query_reports_none_and_fails_closed():
     assert entry["executable"] is False
 
 
-def test_contextual_canary_bridge_is_evidence_derived():
+def test_contextual_canary_is_provenance_not_active_authority():
     """``action_randomized_in_context`` is the in-model canary record: an
     action that was itself randomized inside the answering context — even
-    under a different enforced signature — bridges class-level evidence to
-    active authority, with no operator-supplied confirmation needed."""
+    under a different enforced signature — is reported as confirmed
+    canary provenance. It still cannot bridge class-level evidence to
+    active authority: only the action's own established contrast at a
+    trusted generalization level deploys."""
     from jev_ultrafast.dreamlearn import action_key
 
     def _assigned(run_id, arm, *, key_label, p_overlap, success):
@@ -595,7 +599,7 @@ def test_contextual_canary_bridge_is_evidence_derived():
         meta["proposal_offered_rank"] = 1
         meta["proposal_overlap"] = p_overlap
         meta["proposal_action_key"] = action_key(
-            kind="click", effect="navigate", label=key_label)
+            kind="click", effect="navigate", label=key_label, site="h")
         return [
             {"event": "run_started", "run_id": run_id, "task_key": "t",
              "goal": "g", "task_family": "f"},
@@ -635,8 +639,9 @@ def test_contextual_canary_bridge_is_evidence_derived():
     assert entry["causal"]["generalization_level"] == "same_context_class"
     assert entry["causal"]["exact_action_randomized"] is False
     assert entry["causal"]["action_randomized_in_context"] is True
-    assert entry["execution_blocker"] is None
-    assert entry["executable"] is True
+    assert entry["action_confirmed"] is True
+    assert entry["execution_blocker"] == "unverified_generalization"
+    assert entry["executable"] is False
     # An action that was never randomized in this context still fails —
     # confirmation is derived, never assumed.
     novel = [
@@ -833,7 +838,7 @@ def test_v4_cells_migrate_to_split_coordinates():
         10, 8, 8, 2, 6.0, 8.0, 8.0, 8.0, 8.0,
     )
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/4", "cells": [v4]})
-    assert trials.version == "jev-trials/11"
+    assert trials.version == "jev-trials/12"
     cell = trials.cells[0]
     assert cell[0] == "flights" and cell[1] == ""
     assert cell[3] == "unknown" and cell[6] == "unknown"  # effect/rank wildcards
@@ -865,7 +870,7 @@ def test_v5_cells_migrate_with_zeroed_indeterminate_counter():
     v5 = (*key, *stats_v5, 1.0, 2.0, 0.5, *reasons_v5)
     assert len(v5) == 35
     trials = CounterfactualTrials.from_dict({"version": "jev-trials/5", "cells": [v5]})
-    assert trials.version == "jev-trials/11"
+    assert trials.version == "jev-trials/12"
     cell = trials.cells[0]
     assert len(cell) == TRIAL_CELL_LEN
     # The v8 outcome-vector block is appended after the reason tail; the
@@ -1599,6 +1604,10 @@ def test_active_ranking_follows_causal_not_observational_signal():
                  "effect_status": "beneficial", "support_sufficient": True,
                  "trial_level": "family", "signature_level": "full",
                  "generalization_level": "exact", "action_key": "k-strong",
+                 "action_exact": {"delta": 0.25, "effect_status": "beneficial",
+                                  "support_sufficient": True,
+                                  "candidate": {"ess": 24.0},
+                                  "control": {"ess": 24.0}},
                  "source": "randomized"},
                 {"id": "weak", "kind": "click", "expected_delta": 0.05,
                  "control_p": 0.5, "p_progress": 0.55, "uncertainty": 0.1,
@@ -1606,6 +1615,10 @@ def test_active_ranking_follows_causal_not_observational_signal():
                  "effect_status": "beneficial", "support_sufficient": True,
                  "trial_level": "family", "signature_level": "full",
                  "generalization_level": "exact", "action_key": "k-weak",
+                 "action_exact": {"delta": 0.05, "effect_status": "beneficial",
+                                  "support_sufficient": True,
+                                  "candidate": {"ess": 24.0},
+                                  "control": {"ess": 24.0}},
                  "source": "randomized"},
             ]
 
@@ -1952,7 +1965,7 @@ def test_unmeasured_arms_report_null_not_zero():
     v7k = (*ctrl, *stats, *costs, *reasons)
     trials = CounterfactualTrials.from_dict(
         {"version": "jev-trials/7", "cells": [v7, v7k]})
-    assert trials.version == "jev-trials/11"
+    assert trials.version == "jev-trials/12"
     entry = next(iter(trials.estimate().values()))
     for arm in ("candidate", "control"):
         ov = entry[arm]["outcome_vector"]
@@ -2036,7 +2049,7 @@ def test_v8_roundtrip_preserves_outcome_counters():
                      stale_or_failure=1, risk_events=1, extra_transitions=2)
     trials = CounterfactualTrials.fit(events)
     clone = CounterfactualTrials.from_dict(trials.to_dict())
-    assert clone.version == "jev-trials/11"
+    assert clone.version == "jev-trials/12"
     assert clone.cells == trials.cells
     assert clone.estimate() == trials.estimate()
     ov = next(iter(clone.estimate().values()))["candidate"]["outcome_vector"]
@@ -2078,9 +2091,12 @@ def test_registered_family_counts_declared_but_unobserved_hypotheses():
     summary = trials.hypothesis_summary
     assert summary["observed"] == 1
     assert summary["declared_unobserved"] == 1
-    assert summary["family_size"] == 2
+    # Hypotheses, not contexts: the observed context declared a class test
+    # and (via its transition catalogue) an exact-action test; the spliced
+    # unit's metas carry no recoverable action identity — class only.
+    assert summary["family_size"] == 3
     entry = next(iter(trials.estimate().values()))
-    assert entry["hypothesis_count"] == 2
+    assert entry["hypothesis_count"] == 3
     # The observed context was declared by both arms → a registered test.
     assert entry["hypothesis_registered"] is True
 
@@ -2120,7 +2136,10 @@ def test_rejected_and_post_terminal_declarations_still_pay_into_the_family():
     assert trials.invalid_units == 1
     summary = trials.hypothesis_summary
     assert summary["declared_unobserved"] == 2
-    assert summary["family_size"] == 3
+    # The observed context declared class + action hypotheses; the
+    # rejected and post-terminal units declared class only (no
+    # recoverable action identity) — four hypotheses in the family.
+    assert summary["family_size"] == 4
     # The rejected arm never claims a valid side of the comparison: the
     # declared context cannot pretend to be a registered *comparison*.
     declared_ctxs = {tuple(e[:14]) for e in trials.registered}
@@ -2223,8 +2242,10 @@ def test_declaration_flood_dilutes_never_concentrates_alpha():
         ]
     flooded = CounterfactualTrials.fit(flooded_events)
     flooded_entry = next(iter(flooded.estimate().values()))
-    assert flooded_entry["hypothesis_count"] == 401
-    assert alone_entry["hypothesis_count"] == 1
+    # 400 junk class declarations + the observed context's class and
+    # exact-action tests — 402 hypotheses in the family.
+    assert flooded_entry["hypothesis_count"] == 402
+    assert alone_entry["hypothesis_count"] == 2
     # The dilution direction is one-way: flooding can only make
     # classification *harder* to pass, never easier.
     order = {"insufficient_data": 0, "unresolved": 1,
@@ -2306,36 +2327,45 @@ def test_legacy_malformed_meta_rejects_at_the_unit_gate():
 #
 # The hypothesis family may grow online, but every declared context's share
 # of the family error budget is allocated irrevocably at first declaration
-# (geometric spending over declaration order). A hypothesis added later can
-# never retroactively widen the threshold an earlier deployment decision
-# was made under — the sequential family-expansion failure mode.
+# (normalized heavy-tail spending over *global* declaration order). A
+# hypothesis added later can never retroactively widen the threshold an
+# earlier deployment decision was made under — the sequential
+# family-expansion failure mode — while the power-law tail keeps late
+# hypotheses testable where a geometric spend would strand them.
+
+_SHARE = CounterfactualTrials.SEQUENTIAL_ALPHA / CounterfactualTrials._ALPHA_ZETA
+# α₁ = 0.05/ζ(2) ≈ 0.0304, α₂ = α₁/4 ≈ 0.0076, α₃ = α₁/9, ...
 
 
-def test_alpha_allocation_is_geometric_irrevocable_and_bounded():
-    """First declaration takes ``SEQUENTIAL_ALPHA · ρ``; flooding the family
-    later cannot dilute it (under flat Bonferroni it would shrink to
-    α/k). Total spending stays strictly below the family budget forever."""
+def test_alpha_allocation_is_inverse_power_irrevocable_and_bounded():
+    """First declaration takes ``SEQUENTIAL_ALPHA/ζ(p)``; flooding the
+    family later cannot dilute it (under flat Bonferroni it would shrink
+    to α/k). Total spending stays strictly below the family budget
+    forever, and the heavy tail keeps remote hypotheses testable."""
     base_events = _scoped_events()  # one context, family="f", site="h"
     alone = CounterfactualTrials.fit(list(base_events))
     alone_entry = next(iter(alone.estimate().values()))
     assert alone_entry["family_alpha"] == pytest.approx(
-        CounterfactualTrials.SEQUENTIAL_ALPHA
-        * CounterfactualTrials.ALPHA_SPEND_RATE
+        CounterfactualTrials.SEQUENTIAL_ALPHA / CounterfactualTrials._ALPHA_ZETA
     )
 
-    flooded_events = list(base_events)
+    flooded_events = [
+        {**event, "recorded_at_ms": 1000} for event in base_events
+    ]
     for index in range(400):
         meta = _trial_meta(
             f"junk{index}", "candidate", task_family=f"junkfam{index}",
             site=f"junksite{index}")
         flooded_events += [
             {"event": "run_started", "run_id": f"j{index}",
-             "task_key": "t", "goal": "g", "task_family": f"junkfam{index}"},
+             "task_key": "t", "goal": "g", "task_family": f"junkfam{index}",
+             "recorded_at_ms": 2000 + index},
             {"event": "experiment_assigned", "run_id": f"j{index}",
-             "task_key": "t", "experiment": meta},
+             "task_key": "t", "experiment": meta,
+             "recorded_at_ms": 2000 + index},
             {"event": "run_finished", "run_id": f"j{index}",
              "task_key": "t", "status": "aborted",
-             "reason": "operator_cancel"},
+             "reason": "operator_cancel", "recorded_at_ms": 2000 + index},
         ]
     flooded = CounterfactualTrials.fit(flooded_events)
     assert flooded.hypothesis_summary["declared"] == 401
@@ -2345,44 +2375,94 @@ def test_alpha_allocation_is_geometric_irrevocable_and_bounded():
     assert flooded_entry["family_alpha"] == pytest.approx(
         alone_entry["family_alpha"]
     )
-    # Junk contexts declared later received progressively smaller shares:
-    # the 401st declaration's share is negligible next to the first's.
+    # Junk contexts declared later received progressively smaller but
+    # *still testable* shares: the 402nd declaration gets α₁/402² — a
+    # power-law tail, not the geometric spend that would strand learning
+    # at ~10⁻¹²³ of the first share.
     allocations_map = flooded._alpha_allocations()
     first_key = next(iter(allocations_map))
     last_key = tuple(flooded.family_order[-1])
-    assert allocations_map[last_key] < allocations_map[first_key] * 1e-100
+    assert allocations_map[last_key] == pytest.approx(
+        allocations_map[first_key] / 402.0**2
+    )
+    assert allocations_map[last_key] > 1e-7
     allocations = flooded.hypothesis_summary["alpha_allocation"]
-    assert allocations["scheme"] == "geometric"
-    # The geometric tail underflows in float arithmetic — the sum saturates
-    # at the budget without ever exceeding it. The bound is the guarantee.
+    assert allocations["scheme"] == "inverse-power"
+    # The schedule's infinite sum is exactly the budget — the partial
+    # spend can approach but never exceed it.
     assert allocations["spent"] <= allocations["budget"]
     assert allocations["remaining"] >= 0
-    assert allocations["declaration_order"] == 401
+    assert allocations["declaration_order"] == 402
+
+
+def test_declaration_order_is_global_not_ingestion_order():
+    """Two identical event streams supplied in opposite run orders must
+    produce identical allocations: declaration position is the earliest
+    ``recorded_at_ms`` on the declaring record, digest-tiebroken — never
+    which run's group was iterated first."""
+    def _timed_events(ts_first, ts_second):
+        first = _scoped_events()
+        for event in first:
+            event["recorded_at_ms"] = ts_first
+        second = (
+            _trials("candidate", 24, 24, "d", task_family="g", site="o")
+            + _trials("control", 24, 0, "e", task_family="g", site="o")
+        )
+        for event in second:
+            event["recorded_at_ms"] = ts_second
+        return first, second
+
+    first, second = _timed_events(1000, 2000)
+    forward = CounterfactualTrials.fit(first + second)
+    backward = CounterfactualTrials.fit(second + first)
+    assert forward.family_order == backward.family_order
+    by_family = {
+        key.split("|")[0]: entry["family_alpha"]
+        for key, entry in forward.estimate().items()
+    }
+    # f: class α₁ + action α₂; g: class α₃ + action α₄.
+    assert by_family["f"] == pytest.approx(_SHARE)
+    assert by_family["g"] == pytest.approx(_SHARE / 9.0)
+    # Chronology wins over ingestion: "g" declared *earlier* receives the
+    # first share even when its events arrive second.
+    first, second = _timed_events(2000, 1000)
+    forward = CounterfactualTrials.fit(first + second)
+    backward = CounterfactualTrials.fit(second + first)
+    assert forward.family_order == backward.family_order
+    by_family = {
+        key.split("|")[0]: entry["family_alpha"]
+        for key, entry in forward.estimate().items()
+    }
+    assert by_family["g"] == pytest.approx(_SHARE)
+    assert by_family["f"] == pytest.approx(_SHARE / 9.0)
 
 
 def test_declaration_order_fixes_each_hypothesiss_share():
-    """Two contexts observed in stream order: the second receives exactly
-    half the first's share — allocation order is declaration order, not
-    estimation order."""
-    first = _scoped_events()
-    second = (
-        _trials("candidate", 24, 24, "d", task_family="g", site="o")
-        + _trials("control", 24, 0, "e", task_family="g", site="o")
-    )
+    """Two contexts observed in stream order: the second context's *class*
+    test takes ordinal 3 (its own action test took 2) — α₁/9. Allocation
+    order is global declaration order, not estimation order."""
+    first = [{**event, "recorded_at_ms": 1000} for event in _scoped_events()]
+    second = [
+        {**event, "recorded_at_ms": 2000}
+        for event in (
+            _trials("candidate", 24, 24, "d", task_family="g", site="o")
+            + _trials("control", 24, 0, "e", task_family="g", site="o")
+        )
+    ]
     trials = CounterfactualTrials.fit(first + second)
     entries = trials.estimate()
     by_family = {
         key.split("|")[0]: entry for key, entry in entries.items()
     }
-    assert by_family["f"]["family_alpha"] == pytest.approx(0.025)
-    assert by_family["g"]["family_alpha"] == pytest.approx(0.0125)
+    assert by_family["f"]["family_alpha"] == pytest.approx(_SHARE)
+    assert by_family["g"]["family_alpha"] == pytest.approx(_SHARE / 9.0)
     # Round-trip preserves both the cells and the declaration order.
     restored = CounterfactualTrials.from_dict(trials.to_dict())
     assert restored.family_order == trials.family_order
     by_family_r = {
         key.split("|")[0]: entry for key, entry in restored.estimate().items()
     }
-    assert by_family_r["g"]["family_alpha"] == pytest.approx(0.0125)
+    assert by_family_r["g"]["family_alpha"] == pytest.approx(_SHARE / 9.0)
 
 
 def test_legacy_store_without_declaration_order_splits_evenly():
@@ -2404,26 +2484,32 @@ def test_legacy_store_without_declaration_order_splits_evenly():
         key.split("|")[0]: entry["family_alpha"]
         for key, entry in legacy.estimate().items()
     }
-    assert shares["f"] == pytest.approx(0.025)
-    assert shares["g"] == pytest.approx(0.025)
+    # Four hypotheses (two class + two action) split the budget evenly.
+    assert shares["f"] == pytest.approx(0.0125)
+    assert shares["g"] == pytest.approx(0.0125)
 
 
 def test_pooled_backoff_spends_only_the_least_funded_share():
     """A contrast pooled over several declared contexts may spend no more
     than the *smallest* constituent allocation — pooling thin late
     hypotheses must never buy back error budget they were never given."""
-    early = _scoped_events()  # context declared first → share 0.025
-    late = (
-        _trials("candidate", 24, 24, "d", task_family="g")
-        + _trials("control", 24, 0, "e", task_family="g")
-    )
+    early = [{**event, "recorded_at_ms": 1000}
+             for event in _scoped_events()]  # declared first → share α₁
+    late = [
+        {**event, "recorded_at_ms": 2000}
+        for event in (
+            _trials("candidate", 24, 24, "d", task_family="g")
+            + _trials("control", 24, 0, "e", task_family="g")
+        )
+    ]
     trials = CounterfactualTrials.fit(early + late)
     pooled = trials.resolve(
         model_kind="click", model_overlap=0, proposal_kind="click",
         proposal_overlap=1,
     )
     assert pooled["level"] == "pooled"
-    assert pooled["family_alpha"] == pytest.approx(0.0125)
+    # late's class test is ordinal 3 (its action test took 2) → α₁/9.
+    assert pooled["family_alpha"] == pytest.approx(_SHARE / 9.0)
 
 
 # -------------------------------------- exact-action evidence semantics
@@ -2452,14 +2538,14 @@ def _keyed_trials(arm, count, successes, prefix, key, **kw):
 _SHIP_CANDIDATE = {"id": "s", "kind": "click", "goal_overlap": 1, "label": "Ship"}
 
 
-def _ship_key():
+def _ship_key(site="h"):
     from jev_ultrafast._learning.signatures import action_key
-    return action_key(kind="click", label="Ship")
+    return action_key(kind="click", label="Ship", site=site)
 
 
-def _go_key():
+def _go_key(site="h"):
     from jev_ultrafast._learning.signatures import action_key
-    return action_key(kind="click", label="Go")
+    return action_key(kind="click", label="Go", site=site)
 
 
 def test_action_exact_contrast_is_the_actions_own_measurement():
@@ -2493,8 +2579,9 @@ def test_thin_negative_action_data_vetoes_a_beneficial_class():
     """The audit's second-order failure: "Go" was randomized here (presence
     → ``exact``) but its own six trials all failed while the pooled class
     stayed beneficial on "Ship" data. Under presence-only semantics this
-    executed; now the action's own measured negative delta refutes the
-    generalization."""
+    executed; now the action's own measured negative data keeps the canary
+    running — it has not earned a harmful veto, but the class estimate may
+    not override it either."""
     ship = _keyed_trials("candidate", 48, 48, "sc", _ship_key(),
                          task_family="f", site="h")
     ship += _keyed_trials("control", 48, 0, "sk", _ship_key(),
@@ -2512,7 +2599,7 @@ def test_thin_negative_action_data_vetoes_a_beneficial_class():
     assert entry["causal"]["effect_status"] == "beneficial"
     assert entry["causal"]["action_exact"]["delta"] < 0
     assert entry["executable"] is False
-    assert entry["execution_blocker"] == "unverified_generalization"
+    assert entry["execution_blocker"] == "unresolved"
     assert policy.proposal(
         _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
     ) is None
@@ -2542,11 +2629,12 @@ def test_sufficient_undecided_action_data_is_not_overridden_by_the_class():
     assert entry["execution_blocker"] == "unresolved"
 
 
-def test_thin_positive_action_data_deploys_on_shrinkage():
-    """Thin per-action data with a non-negative point estimate deploys on
-    the documented hierarchical shrinkage estimator — the class effect
-    enters as a prior worth one MIN_ESS cell, and the deployed estimate
-    says so."""
+def test_thin_positive_action_data_keeps_the_canary_running():
+    """Thin per-action data with a positive point estimate still cannot
+    deploy: shrinking toward the class estimate would lend significance
+    the action's own evidence has not earned (the class cell usually
+    contains those same observations). The canary continues until the
+    action's own contrast establishes."""
     ship = _keyed_trials("candidate", 24, 24, "sc", _ship_key(),
                          task_family="f", site="h")
     ship += _keyed_trials("control", 24, 0, "sk", _ship_key(),
@@ -2561,17 +2649,30 @@ def test_thin_positive_action_data_deploys_on_shrinkage():
         _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
     )["proposals"][0]
     assert entry["causal"]["action_exact"]["support_sufficient"] is False
-    assert entry["executable"] is True
-    assert entry["deployment"]["estimator"] == "hierarchical_shrinkage"
-    shrunk = entry["deployment"]["delta"]
-    assert 0.0 < shrunk < entry["causal"]["expected_delta"]
+    assert entry["executable"] is False
+    assert entry["execution_blocker"] == "unresolved"
+    assert entry["deployment"] is None
+    # But once the action's own contrast establishes beneficial, ACTIVE
+    # deploys on the exact estimator — no class substitution.
+    go_full = _keyed_trials("candidate", 48, 44, "gc2", _go_key(),
+                            task_family="f", site="h")
+    go_full += _keyed_trials("control", 48, 8, "gk2", _go_key(),
+                             task_family="f", site="h")
+    model2 = TrialChoiceModel(
+        trials=CounterfactualTrials.fit(ship + go_full))
+    entry2 = CausalChoicePolicy(mode="active", trial_model=model2).rank(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    )["proposals"][0]
+    assert entry2["causal"]["action_exact"]["effect_status"] == "beneficial"
+    assert entry2["executable"] is True
+    assert entry2["deployment"]["estimator"] == "exact_action"
 
 
-def test_store_without_action_counters_deploys_on_class_evidence():
+def test_store_without_action_counters_cannot_establish_active():
     """A payload predating per-action counters keeps presence (the
     ``action_index`` proves the in-context canary ran) but cannot supply an
-    action contrast — the deployment estimate names the weaker basis it
-    actually used."""
+    action contrast — legacy evidence annotates and nominates, it never
+    deploys: ACTIVE requires the action's own established contrast."""
     trials = CounterfactualTrials.fit(_scoped_events())
     payload = trials.to_dict()
     del payload["action_cells"]
@@ -2583,8 +2684,9 @@ def test_store_without_action_counters_deploys_on_class_evidence():
     )["proposals"][0]
     assert entry["causal"]["generalization_level"] == "exact"
     assert entry["causal"]["action_exact"] is None
-    assert entry["executable"] is True
-    assert entry["deployment"]["estimator"] == "class_evidence"
+    assert entry["executable"] is False
+    assert entry["execution_blocker"] == "insufficient_action_evidence"
+    assert entry["deployment"] is None
 
 
 def test_action_cells_roundtrip_through_serialization():
@@ -2606,10 +2708,13 @@ def test_action_cells_roundtrip_through_serialization():
 
 # ------------------------------------------- signed action confirmations
 #
-# A same-context class action may bridge to active authority through a
-# completed contextual canary. External attestations are cryptographically
-# bound to action identity, context scope, and the evidence they cite;
-# unsigned, forged, or mis-scoped records fail closed.
+# A completed contextual canary of an action may be attested externally.
+# External attestations are cryptographically bound to action identity,
+# context scope, and the evidence they cite; unsigned, forged, or
+# mis-scoped records fail closed. Confirmations are canary *provenance* —
+# they annotate ``action_confirmed`` for scheduling/audit but carry no
+# deployment authority: ACTIVE requires the action's own established
+# exact-action contrast.
 
 
 def _cross_context_go_events():
@@ -2641,10 +2746,12 @@ def test_same_context_class_needs_a_canary_record():
     assert entry["execution_blocker"] == "unverified_generalization"
 
 
-def test_signed_confirmation_bridges_same_context_class():
+def test_signed_confirmation_is_provenance_not_active_authority():
     """A confirmation signed by a configured key, scoped to this
-    family/site, attests the out-of-model canary and lets the class
-    estimate deploy under the ``class_evidence`` label."""
+    family/site, attests the out-of-model canary — it surfaces on the
+    ``action_confirmed`` annotation for scheduling/audit but cannot bridge
+    class evidence to deployment: ACTIVE still requires the action's own
+    established contrast."""
     from jev_ultrafast._learning.policy import (
         mint_action_confirmation,
     )
@@ -2662,8 +2769,9 @@ def test_signed_confirmation_bridges_same_context_class():
     entry = policy.rank(
         _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
     )["proposals"][0]
-    assert entry["executable"] is True
-    assert entry["deployment"]["estimator"] == "class_evidence"
+    assert entry["action_confirmed"] is True
+    assert entry["executable"] is False
+    assert entry["deployment"] is None
 
 
 def test_signed_confirmation_scope_does_not_travel():
@@ -2684,6 +2792,7 @@ def test_signed_confirmation_scope_does_not_travel():
     entry = policy.rank(
         _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
     )["proposals"][0]
+    assert entry["action_confirmed"] is False
     assert entry["executable"] is False
     assert entry["execution_blocker"] == "unverified_generalization"
 

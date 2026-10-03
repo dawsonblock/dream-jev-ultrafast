@@ -1163,6 +1163,12 @@ class Agent:
                                     if proposal_action is not None
                                     else None
                                 ),
+                                site=_page_site(page),
+                                ctx=(
+                                    proposal_action.get("ctx")
+                                    if proposal_action is not None
+                                    else None
+                                ),
                             ),
                             "proposal_effect": (
                                 classify_effect(proposal_action).value

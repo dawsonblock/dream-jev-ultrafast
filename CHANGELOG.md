@@ -6,6 +6,78 @@ this file documents what changed and why, in the project's own words.
 
 ## Unreleased
 
+### statistical authority, release qualification, and grammar-aware search
+
+A second independent audit pass (twelve findings) moved the remaining risk
+into the statistical-authority and release-qualification layers:
+
+- **The `pow` verifier bypass is closed.** `policylang` validation now
+  requires the exponent to pass the ordinary AST validator as an exact
+  single-key `const` node inside the shared node budget — extra members
+  smuggled inside the exponent object are rejected instead of ignored —
+  and `clamp` bounds are held to the same `_MAX_CONST` envelope as every
+  other constant.
+- **Alpha spending follows true declaration order.** Hypothesis funding
+  sorts by `recorded_at_ms`, metadata digest, and tag rank — not by which
+  run a dict happened to iterate first — so the same evidence in a
+  different ingestion order gets the same irrevocable allocation.
+- **Each hypothesis gets its own α share.** A declaration registers the
+  treatment-class hypothesis and a separately funded exact-action
+  hypothesis (`action:<key>`), so the adaptive backoffs and the per-action
+  contrast inside one context can no longer spend the same context-level
+  α as if they were a single test. Allocation moved from a geometric
+  schedule to the summable `i⁻²/ζ(2)` normalization — later hypotheses
+  still pay a shrinking share, but learning never becomes practically
+  impossible.
+- **Confidence sequences are epoch-stitched anytime-valid bounds.** The
+  per-look `n^-1.5` spend that made the estimator statistically deaf is
+  replaced by powers-of-two epoch stitching with logarithmic-logarithmic
+  τ growth and mean-normalized IPW weights — measurable power (e.g. ≈92%
+  at `+0.30, n=300`) with the same family-wise guarantee, verified under
+  the Q4 gate rather than assumed.
+- **Q4 is a real statistical qualification gate**
+  (`scripts/simulate_causal.py`). Deterministic SHA-256-derived seeds and
+  explicit acceptance bounds in six groups — null false-establishment,
+  power at documented operating points, harm and extreme propensity,
+  censoring imbalance and symmetric censoring, delta calibration, and
+  family-wise multiplicity — each printed with its bound and each
+  failing the run when violated; `scripts/qualify.py` invokes it.
+- **`action_key` carries semantic identity, not just a redacted label.**
+  Kind, effect, role, the *pre-redaction* normalized label, the site,
+  and an authority-context digest (form destination, field semantics,
+  structural context) now bind the key, so two same-labeled controls on
+  one site — or the same label across redaction-colliding inputs — no
+  longer share an "exact" evidence pool.
+- **ACTIVE deploys only on the action's own established contrast.**
+  Legacy stores without `action_cells` cannot establish ACTIVE at all
+  (`insufficient_action_evidence`) — their evidence remains valid for
+  shadow annotation and canary nomination — and thin per-action data
+  keeps the canary running rather than deploying a hierarchical
+  shrinkage estimate whose uncertainty was never controlled.
+- **Qualified means qualified, not just signed.** `verify_installation()`
+  and `scripts/verify_release.py` now verify
+  `RELEASE_QUALIFICATION.json` — a `jev-qualify/*` report signed under a
+  pinned qualification key, declaring `release_qualified: true`, bound
+  to the current manifest digest — closing the gap where a fabricated
+  markdown report could stand in for evidence. The trusted codebase
+  advances to `jev-ultrafast-tcb/0.18` (older evidence stays readable).
+- **Anti-rollback pins.** `JEV_EXPECT_TCB_VERSION` and
+  `JEV_EXPECT_MANIFEST_DIGEST` (runtime) and
+  `--expect-tcb-version`/`--expect-manifest-digest` (external verifier)
+  fail closed on a validly-signed older release — authenticity is not
+  recency.
+- **Full-set enumeration.** The external verifier now rejects *any*
+  unmanifested file anywhere in the tree (excluding only the manifest,
+  its signature, the generated reports, and runtime caches) — matching
+  the packaged-tree rule `update_manifest.py --check` already enforced.
+- **Structural search explores the grammar, not four templates.**
+  `mutate_policies` now rewrites single AST positions — operator swaps
+  inside signature families, relation/operand moves, same-typed feature
+  and constant exchanges, unary wraps/strips, subtree pruning, and
+  growth wraps — round-robin across every expression position, capped
+  deterministically, with the constructor's validation boundary dropping
+  anything the verifier would reject.
+
 ### release provenance, upload binding, and structural policy programs
 
 An independent audit (P0–P2) closed the remaining security/scientific gaps
@@ -23,29 +95,36 @@ and made the mutable artifact genuinely more expressive:
   `action_exact` contrast — the exact action's own support, effect, and
   confidence sequence — alongside the class-level estimate. Active-mode
   deployment requires the action's own evidence to be sufficient and
-  beneficial, a documented `hierarchical_shrinkage` rule for thin
-  per-action data, or a verified external confirmation; a class effect
-  can no longer carry an exact action whose own randomized data is thin
-  or harmful (`deployment` block reports the estimator and blockers).
-- **Multiplicity is allocated online and irrevocably.** Hypothesis
-  contexts register at declaration time in `family_order`, and each
-  declaration spends a fixed geometric share of the family α
-  (`SEQUENTIAL_ALPHA` × rate × (1 − rate)^index — a budget of 0.05 that
-  later hypotheses can never retroactively loosen for earlier ones).
-  Contrasts report `family_alpha`; stores without declaration order use
-  a deterministic equal split across known contexts.
+  beneficial — nothing else deploys: thin per-action data keeps the
+  canary running, confirmations are provenance annotations, and a class
+  effect can never carry an exact action whose own randomized data is
+  thin or harmful (`deployment` block reports the estimator and
+  blockers).
+- **Multiplicity is allocated online, irrevocably, and per hypothesis**
+  (`jev-trials/12`). Every declared hypothesis — a treatment-class
+  contrast *and* each derived exact-action contrast — registers at
+  declaration time in a single global order (by declaration timestamp,
+  metadata digest, and tag rank, never by run-encounter order), and each
+  spends a normalized inverse-power share of the family α
+  (`SEQUENTIAL_ALPHA` × i⁻² / ζ(2) — a summable budget of 0.05 that later
+  hypotheses can never retroactively loosen for earlier ones, and that
+  does not make late-context learning practically impossible the way a
+  geometric schedule does). Contrasts report `family_alpha`; stores
+  without declaration order use a deterministic equal split across known
+  contexts.
 - **The one-trial invariant holds on legacy evidence too.** The
   transition-tag migration path deduplicates identical rewrites,
   quarantines runs carrying two *distinct* experiment decisions, and
   rejects assignments ordered after the terminal event — the same rules
   the modern `experiment_assigned` path enforces.
-- **External/manual action confirmations are signed evidence.** Raw
+- **External/manual action confirmations are signed provenance.** Raw
   `confirmed_action_keys` no longer admit an action: confirmations are
   domain-separated Ed25519 attestations
   (`jev-dream/action-confirmation/v1`, `mint_action_confirmation`)
   verified against `JEV_CONFIRMATION_VERIFY_KEYS`, optionally scoped to
   task family/site — unsigned confirmations fail closed when keys are
-  configured.
+  configured. They surface on the `action_confirmed` entry annotation
+  for canary scheduling and audit; they carry no deployment authority.
 - **`ExplorationPolicy` is a real declarative program, not just a knob
   vector.** Two new validated fields — `rules` (guarded score adjustments)
   and `stop_when` (a stopping expression) — interpret a small checked AST
@@ -55,25 +134,43 @@ and made the mutable artifact genuinely more expressive:
   canonical, and the baseline digest is unchanged (empty programs
   serialize as before). `mutate_policies()` grows genuine structural
   mutations alongside the scalar ones — rule insertion/removal,
-  expression-constant perturbation, and stop-condition rewrites — 79
-  baseline candidates where there were 73.
+  expression-constant perturbation, and stop-condition rewrites — plus a
+  grammar-aware search layer that rewrites single AST positions
+  (operator swaps inside a signature family, relation and operand moves,
+  feature and constant exchanges within a type, unary wraps and strips,
+  subtree pruning, and growth wraps), interleaved across every
+  expression so the search explores the bounded language rather than a
+  handful of seed templates — 89 baseline candidates where there were 73.
 - **Release verification is externally bootstrapped**
   (`scripts/verify_release.py`). A self-contained verifier — stdlib +
   `cryptography`, zero `jev_ultrafast` imports — that can be copied out
-  of the tree: pinned-key `MANIFEST.sig` verification, full-set hashing,
-  the TCB floor embedded as an external expectation rather than imported,
-  a `--expect-tcb-version` pin, and a check that a shipped
+  of the tree: pinned-key `MANIFEST.sig` verification, full-set hashing
+  *and* full-set enumeration (any file the manifest does not cover fails
+  closed, not just files under trusted prefixes), the TCB floor embedded
+  as an external expectation rather than imported, anti-rollback pins
+  (`--expect-tcb-version`, `--expect-manifest-digest` /
+  `JEV_EXPECT_MANIFEST_DIGEST`), a check that a shipped
   `VALIDATION.generated.md` declares the manifest digest it actually
-  validates (`--require-validation` makes absence a failure). The
-  internal `scripts/check_tcb.py` remains the CI consistency check and
-  now says so.
-- **`JEV_SECURITY_PROFILE=qualified` — strict plus provenance.** Every
-  strict refusal applies (it is a hardened profile), and the agent
-  additionally re-verifies the installed tree against its signed
-  manifest under `JEV_MANIFEST_VERIFY_KEYS` at construction —
-  `tcb.verify_installation()` hashes the release set and checks the TCB
-  boundary before any run starts; unsigned, unpinned, or drifted trees
-  fail closed (TCB `jev-ultrafast-tcb/0.17`).
+  validates (`--require-validation` makes absence a failure), and signed
+  qualification evidence — `RELEASE_QUALIFICATION.json` must verify
+  under a pinned qualification key and bind this manifest's digest, with
+  `--require-qualification` demanding `release_qualified: true`
+  (`--qualify-key` / `JEV_QUALIFY_VERIFY_KEYS`). The internal
+  `scripts/check_tcb.py` remains the CI consistency check and now says
+  so.
+- **`JEV_SECURITY_PROFILE=qualified` — strict plus provenance *and*
+  qualification.** Every strict refusal applies (it is a hardened
+  profile), and the agent additionally re-verifies the installed tree at
+  construction — `tcb.verify_installation()` hashes the release set,
+  checks the TCB boundary, and requires `RELEASE_QUALIFICATION.json`: a
+  `jev-qualify/*` report signed under `JEV_QUALIFY_VERIFY_KEYS`,
+  declaring `release_qualified: true`, bound to the current manifest
+  digest. A signed release proves integrity; only the signed
+  qualification report proves the gates ran. `JEV_EXPECT_TCB_VERSION`
+  and `JEV_EXPECT_MANIFEST_DIGEST` pin the approved release so a
+  validly-signed older tree cannot roll back — unsigned, unpinned,
+  unqualified, or drifted trees fail closed (TCB
+  `jev-ultrafast-tcb/0.17`).
 
 ### exact-action generalization and experimental-unit enforcement
 

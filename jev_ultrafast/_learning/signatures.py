@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from ..privacy import redact_text
 from .common import _stable_hash
 
 __all__ = [
@@ -231,29 +230,68 @@ def _trial_context(meta: dict, transition: dict | None) -> tuple[str, ...]:
 _SIGNATURE_INDEX = {field: 2 + index for index, field in enumerate(_SIGNATURE_FIELDS)}
 
 
-def action_key(kind=None, effect=None, role=None, label=None) -> str | None:
+_CTX_KEY_FIELDS = ("field", "method", "same_origin")
+
+
+def _ctx_semantics(ctx) -> str:
+    """Authority-semantics fingerprint of a target's observed context.
+
+    The same redacted-label text can sit on controls that do very different
+    things — a "Continue" button that submits a same-origin search form and
+    a "Continue" that posts cross-origin are different actions. ``ctx`` is
+    the derived-flag context the browser records (form destination class,
+    field semantics, structural scope): folded into the key, it separates
+    semantic twins without persisting any free text.
+    """
+    if not isinstance(ctx, dict):
+        return "unknown"
+    flags = (
+        "form" if ctx.get("form") else "-",
+        "submit" if ctx.get("submit") else "-",
+        "ext" if ctx.get("external") else "-",
+        "msg" if ctx.get("messaging") else "-",
+        "dl" if ctx.get("download") else "-",
+        "modal" if ctx.get("modal") else "-",
+        "row" if ctx.get("row") else "-",
+    )
+    values = tuple(
+        str(ctx.get(field) if ctx.get(field) is not None else "?")
+        .replace("|", " ")
+        for field in _CTX_KEY_FIELDS
+    )
+    return "/".join(flags) + "#" + "/".join(values)
+
+
+def action_key(kind=None, effect=None, role=None, label=None, *,
+               site=None, ctx=None) -> str | None:
     """Stable semantic identity of one concrete action, across runs.
 
     Treatment-signature coordinates answer "was an action of this *class*
     randomized?"; ``action_key`` answers the stricter Phase-3 question "was
     *this exact action* randomized?" — the distinction between an established
     class effect and treatment-class exchangeability assumed for a
-    never-randomized control. The key binds operation kind, effect class,
-    element role, and the same redacted label the evidence store records, so
-    a same-class action with different semantics (a changed label, a
-    re-labelled control) is a different key, and an action with no readable
-    identity at all returns ``None`` — never a fabricated identity.
+    never-randomized control. The key binds site, operation kind, effect
+    class, element role, the action's authority-semantics context, and the
+    action's label digested *before* privacy redaction: two controls whose
+    labels redact to the same placeholder (``alice@…`` / ``bob@…`` →
+    ``[email]``) or that share redacted text under different semantics are
+    still different keys. The raw label is normalized and hashed locally —
+    only the digest ever leaves the process, never the text — and an action
+    with no readable identity at all returns ``None``, never a fabricated
+    identity.
     """
     if label is None or not str(label).strip():
         return None
-    text = " ".join(str(redact_text(str(label), 256)).split()).lower()
+    text = " ".join(str(label).split()).lower()
     if not text:
         return None
     components = (
+        _coord(str(site or "unknown").lower()),
         str(kind or "unknown").replace("|", " ") or "unknown",
         _effect_bucket(effect),
         _role_bucket(role),
         text,
+        _ctx_semantics(ctx),
     )
     return _stable_hash("|".join(components))
 
