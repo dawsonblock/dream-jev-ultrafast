@@ -1479,6 +1479,10 @@ def _causal_evidence():
                 "model_choice_overlap": 0,
                 "model_choice_offered_rank": 0,
                 "task_key": "t",
+                # Family coordinate only: a runner without task_family still
+                # resolves this at the pooled stratum; a runner declaring the
+                # matching family gets family-stratum authority.
+                "task_family": "search",
             }
             run_id = f"r{i}{arm}"
             events += [
@@ -1566,6 +1570,10 @@ def test_causal_policy_active_override_is_recorded_and_canary_excluded(runner, t
     p = runner.state["page"]
     p["actions"] = [a for a in p["actions"] if a["id"] != "e2"]
     p["fingerprint"] = fingerprint(p)
+    # Active execution requires context-specific randomized evidence:
+    # without this family declaration the pooled stratum alone could never
+    # drive an override.
+    runner.task_family = "search"
     runner.experiment = {"causal_policy": CausalChoicePolicy(mode="active", trial_model=model)}
     runner.state["decision"] = decision("e1")
     runner.state["status"] = "predicted"

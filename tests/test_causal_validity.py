@@ -404,9 +404,26 @@ def test_never_randomized_action_class_is_flagged_not_assumed():
     assert shadow.proposal(
         candidates, model_choice={"id": "m", "kind": "click", "goal_overlap": 0}
     ) is None  # shadow observes, never acts
+    # Established but *pooled* evidence annotates and nominates canaries — it
+    # cannot drive a deterministic override in a context it never measured.
     active = CausalChoicePolicy(mode="active", trial_model=model)
     assert active.proposal(
         candidates, model_choice={"id": "m", "kind": "click", "goal_overlap": 0}
+    ) is None
+    # The same estimate at a context-specific stratum may execute.
+    family_events = []
+    for i in range(24):
+        family_events += _trial_run(
+            f"fc{i}", "candidate", success=True, proposal_effect="navigate",
+            task_family="f")
+        family_events += _trial_run(
+            f"fk{i}", "control", success=False, proposal_effect="navigate",
+            task_family="f")
+    family_model = TrialChoiceModel.fit(family_events)
+    scoped = CausalChoicePolicy(mode="active", trial_model=family_model)
+    assert scoped.proposal(
+        candidates, model_choice={"id": "m", "kind": "click", "goal_overlap": 0},
+        task_family="f",
     ) is not None
     # An *unresolved* class-level estimate blocks deterministic execution.
     thin = TrialChoiceModel.fit(_trial_run("a", "candidate") + _trial_run("b", "control"))
@@ -1218,3 +1235,158 @@ def test_observational_and_causal_probabilities_keep_separate_provenance():
     assert proposal["p_progress"] == pytest.approx(0.30)
     assert proposal["source"] == "pooled_randomized"
     assert proposal["expected_delta"] == pytest.approx(0.20)
+
+
+# ----------------------------------------- active-mode evidence strata
+#
+# Active execution requires context-specific randomized evidence. Pooled
+# randomized evidence is a hypothesis/nomination channel — it can annotate
+# (shadow) and can nominate a randomized canary, but it can never drive a
+# deterministic substitution in a context it did not measure.
+
+
+def _scoped_events(cand_success=True, ctrl_success=False, n=24, *, family="f",
+                   site="h"):
+    return (
+        _trials("candidate", n, n if cand_success else 0, "c",
+                task_family=family, site=site)
+        + _trials("control", n, n if ctrl_success else 0, "k",
+                  task_family=family, site=site)
+    )
+
+
+def _active_entry(policy, **query):
+    return policy.rank(_CANDIDATES, model_choice=_MODEL_CHOICE, **query)["proposals"][0]
+
+
+def test_active_executes_on_family_site_evidence():
+    """beneficial at the strictest stratum → executable."""
+    model = TrialChoiceModel.fit(_scoped_events())
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    entry = _active_entry(policy, task_family="f", site="h")
+    assert entry["causal"]["trial_level"] == "family+site"
+    assert entry["executable"] is True
+    assert entry["execution_blocker"] is None
+    assert policy.proposal(
+        _CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f", site="h"
+    ) is not None
+
+
+def test_active_executes_on_family_and_site_strata():
+    """beneficial at ``family`` and at ``site`` → executable under the
+    default active-evidence policy."""
+    family_events = _trials("candidate", 24, 24, "c", task_family="f") + _trials(
+        "control", 24, 0, "k", task_family="f"
+    )
+    model = TrialChoiceModel.fit(family_events)
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    entry = _active_entry(policy, task_family="f")
+    assert entry["causal"]["trial_level"] == "family"
+    assert entry["executable"] is True
+
+    site_events = _trials("candidate", 24, 24, "c", site="h") + _trials(
+        "control", 24, 0, "k", site="h"
+    )
+    site_model = TrialChoiceModel.fit(site_events)
+    site_policy = CausalChoicePolicy(mode="active", trial_model=site_model)
+    site_entry = _active_entry(site_policy, site="h")
+    assert site_entry["causal"]["trial_level"] == "site"
+    assert site_entry["executable"] is True
+
+
+def test_active_never_executes_on_pooled_evidence():
+    """beneficial at ``pooled`` → not executable; the blocker names why.
+    Pooled evidence generalizes over all tasks — it may hypothesize, never
+    authorize a deterministic override in an unmeasured context."""
+    events = _trials("candidate", 24, 24, "c") + _trials("control", 24, 0, "k")
+    model = TrialChoiceModel.fit(events)
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    entry = _active_entry(policy)
+    assert entry["causal"]["trial_level"] == "pooled"
+    assert entry["causal"]["effect_status"] == "beneficial"
+    assert entry["executable"] is False
+    assert entry["execution_blocker"] == "pooled_only"
+    # proposal() honors the gate.
+    assert policy.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE) is None
+
+
+def test_shadow_and_canary_still_see_pooled_evidence():
+    """Pooled evidence keeps its advisory roles: it ranks in shadow and may
+    nominate a randomized canary — execution authority is the only thing
+    withheld."""
+    events = _trials("candidate", 24, 24, "c") + _trials("control", 24, 0, "k")
+    model = TrialChoiceModel.fit(events)
+
+    shadow = CausalChoicePolicy(mode="shadow", trial_model=model)
+    ranking = shadow.rank(_CANDIDATES, model_choice=_MODEL_CHOICE)
+    assert ranking["proposals"][0]["causal"]["trial_level"] == "pooled"
+    assert ranking["proposals"][0]["source"] == "pooled_randomized"
+    assert ranking["proposals"][0]["executable"] is False
+    assert shadow.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE) is None
+
+    canary = CausalChoicePolicy(mode="canary", trial_model=model)
+    proposal = canary.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE)
+    assert proposal is not None and proposal["id"] == "p"
+    assert proposal["executable"] is False
+    assert proposal["execution_blocker"] == "pooled_only"
+
+
+def test_active_unresolved_stratum_specific_evidence_blocks():
+    """A supported but unresolved estimate at family+site cannot execute —
+    'we measured this context and it is not established' is not authority."""
+    events = (
+        _trials("candidate", 20, 12, "c", task_family="f", site="h")
+        + _trials("control", 20, 10, "k", task_family="f", site="h")
+    )
+    model = TrialChoiceModel.fit(events)
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    entry = _active_entry(policy, task_family="f", site="h")
+    assert entry["causal"]["trial_level"] == "family+site"
+    assert entry["causal"]["effect_status"] == "unresolved"
+    assert entry["executable"] is False
+    assert entry["execution_blocker"] == "unresolved"
+
+
+def test_active_omits_harmful_and_blocks_insufficient():
+    """Established-harmful divergences are flagged and refused — never
+    executable in active, never nominated as a canary; thin evidence cannot
+    execute either."""
+    harmful = _trials("candidate", 24, 0, "c", task_family="f") + _trials(
+        "control", 24, 24, "k", task_family="f"
+    )
+    model = TrialChoiceModel.fit(harmful)
+    policy = CausalChoicePolicy(mode="active", trial_model=model)
+    ranking = policy.rank(_CANDIDATES, model_choice=_MODEL_CHOICE, task_family="f")
+    entry = ranking["proposals"][0]
+    assert entry["causal"] is None
+    assert entry["execution_blocker"] == "harmful"
+    assert entry["executable"] is False
+    assert policy.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE,
+                           task_family="f") is None
+    # Canary mode refuses it too: a refuted divergence must not consume a
+    # real randomized trial.
+    canary = CausalChoicePolicy(mode="canary", trial_model=model)
+    assert canary.proposal(_CANDIDATES, model_choice=_MODEL_CHOICE,
+                           task_family="f") is None
+
+    thin = _trials("candidate", 4, 4, "c", task_family="f") + _trials(
+        "control", 4, 0, "k", task_family="f"
+    )
+    thin_model = TrialChoiceModel.fit(thin)
+    thin_policy = CausalChoicePolicy(mode="active", trial_model=thin_model)
+    entry = _active_entry(thin_policy, task_family="f")
+    assert entry["executable"] is False
+    assert entry["execution_blocker"] == "insufficient_support"
+
+
+def test_active_trial_levels_reject_unknown_strings():
+    """Configuration cannot smuggle in an unrecognized evidence level — an
+    unknown name fails closed at construction."""
+    with pytest.raises(ValueError):
+        CausalChoicePolicy(mode="active", active_trial_levels=("made_up",))
+    with pytest.raises(ValueError):
+        CausalChoicePolicy(mode="active",
+                           active_trial_levels=("family", "inferred"))
+    # An explicit operator may still widen the list — modes are configuration
+    # — but only with real level names.
+    CausalChoicePolicy(mode="active", active_trial_levels=("family", "pooled"))

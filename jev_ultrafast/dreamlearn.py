@@ -2392,18 +2392,29 @@ class CausalChoicePolicy:
       prefers can influence execution.
     - ``canary`` — its top proposal may be used as the *experimental*
       candidate under the existing randomized assignment (recorded
-      propensity, real authority plane, at most one trial per run).
+      propensity, real authority plane, at most one trial per run). Pooled
+      randomized evidence may nominate here: a canary is exactly how pooled
+      evidence earns context-specific support.
     - ``active`` — a *beneficial*, randomized-established proposal may be
       used as the executed choice, still bounded to the offered catalogue and
       still passing effect classification, payload review, approvals, and the
-      browser guards.
+      browser guards. Active execution additionally requires evidence from a
+      *context-specific* stratum — ``active_trial_levels`` defaults to
+      ``family+site``/``site``/``family`` and never includes ``pooled``:
+      pooled randomized evidence generalizes over every task at once and is
+      sufficient to schedule an experiment, never to silently substitute a
+      choice in an unseen context.
 
     Every entry carries provenance: ``randomized`` (supported randomized
     evidence at a specific stratum), ``pooled_randomized`` (randomized
     evidence that had to back off to the pooled stratum), or
     ``observational`` (trajectory association only). The two evidence
     channels are never silently mixed — a combined score reports which
-    channel each component came from.
+    channel each component came from. Every entry also carries
+    ``execution_blocker``: the named reason it cannot execute
+    deterministically (``no_causal_evidence``, ``insufficient_support``,
+    ``unresolved``, ``below_effect_threshold``, ``missing_probability``,
+    ``pooled_only``, ``unsupported_stratum``), or ``None``.
     """
 
     mode: str = "shadow"
@@ -2412,12 +2423,24 @@ class CausalChoicePolicy:
     w_causal: float = 1.0
     w_observational: float = 0.5
     min_causal_delta: float = 0.0
+    # Strata whose established randomized evidence may drive an *active*
+    # override. Pooled evidence is hypothesis/nomination authority, not
+    # execution authority — an operator may weaken this list explicitly, but
+    # never accidentally: unknown level names fail closed at construction.
+    active_trial_levels: tuple[str, ...] = ("family+site", "site", "family")
 
     MODES = ("shadow", "canary", "active")
+    TRIAL_LEVELS = ("family+site", "site", "family", "pooled")
 
     def __post_init__(self):
         if self.mode not in self.MODES:
             raise ValueError(f"CausalChoicePolicy mode must be one of {self.MODES}")
+        unknown = {str(level) for level in self.active_trial_levels} - set(self.TRIAL_LEVELS)
+        if unknown:
+            raise ValueError(
+                f"active_trial_levels entries must be known trial levels "
+                f"{self.TRIAL_LEVELS}; got {sorted(unknown)}"
+            )
 
     def rank(
         self,
@@ -2441,6 +2464,11 @@ class CausalChoicePolicy:
                     phase=phase,
                 )
             }
+        mc_rank = next(
+            (i for i, c in enumerate(candidates)
+             if c.get("id") == model_choice.get("id")),
+            None,
+        )
         entries = []
         for index, candidate in enumerate(candidates):
             if candidate.get("id") == model_choice.get("id"):
@@ -2454,6 +2482,29 @@ class CausalChoicePolicy:
                     rank=index,
                     task_family=task_family,
                 )
+            # The causal channel omits established-harmful divergences rather
+            # than ranking them; a missing entry is either "no evidence" or
+            # "refuted" — ask once, so the blocker says which.
+            refuted = bool(
+                causal_entry is None
+                and self.trial_model is not None
+                and callable(getattr(self.trial_model, "refuted", None))
+                and self.trial_model.refuted(
+                    kind=str(candidate.get("kind") or "unknown"),
+                    goal_overlap=candidate.get("goal_overlap"),
+                    model_kind=str(model_choice.get("kind") or "unknown"),
+                    model_overlap=model_choice.get("goal_overlap"),
+                    model_effect=model_choice.get("effect"),
+                    model_role=model_choice.get("role"),
+                    model_rank=mc_rank,
+                    proposal_effect=candidate.get("effect"),
+                    proposal_role=candidate.get("role"),
+                    proposal_rank=index,
+                    phase=phase,
+                    task_family=task_family,
+                    site=site,
+                )
+            )
             supported = bool(causal_entry and causal_entry.get("support_sufficient"))
             if supported:
                 source = (
@@ -2479,11 +2530,13 @@ class CausalChoicePolicy:
                 "source": source,
                 "causal": causal_entry,
                 "observational": observational,
+                "execution_blocker": self._execution_blocker(
+                    causal_entry, refuted=refuted
+                ),
                 "executable": bool(
                     self.mode == "active"
-                    and causal_entry is not None
-                    and causal_entry.get("effect_status") == "beneficial"
-                    and float(causal_entry.get("expected_delta") or 0.0) > self.min_causal_delta
+                    and self._execution_blocker(causal_entry, refuted=refuted)
+                    is None
                 ),
             })
         tiers = {"beneficial": 0, "unresolved": 1, "insufficient_data": 2}
@@ -2500,6 +2553,37 @@ class CausalChoicePolicy:
             "proposals": entries,
             "abstain": not entries,
         }
+
+    def _execution_blocker(
+        self, causal_entry: dict | None, *, refuted: bool = False
+    ) -> str | None:
+        """The named reason this candidate cannot execute under ``active`` —
+        or ``None`` when every active-evidence requirement holds.
+
+        Requirements, in evaluation order: the causal channel must have
+        answered at all (an established-harmful divergence is reported
+        ``harmful``, not merely absent); its estimate must carry enough
+        randomized support; the established sign must be beneficial; the
+        effect must clear the configured practical threshold; the contrast
+        must supply a valid finite causal probability; and the evidence must
+        come from a context-specific stratum this policy trusts for active
+        use — pooled randomized evidence is a hypothesis source, not
+        execution authority.
+        """
+        if causal_entry is None:
+            return "harmful" if refuted else "no_causal_evidence"
+        if not causal_entry.get("support_sufficient"):
+            return "insufficient_support"
+        if causal_entry.get("effect_status") != "beneficial":
+            return "unresolved"
+        if not (float(causal_entry.get("expected_delta") or 0.0) > self.min_causal_delta):
+            return "below_effect_threshold"
+        if causal_entry.get("p_progress") is None:
+            return "missing_probability"
+        trial_level = causal_entry.get("trial_level")
+        if trial_level not in self.active_trial_levels:
+            return "pooled_only" if trial_level == "pooled" else "unsupported_stratum"
+        return None
 
     def proposal(
         self,
@@ -2523,9 +2607,24 @@ class CausalChoicePolicy:
         )
         if not ranking["proposals"] or self.mode == "shadow":
             return None
-        top = ranking["proposals"][0]
-        if self.mode == "active" and not top["executable"]:
-            return None
+        if self.mode == "active":
+            top = ranking["proposals"][0]
+            if not top["executable"]:
+                return None
+        else:
+            # canary: nominate the first non-refuted entry — an established-
+            # harmful divergence is settled and negative; spending a real
+            # randomized trial re-testing it is never warranted.
+            top = next(
+                (
+                    entry
+                    for entry in ranking["proposals"]
+                    if entry.get("execution_blocker") != "harmful"
+                ),
+                None,
+            )
+            if top is None:
+                return None
         causal = top.get("causal") or {}
         observational = top.get("observational") or {}
         causal_p = causal.get("p_progress")
@@ -2558,4 +2657,5 @@ class CausalChoicePolicy:
             "source": top["source"],
             "mode": self.mode,
             "executable": top["executable"],
+            "execution_blocker": top.get("execution_blocker"),
         }
