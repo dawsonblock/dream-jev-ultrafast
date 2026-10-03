@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
+from typing import ClassVar
 
 from ..privacy import action_goal_overlap
 from .common import _stable_hash
@@ -43,34 +44,69 @@ class ExplorationPolicy:
     max_actions: int = 60
     no_progress_window: int = 3
 
+    # The declarative policy DSL (Phase 18): the entire vocabulary a
+    # candidate may write. Each field declares its JSON type and, where
+    # bounded, its inclusive envelope — the same numbers this class has
+    # always enforced, declared once so validation, serialization,
+    # introspection, and mutation cannot drift apart. ``type`` is ``str``,
+    # ``int``, or ``number`` (int-or-float); ``bool`` is never an integer
+    # here — a flag must not silently satisfy a numeric envelope.
+    _FIELD_SPECS: ClassVar[dict] = {
+        "name": {"type": "str", "nonempty": True},
+        "version": {"type": "int", "min": 1},
+        "goal_overlap_weight": {"type": "number"},
+        "overlap_exponent": {"type": "number", "min": 0.25, "max": 2.0},
+        "order_penalty": {"type": "number"},
+        "click_bonus": {"type": "number"},
+        "fill_bonus": {"type": "number"},
+        "select_bonus": {"type": "number"},
+        "model_action_limit": {"type": "int", "min": 16, "max": 250},
+        "duplicate_node_cap": {"type": "int", "min": 1, "max": 250},
+        "min_goal_overlap": {"type": "int", "min": 0, "max": 5},
+        "click_quota": {"type": "int", "min": 1, "max": 250},
+        "fill_quota": {"type": "int", "min": 1, "max": 250},
+        "select_quota": {"type": "int", "min": 1, "max": 250},
+        "max_actions": {"type": "int", "min": 1, "max": 120},
+        "no_progress_window": {"type": "int", "min": 2, "max": 10},
+    }
+
+    @classmethod
+    def schema(cls) -> dict:
+        """The declared write surface: field → type/envelope spec.
+
+        This *is* the DSL — the complete vocabulary recursive improvement
+        may write. Anything outside it fails closed at ``from_dict``."""
+        return {k: dict(v) for k, v in cls._FIELD_SPECS.items()}
+
     def __post_init__(self):
-        if not self.name or self.version < 1:
-            raise ValueError("Exploration policy needs a name and positive version")
-        for value in (
-            self.goal_overlap_weight,
-            self.overlap_exponent,
-            self.order_penalty,
-            self.click_bonus,
-            self.fill_bonus,
-            self.select_bonus,
-        ):
-            if not math.isfinite(value):
-                raise ValueError("Exploration policy weights must be finite")
-        if not 0.25 <= self.overlap_exponent <= 2.0:
-            raise ValueError("overlap_exponent must be between 0.25 and 2.0")
-        if not 16 <= self.model_action_limit <= 250:
-            raise ValueError("model_action_limit must be between 16 and 250")
-        if not 1 <= self.duplicate_node_cap <= 250:
-            raise ValueError("duplicate_node_cap must be between 1 and 250")
-        if not 0 <= self.min_goal_overlap <= 5:
-            raise ValueError("min_goal_overlap must be between 0 and 5")
-        for quota in (self.click_quota, self.fill_quota, self.select_quota):
-            if not 1 <= quota <= 250:
-                raise ValueError("candidate quotas must be between 1 and 250")
-        if not 1 <= self.max_actions <= 120:
-            raise ValueError("max_actions must be between 1 and 120")
-        if not 2 <= self.no_progress_window <= 10:
-            raise ValueError("no_progress_window must be between 2 and 10")
+        for name, spec in self._FIELD_SPECS.items():
+            value = getattr(self, name)
+            kind = spec["type"]
+            if kind == "str":
+                if not isinstance(value, str):
+                    raise ValueError(f"{name} must be a string")
+                if spec.get("nonempty") and not value:
+                    raise ValueError(
+                        "Exploration policy needs a name and positive version"
+                    )
+            elif kind == "int":
+                # bool is an int subclass — never silently accept a flag
+                # where the DSL declares an integer envelope.
+                if not isinstance(value, int) or isinstance(value, bool):
+                    raise ValueError(f"{name} must be an integer")
+            else:
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise ValueError(f"{name} must be a number")
+                if not math.isfinite(value):
+                    raise ValueError("Exploration policy weights must be finite")
+            lo, hi = spec.get("min"), spec.get("max")
+            if lo is not None and hi is not None:
+                if not lo <= value <= hi:
+                    raise ValueError(f"{name} must be between {lo} and {hi}")
+            elif lo is not None and value < lo:
+                raise ValueError(f"{name} must be at least {lo}")
+            elif hi is not None and value > hi:
+                raise ValueError(f"{name} must be at most {hi}")
 
     def candidate_score(self, action: dict, goal_tokens: set[str], order: int, overlap=None) -> float:
         if overlap is None:
@@ -94,27 +130,18 @@ class ExplorationPolicy:
 
     @classmethod
     def from_dict(cls, payload: dict) -> "ExplorationPolicy":
-        allowed = set(cls.__dataclass_fields__)
+        if not isinstance(payload, dict):
+            raise ValueError("Exploration policy payload must be a dict")
+        allowed = set(cls._FIELD_SPECS)
         unknown = set(payload) - allowed
         if unknown:
             raise ValueError(f"Unknown exploration policy keys: {sorted(unknown)}")
         return cls(**payload)
 
-    _BEHAVIOR_FIELDS = (
-        "goal_overlap_weight",
-        "overlap_exponent",
-        "order_penalty",
-        "click_bonus",
-        "fill_bonus",
-        "select_bonus",
-        "model_action_limit",
-        "duplicate_node_cap",
-        "min_goal_overlap",
-        "click_quota",
-        "fill_quota",
-        "select_quota",
-        "max_actions",
-        "no_progress_window",
+    # Behavior fields are the DSL minus identity — derived from the spec
+    # so the two can never drift.
+    _BEHAVIOR_FIELDS: ClassVar[tuple] = tuple(
+        k for k in _FIELD_SPECS if k not in ("name", "version")
     )
 
     @property
@@ -167,6 +194,10 @@ class ReplayMetrics:
     estimated_tokens: int = 0
     estimated_latency_ms: int = 0
     estimated_score: float | None = None
+    # Phase 13 verdict tally — how each world ended, counted once per world
+    # under ``REPLAY_VERDICTS`` (see replay.py). A coverage miss is truncated
+    # evidence, never a measured failure; the tally keeps those distinct.
+    verdicts: dict = field(default_factory=dict)
 
     @property
     def success_rate(self) -> float:
@@ -180,11 +211,15 @@ class ReplayMetrics:
 def mutate_policies(base: ExplorationPolicy) -> list[ExplorationPolicy]:
     """Deterministic, bidirectional, bounded candidate generator for offline dreaming.
 
-    Every knob is perturbed in both directions within the ``ExplorationPolicy``
-    envelopes, so the search can expand as well as contract the candidate space.
-    The generator changes only whitelisted exploration knobs. It never emits
-    code, and candidates identical in behavior to the base are dropped by
-    ``behavior_digest`` rather than kept as distinct digests.
+    Two layers of moves: scalar perturbations walk each knob in both
+    directions inside its declared envelope, and structural moves (Phase
+    19) change the candidate's *shape* — envelope-boundary probes, joint
+    moves of coupled knob groups (patience, kind budgets, selectivity),
+    ablations resetting one knob to the class default, and knock-outs
+    zeroing each kind prior. The generator writes only the declared DSL
+    surface, never code, and candidates identical in behavior to the base
+    are dropped by ``behavior_digest`` rather than kept as distinct
+    digests.
     """
     specs = [
         {"goal_overlap_weight": max(0.1, base.goal_overlap_weight * factor)}
@@ -228,6 +263,77 @@ def mutate_policies(base: ExplorationPolicy) -> list[ExplorationPolicy]:
         {"min_goal_overlap": max(0, min(5, base.min_goal_overlap + delta))}
         for delta in (-1, 1)
     ]
+
+    # ------------------------------------------------------------------
+    # Structural mutations (Phase 19): candidates whose *shape* differs,
+    # not just one coordinate's value. Scalar perturbations explore along
+    # single axes; these probe envelope boundaries, move coupled knob
+    # groups jointly, ablate one knob back to the class default, and
+    # knock out each kind prior entirely. Every move stays inside the
+    # declared DSL envelope, and construction still validates — a
+    # structural candidate is exactly as bounded as a scalar one.
+    # ------------------------------------------------------------------
+    defaults = ExplorationPolicy()
+
+    # Envelope-boundary probes: each bounded numeric field pushed to its
+    # declared min and max alone — the corners of the write surface.
+    # Identity fields (name, version) are never mutation targets.
+    for field_name, spec in ExplorationPolicy._FIELD_SPECS.items():
+        if field_name in ("name", "version"):
+            continue
+        if spec["type"] not in ("int", "number"):
+            continue
+        for bound in (spec.get("min"), spec.get("max")):
+            if bound is not None:
+                specs.append({field_name: bound})
+
+    # Joint moves: coupled knob groups stepped together in both
+    # directions. A group moved jointly is a different *policy shape* —
+    # e.g. "patient" scales the whole patience envelope at once, which no
+    # sequence of single-axis perturbations expresses in one candidate.
+    _GROUPS = (
+        # Patience: how long the search may run.
+        ("model_action_limit", "duplicate_node_cap", "max_actions",
+         "no_progress_window"),
+        # Kind budgets.
+        ("click_quota", "fill_quota", "select_quota"),
+        # Selectivity: how strongly goal relevance gates the catalogue.
+        ("min_goal_overlap", "goal_overlap_weight", "overlap_exponent"),
+    )
+    for group in _GROUPS:
+        for direction in (-1, 1):
+            changes = {}
+            for field_name in group:
+                spec = ExplorationPolicy._FIELD_SPECS[field_name]
+                lo, hi = spec.get("min"), spec.get("max")
+                current = getattr(base, field_name)
+                if spec["type"] == "int":
+                    # Integer envelopes step a quarter-span in the move's
+                    # direction — a joint move must visibly move every
+                    # member, never round a contraction up to +1.
+                    span = (
+                        hi - lo
+                        if hi is not None and lo is not None
+                        else 1
+                    )
+                    moved = current + direction * max(1, round(span * 0.25))
+                else:
+                    moved = current * (1.5 if direction > 0 else 0.75)
+                if lo is not None:
+                    moved = max(lo, moved)
+                if hi is not None:
+                    moved = min(hi, moved)
+                changes[field_name] = moved
+            specs.append(changes)
+
+    # Ablations: each behavior field reset to the class default alone —
+    # "what if this knob went back to baseline" — and knock-outs zeroing
+    # each kind prior entirely (0 is inside every declared envelope).
+    for field_name in ExplorationPolicy._BEHAVIOR_FIELDS:
+        specs.append({field_name: getattr(defaults, field_name)})
+    for field_name in ("click_bonus", "fill_bonus", "select_bonus"):
+        specs.append({field_name: 0.0})
+
     candidates = []
     seen = {base.behavior_digest}
     for index, changes in enumerate(specs, 1):

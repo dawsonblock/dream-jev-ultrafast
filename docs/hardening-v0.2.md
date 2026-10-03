@@ -36,4 +36,4 @@ The environment used to assemble this package did not have the `browser-harness`
 
 ## Deliberately still out of scope
 
-The following are not papered over as “supported”: cross-frame control, shadow DOM traversal, nested scroll containers, pop-up/new-tab ownership, canvas-only controls, drag/drop, file upload, browser permission dialogs, arbitrary keyboard widgets, and native multi-select semantics. These should be added after the execution-integrity invariants above remain green in live browser tests.
+The following are not papered over as “supported”: canvas-only controls, drag/drop, browser permission dialogs, arbitrary keyboard widgets, and native multi-select semantics. Same-origin frame control, open shadow roots, nested scroll containers, popup/new-tab ownership, whitelisted scroll keys, and allowlisted file upload have since landed under the same execution-integrity invariants — each rejects through the stale/overlay/indeterminate machinery rather than bypassing it, and cross-origin frames and closed shadow roots remain honest blind spots rather than silent traversal.

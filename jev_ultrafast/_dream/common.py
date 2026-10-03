@@ -56,7 +56,7 @@ SUPPORTED_TCB_VERSIONS = {
 }
 
 
-ACTION_KINDS = ("click", "fill", "select", "scroll", "wait")
+ACTION_KINDS = ("click", "fill", "select", "upload", "scroll", "key", "wait")
 
 
 def _stable_hash(value: str) -> str:

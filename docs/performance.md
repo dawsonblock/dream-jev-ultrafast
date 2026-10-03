@@ -52,4 +52,4 @@ The previous 11.387-second recording and post-recording 12.898-second policy reg
 
 ## Limits
 
-This DOM reader supports common HTML and ARIA controls; it does not implement the full accessible-name algorithm or traverse shadow roots/frames. Scoped click guards deliberately allow unrelated visible updates. Canvas, uploads, new tabs, nested scrolling, and arbitrary keyboard widgets remain unsupported. A valid operation can still be wrong, and DONE is never independent evidence of success.
+This DOM reader supports common HTML and ARIA controls plus same-origin frames, open shadow roots, nested scroll containers, whitelisted keyboard scroll, allowlisted file upload, and popup adoption; it does not implement the full accessible-name algorithm, cross-origin frames, closed shadow roots, canvas, browser dialogs, drag/drop, arbitrary keyboard widgets, or native multi-select. Scoped click guards deliberately allow unrelated visible updates. A valid operation can still be wrong, and DONE is never independent evidence of success.

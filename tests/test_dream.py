@@ -394,7 +394,7 @@ def test_agent_emits_replayable_trace_without_changing_executor_contract(tmp_pat
         def fresh(self, _page, action=None):
             return True
 
-        def act(self, action, page, text=None, guarantee=None):
+        def act(self, action, page, text=None, guarantee=None, file_path=None):
             assert action["id"] == "go" and page["fingerprint"] == "S" and text is None
             self.current = second
 
@@ -1511,6 +1511,81 @@ def test_offered_digest_must_match_recorded_policy(tmp_path):
         ReplayWorld.from_events(store.load())
 
 
+def test_replay_honors_recorded_upload_availability(tmp_path):
+    """A file input's upload actions stay in the observed catalogue but only
+    reach the offered one when the operator declared files. run_started
+    records upload_count so replay re-derives the SAME offered catalogue —
+    a valid trace must verify, not die on a digest mismatch."""
+    policy = ExplorationPolicy()
+    page = {"fingerprint": "A", "url": "https://example.test"}
+    actions = [
+        {"id": "attach", "kind": "upload", "node": 1, "label": "Attach"},
+        {"id": "send", "kind": "click", "node": 2, "label": "Send files"},
+    ]
+
+    # No files declared — live selection drops the upload from the offered
+    # catalogue; replay must verify that recorded digest, not reject it.
+    store = ExperienceStore(tmp_path / "no-uploads.jsonl")
+    recorder = DreamTraceRecorder(store, goal="Send files")
+    recorder.start(page, policy, upload_count=0)
+    offered, _ = candidate_actions(actions, "Send files", exploration_policy=policy)
+    assert all(a["kind"] != "upload" for a in offered)
+    recorder.transition(
+        before=page, after={"fingerprint": "B", "url": "https://example.test"},
+        action=actions[1], decision={"latency_ms": 1, "usage": {}},
+        candidates=actions, offered=offered,
+    )
+    recorder.finish(status="done", verified=True)
+    start = next(e for e in store.load() if e["event"] == "run_started")
+    assert start["upload_count"] == 0
+    worlds = ReplayWorld.from_events(store.load())
+    assert worlds[0].trajectory[0].uploads_declared is False
+    assert worlds[0].trajectory[0].selected_offered_rank == 0
+
+    # Files declared — the upload action IS offerable and replay must
+    # reconstruct that same inclusive catalogue.
+    store = ExperienceStore(tmp_path / "uploads.jsonl")
+    recorder = DreamTraceRecorder(store, goal="Send files")
+    recorder.start(page, policy, upload_count=2)
+    offered, _ = candidate_actions(
+        actions, "Send files", exploration_policy=policy,
+        upload_names=["a.pdf", "b.pdf"],
+    )
+    assert any(a["kind"] == "upload" for a in offered)
+    recorder.transition(
+        before=page, after={"fingerprint": "B", "url": "https://example.test"},
+        action=actions[0], decision={"latency_ms": 1, "usage": {}},
+        candidates=actions, offered=offered,
+    )
+    recorder.finish(status="done", verified=True)
+    worlds = ReplayWorld.from_events(store.load())
+    assert worlds[0].trajectory[0].uploads_declared is True
+
+
+def test_replay_rejects_uploaded_offered_catalogue_without_declaration(tmp_path):
+    """An offered catalogue containing an upload action cannot verify against
+    a run that declared no files — the digest check still fails closed."""
+    store = ExperienceStore(tmp_path / "forged-upload.jsonl")
+    policy = ExplorationPolicy()
+    page = {"fingerprint": "A", "url": "https://example.test"}
+    recorder = DreamTraceRecorder(store, goal="Send files")
+    recorder.start(page, policy, upload_count=0)
+    actions = [
+        {"id": "attach", "kind": "upload", "node": 1, "label": "Attach"},
+        {"id": "send", "kind": "click", "node": 2, "label": "Send files"},
+    ]
+    # Record an offered catalogue that includes the upload action — as if the
+    # run had declared files — while run_started says it did not.
+    recorder.transition(
+        before=page, after={"fingerprint": "B", "url": "https://example.test"},
+        action=actions[1], decision={"latency_ms": 1, "usage": {}},
+        candidates=actions, offered=list(actions),
+    )
+    recorder.finish(status="done", verified=True)
+    with pytest.raises(ValueError, match="offered catalogue digest mismatch"):
+        ReplayWorld.from_events(store.load())
+
+
 def test_task_family_keeps_paraphrased_goals_in_one_partition(tmp_path):
     store = ExperienceStore(tmp_path / "fam.jsonl")
     transition = _single_transition()
@@ -1772,6 +1847,10 @@ def test_registry_schema_downgrade_cannot_launder_a_stripped_head(tmp_path):
         payload.pop(key, None)
     payload["schema"] = "jev-dream/3"  # the field `stripped` keys on
     payload["active"]["suspended"] = False  # the edit the attacker wants
+    # The forged record must also lie consistently under the lifecycle
+    # state machine — a declared status contradicting the flags is caught
+    # even without trust keys.
+    payload["active"]["status"] = "active"
     payload["active"].pop("suspend_attestation", None)
     payload["active"].pop("suspended_at_ms", None)
     path.write_text(json.dumps(payload))
@@ -1967,3 +2046,344 @@ def test_experiment_runs_are_excluded_from_canary_metrics(tmp_path):
     metrics = CanaryMetrics.from_events(store.load(), baseline.digest)
     assert metrics.tasks == 1
     assert metrics.run_ids == ("clean-1",)
+
+
+def test_replay_verdicts_categorize_world_endings(tmp_path):
+    """Phase 13: every world reports exactly one verdict — truncated
+    evidence (coverage_miss, inconclusive) is counted apart from measured
+    endings, never silently read as failure."""
+    _store, worlds = _branching_world(tmp_path)
+    result = ReplaySimulator(worlds).evaluate(ExplorationPolicy())
+    verdicts = result.metrics.verdicts
+    assert sum(verdicts.values()) == 2
+    assert verdicts["verified_success"] == 1
+    assert verdicts["measured_terminal"] == 1
+    assert result.per_world[0]["verdict"] == "measured_terminal"
+    assert result.per_world[1]["verdict"] == "verified_success"
+
+    miss_worlds = _coverage_miss_world(tmp_path)
+    constrained = ReplaySimulator(miss_worlds).evaluate(
+        ExplorationPolicy(model_action_limit=16))
+    assert constrained.metrics.verdicts["coverage_miss"] == 1
+    assert constrained.per_world[0]["verdict"] == "coverage_miss"
+    # A coverage miss is truncated evidence — the same world under a
+    # covering policy produces a real measured ending, not a failure.
+    covering = ReplaySimulator(miss_worlds).evaluate(ExplorationPolicy())
+    assert covering.metrics.verdicts["verified_success"] == 1
+
+    # Trajectory ending with no recorded terminal: inconclusive, not failure.
+    store = ExperienceStore(tmp_path / "noend.jsonl")
+    goal = "click final control"
+    store.append({
+        "run_id": "n", "task_key": task_key(goal), "sequence": 1,
+        "event": "run_started", "goal": goal, "state": "S",
+        "policy": ExplorationPolicy().to_dict(),
+        "policy_digest": ExplorationPolicy().digest,
+    })
+    store.append({
+        "run_id": "n", "task_key": task_key(goal), "sequence": 2,
+        "event": "transition", "state": "S", "next_state": "D",
+        "selected": {"id": "c0", "kind": "click"},
+        "candidates": [{"id": "c0", "kind": "click", "label": "Go",
+                        "goal_overlap": 1}],
+        "page_changed": True, "latency_ms": 10, "model_calls": 1,
+        "tokens": 10, "stale_or_failure": 0, "risk_events": 0,
+    })
+    open_worlds = ReplayWorld.from_events(store.load())
+    open_result = ReplaySimulator(open_worlds).evaluate(ExplorationPolicy())
+    assert open_result.metrics.verdicts["inconclusive"] == 1
+    assert open_result.per_world[0]["verdict"] == "inconclusive"
+
+
+def test_policy_dsl_declares_the_write_surface():
+    """Phase 18: the field spec is the DSL — the complete vocabulary a
+    candidate may write, derived once and reused by validation."""
+    schema = ExplorationPolicy.schema()
+    # Every dataclass field is declared, nothing else is.
+    assert sorted(schema) == sorted(ExplorationPolicy().to_dict())
+    # Envelopes are declared data, not scattered literals.
+    assert schema["model_action_limit"] == {
+        "type": "int", "min": 16, "max": 250}
+    assert schema["overlap_exponent"] == {
+        "type": "number", "min": 0.25, "max": 2.0}
+    # Mutating the returned dict cannot edit the policy's own spec.
+    schema["model_action_limit"]["min"] = 0
+    assert ExplorationPolicy.schema()["model_action_limit"]["min"] == 16
+
+
+def test_policy_dsl_rejects_type_violations():
+    """Types are part of the language: a string, float, or bool where an
+    integer is declared is a ValueError — never a leaked TypeError."""
+    base = ExplorationPolicy().to_dict()
+    for bad in (
+        dict(base, model_action_limit="many"),
+        dict(base, model_action_limit=250.0),
+        dict(base, click_quota=True),          # bool is not an int here
+        dict(base, goal_overlap_weight="fast"),
+        dict(base, goal_overlap_weight=None),
+        dict(base, name=["baseline"]),
+        dict(base, version=2.0),
+        dict(base, version=False),
+    ):
+        with pytest.raises(ValueError):
+            ExplorationPolicy.from_dict(bad)
+    # Non-dict payloads fail closed too.
+    for payload in ("name=baseline", 42, None, ["name"]):
+        with pytest.raises(ValueError):
+            ExplorationPolicy.from_dict(payload)
+    # Declared-coherent values still parse (int satisfies number).
+    ok = ExplorationPolicy.from_dict({**base, "goal_overlap_weight": 5})
+    assert ok.goal_overlap_weight == 5
+
+
+def test_structural_mutations_stay_inside_the_dsl():
+    """Phase 19: candidates may differ in shape, never in vocabulary —
+    every structural move is still declared DSL inside the envelopes."""
+    base = ExplorationPolicy()
+    candidates = mutate_policies(base)
+    # Scalar-only generation was ~30; structural moves add boundary
+    # probes, joint group moves, ablations, and knock-outs.
+    assert len(candidates) > 60
+    # Every candidate validates against the DSL and is behavior-distinct.
+    digests = {c.behavior_digest for c in candidates}
+    assert len(digests) == len(candidates)
+    for c in candidates:
+        ExplorationPolicy.from_dict(c.to_dict())  # revalidates
+    # Boundary probes reach the declared envelope corners.
+    assert any(c.model_action_limit == 16 for c in candidates)
+    assert any(c.model_action_limit == 250 for c in candidates)
+    assert any(c.no_progress_window == 2 for c in candidates)
+    assert any(c.min_goal_overlap == 5 for c in candidates)
+    # Joint patience move: several patience knobs moved together — no
+    # scalar perturbation produces that shape in one candidate.
+    assert any(
+        c.model_action_limit != base.model_action_limit
+        and c.max_actions != base.max_actions
+        and c.no_progress_window != base.no_progress_window
+        for c in candidates
+    )
+    # Knock-outs zero a kind prior entirely.
+    assert any(c.click_bonus == 0.0 for c in candidates)
+    # Ablations reset a knob to the class default — present whenever the
+    # base deviates from default.
+    nondefault = ExplorationPolicy(click_quota=100, min_goal_overlap=2)
+    reset = mutate_policies(nondefault)
+    assert any(c.click_quota == 150 for c in reset)
+    # Identity fields are never mutation targets.
+    assert all(c.version == nondefault.version + 1 for c in reset)
+    assert all(c.name.startswith(nondefault.name) for c in reset)
+
+
+def _promoted_registry(tmp_path, name="sm"):
+    worlds = _efficiency_world(tmp_path)
+    registry = PolicyRegistry(tmp_path / f"{name}.json")
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds, ExplorationPolicy())
+    registry.stage(report)
+    permissive = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=0,
+        min_paired_task_families=0)
+    registry.promote(
+        CanaryMetrics(1, 1), CanaryMetrics(1, 1), gate=permissive,
+        allow_unbound_metrics=True)
+    return registry
+
+
+def test_lifecycle_status_is_declared_on_every_record(tmp_path):
+    """Phase 20: records carry a named status — staged, active, suspended,
+    retired — and history records are retired members, not ghosts."""
+    registry = _promoted_registry(tmp_path)
+    payload = registry.load()
+    assert payload["active"]["status"] == "active"
+    # Re-stage + promote to create history.
+    second_report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        _overlapping_distractor_world(tmp_path), registry.active_policy())
+    assert second_report.promotion.approved
+    registry.stage(second_report)
+    permissive = CanaryGate(
+        min_tasks=1, min_baseline_tasks=1, min_task_families=0,
+        min_paired_task_families=0)
+    registry.promote(
+        CanaryMetrics(1, 1), CanaryMetrics(1, 1), gate=permissive,
+        allow_unbound_metrics=True)
+    payload = registry.load()
+    assert payload["history"][-1]["status"] == "retired"
+    registry.suspend("drift")
+    assert registry.load()["active"]["status"] == "suspended"
+    registry.resume()
+    assert registry.load()["active"]["status"] == "active"
+
+
+def test_lifecycle_rejects_contradictory_declared_status(tmp_path):
+    """A record whose declared status contradicts its slot/flags fails
+    closed at load — even without trust keys, a forged status cannot
+    repaint a record's authority."""
+    registry = _promoted_registry(tmp_path)
+    registry.suspend("drift")
+    path = tmp_path / "sm.json"
+    payload = json.loads(path.read_text())
+    assert payload["active"]["status"] == "suspended"
+    # The forgery that flips only the flag now contradicts the declared
+    # status — caught without any signing infrastructure.
+    payload["active"]["suspended"] = False
+    payload.pop("state_digest", None)
+    payload.pop("prev_state_digest", None)
+    payload["schema"] = "jev-dream/3"  # unsigned legacy framing
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="inconsistent"):
+        PolicyRegistry(path).load()
+    # An unknown status name fails closed the same way.
+    payload["active"]["suspended"] = True
+    payload["active"]["status"] = "dictator-for-life"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="inconsistent"):
+        PolicyRegistry(path).load()
+
+
+def test_lifecycle_idempotent_edges_are_race_safe(tmp_path):
+    """Re-suspending a suspended policy and resuming an active one are
+    declared self-loops — a monitor must not crash on a re-check."""
+    registry = _promoted_registry(tmp_path)
+    registry.suspend("first")
+    registry.suspend("second")  # suspended -> suspended is legal
+    state = registry.load()["active"]
+    assert state["status"] == "suspended"
+    assert state["suspension_reason"] == "second"
+    registry.resume()
+    registry.resume()  # active -> active is legal
+    assert registry.load()["active"]["status"] == "active"
+
+
+def test_lifecycle_transition_table_is_exported():
+    from jev_ultrafast.dream import POLICY_STATES, POLICY_TRANSITIONS
+    assert set(POLICY_STATES) == {"staged", "active", "suspended", "retired"}
+    # The table declares exactly the implemented lifecycle and nothing
+    # else — no edge mints authority outside staged -> active.
+    for state in POLICY_STATES:
+        assert state in POLICY_TRANSITIONS
+    assert POLICY_TRANSITIONS["staged"] == ("active",)
+    # Nothing transitions back to staged — a new candidacy always starts
+    # from replay approval, never from a lifecycle edge.
+    assert all("staged" not in targets for targets in POLICY_TRANSITIONS.values())
+
+
+def _aborted_run(store, run_id, goal, reason, *, policy):
+    key = task_key(goal)
+    store.append({
+        "run_id": run_id, "task_key": key, "sequence": 1,
+        "event": "run_started", "goal": goal, "state": "S",
+        "policy": policy.to_dict(), "policy_digest": policy.digest,
+    })
+    store.append({
+        "run_id": run_id, "task_key": key, "sequence": 2,
+        "event": "run_finished", "status": "aborted",
+        "verified": False, "reason": reason,
+    })
+
+
+def test_health_gate_detects_crash_loop_with_zero_completed_tasks(tmp_path):
+    """Phase 21: a policy that crashes every start produces no tasks —
+    'insufficient data' must never be the verdict on a death spiral."""
+    store = ExperienceStore(tmp_path / "crashy.jsonl")
+    policy = ExplorationPolicy(name="crashy", version=2)
+    for index in range(8):
+        _aborted_run(store, f"c{index}", f"goal {index}", "browser_crash", policy=policy)
+    # And a run that died before even recording a finish.
+    store.append({
+        "run_id": "ghost", "task_key": task_key("goal g"), "sequence": 1,
+        "event": "run_started", "goal": "goal g", "state": "S",
+        "policy": policy.to_dict(), "policy_digest": policy.digest,
+    })
+    observed = CanaryMetrics.from_events(store.load(), policy.digest)
+    assert observed.tasks == 0
+    assert observed.abandoned_runs == 9
+    # browser_crash is candidate-attributable; the unfinished run is not.
+    assert observed.crash_runs == 8
+    decision = HealthGate(min_tasks=20).assess(
+        CanaryMetrics(tasks=20, verified_successes=18), observed)
+    assert not decision.healthy
+    assert "crash" in decision.reason
+
+
+def test_health_gate_distinguishes_censors_from_crashes(tmp_path):
+    """Operator cancels and timeouts are abandoned but not crashes — a
+    modest censor count still reports healthy-insufficient."""
+    store = ExperienceStore(tmp_path / "censors.jsonl")
+    policy = ExplorationPolicy(name="censors", version=2)
+    for index in range(3):
+        _aborted_run(store, f"o{index}", f"goal {index}", "operator_cancel", policy=policy)
+    _aborted_run(store, "t", "goal t", "timeout", policy=policy)
+    observed = CanaryMetrics.from_events(store.load(), policy.digest)
+    assert observed.abandoned_runs == 4
+    assert observed.crash_runs == 0
+    decision = HealthGate(min_tasks=20).assess(
+        CanaryMetrics(tasks=20, verified_successes=18), observed)
+    assert decision.healthy and not decision.sufficient
+
+
+def test_health_gate_abandoned_majority_is_unhealthy(tmp_path):
+    """Even unattributable abandons condemn when they dominate the window —
+    the policy repeatedly fails to survive its own runs."""
+    store = ExperienceStore(tmp_path / "abandons.jsonl")
+    policy = ExplorationPolicy(name="abandons", version=2)
+    for index in range(6):
+        _aborted_run(store, f"a{index}", f"goal {index}", "network_failure", policy=policy)
+    _append_run(store, "ok", "goal ok", [], status="done", verified=True, policy=policy)
+    observed = CanaryMetrics.from_events(store.load(), policy.digest)
+    assert observed.abandoned_fraction == 6 / 7
+    decision = HealthGate(min_tasks=20).assess(
+        CanaryMetrics(tasks=20, verified_successes=18), observed)
+    assert not decision.healthy
+    assert "abandoned" in decision.reason
+
+
+def test_health_gate_covers_promotion_dimensions():
+    """The reference-vs-observed monitors now cover the same dimensions
+    the promotion gate measured — failure rate, latency, actions, tokens —
+    plus a hard zero-success collapse check."""
+    reference = CanaryMetrics(
+        tasks=30, verified_successes=24, failures=6, risk_events=1,
+        latency_ms=3000, actions=150, model_calls=150, tokens=30000)
+    # A policy twice as slow and with three times the failure share.
+    drifted = CanaryMetrics(
+        tasks=30, verified_successes=12, failures=18, risk_events=1,
+        latency_ms=8000, actions=150, model_calls=150, tokens=30000)
+    decision = HealthGate(min_tasks=20).assess(reference, drifted)
+    assert not decision.healthy
+    collapsed = CanaryMetrics(tasks=30, verified_successes=0, failures=30)
+    decision = HealthGate(min_tasks=20).assess(reference, collapsed)
+    assert not decision.healthy and "no verified successes" in decision.reason
+
+
+def test_health_reference_metrics_from_older_records_still_load():
+    """Canary blocks attested before the attrition fields existed rebuild
+    with the documented zero defaults — old authority stays verifiable."""
+    legacy = {"tasks": 30, "verified_successes": 24, "failures": 6,
+              "risk_events": 1, "latency_ms": 3000, "actions": 150,
+              "model_calls": 150, "tokens": 30000,
+              "offered_candidates": 600, "task_families": 4,
+              "run_ids": (), "task_keys": (), "family_keys": (),
+              "instance_ids": ()}
+    metrics = CanaryMetrics(**legacy)
+    assert metrics.abandoned_runs == 0 and metrics.crash_runs == 0
+
+
+def test_staged_slot_rejects_record_claiming_active_status(tmp_path):
+    """Phase 24: a forged record cannot borrow authority by writing
+    ``status: active`` into the staged slot — the slot derives the status,
+    and a contradiction fails closed at load."""
+    worlds = _efficiency_world(tmp_path)
+    registry = PolicyRegistry(tmp_path / "forge.json")
+    report = DreamImprover(gate=PromotionGate(min_coverage=1.0)).improve(
+        worlds, ExplorationPolicy())
+    registry.stage(report)
+    path = tmp_path / "forge.json"
+    payload = json.loads(path.read_text())
+    assert payload["staged"]["status"] == "staged"
+    payload["staged"]["status"] = "active"
+    payload.pop("state_digest", None)
+    payload.pop("prev_state_digest", None)
+    payload["schema"] = "jev-dream/3"
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="inconsistent"):
+        PolicyRegistry(path).load()

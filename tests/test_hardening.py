@@ -653,12 +653,18 @@ class El {
     return sel.split(',').some(part => {
       part = part.trim();
       if (part === ':disabled') return this.disabled;
-      const attr = part.match(/^\[([^\]=]+)(?:="([^"]*)")?\]$/);
+      // Compound forms the catalogue actually uses: tag, [attr], [attr="v"],
+      // tag[attr], tag[attr="v"]. (:not(...) compounds stay unsupported —
+      // contenteditable is not exercised by these fixtures.)
+      const m = part.match(/^(?:([A-Za-z]+))?(?:\[([^\]=]+)(?:="([^"]*)")?\])?$/);
+      if (!m || (!m[1] && !m[2])) return false;
+      const [, tag, attr, attrVal] = m;
+      if (tag && this.tagName !== tag.toUpperCase()) return false;
       if (attr) {
-        const v = this.getAttribute(attr[1]);
-        return attr[2] === undefined ? v !== null : v === attr[2];
+        const v = this.getAttribute(attr);
+        if (attrVal === undefined ? v === null : v !== attrVal) return false;
       }
-      return this.tagName === part.toUpperCase();
+      return true;
     });
   }
   checkVisibility() { return true; }
@@ -754,7 +760,7 @@ def test_giant_select_cannot_starve_the_action_catalogue(tmp_path):
     # 1499 selectable options + fill + open-click + go-click = 1502 raw.
     assert page["raw_action_count"] == 1502
     assert page["omitted_actions"] == 302
-    assert len(actions) == 1201  # 1200 catalogue + the wait sentinel
+    assert len(actions) == 1203  # 1200 catalogue + 2 key controls + wait sentinel
     # First pass of the interleave: each node's head action, in DOM order.
     assert actions[1]["kind"] == "fill" and actions[1]["label"] == "Search"
     assert actions[2]["kind"] == "click" and actions[2]["label"] == "Go"
@@ -762,6 +768,9 @@ def test_giant_select_cannot_starve_the_action_catalogue(tmp_path):
     # survives, in order.
     select_indexes = [a["option_index"] for a in actions if a["kind"] == "select"]
     assert select_indexes == list(range(1, 1198))
+    # Keyboard-scroll controls land between the catalogue and the sentinel.
+    assert actions[-3]["kind"] == "key" and actions[-3]["key"] == "PageDown"
+    assert actions[-2]["kind"] == "key" and actions[-2]["key"] == "PageUp"
     assert actions[-1]["kind"] == "wait"
 
 
@@ -879,3 +888,122 @@ def test_sanitize_url_strips_userinfo_and_path_secrets(monkeypatch):
     assert sanitize_url(
         "https://example.test/docs/getting-started-with-the-new-platform"
     ).endswith("/docs/getting-started-with-the-new-platform")
+
+
+# --- Phase 16: iframe / shadow DOM / tab / keyboard-scroll / upload ----------
+
+
+def test_upload_targets_expand_per_declared_file():
+    """UPLOAD mirrors select's option axis: element_index:file_index keys over
+    the operator-declared basenames, never paths."""
+    actions = [
+        {"id": "e1", "kind": "upload", "node": 9, "role": "button",
+         "label": "Choose file — Attach", "ctx": {"field": "file"}},
+    ]
+    elements, targets, controls = model.action_space(actions, upload_names=["a.pdf", "b.txt"])
+    assert elements[0]["operations"] == ["UPLOAD"]
+    assert [f["name"] for f in elements[0]["files"]] == ["a.pdf", "b.txt"]
+    assert targets["UPLOAD"]["1:1"]["file_index"] == 0
+    assert targets["UPLOAD"]["1:2"]["file_index"] == 1
+    assert targets["UPLOAD"]["1:2"]["id"] == "e1"
+    assert not controls
+
+
+def test_upload_actions_are_inert_without_declared_files():
+    """A page can offer a file input while the operator declared no files —
+    the action stays in the observed catalogue but never reaches the model."""
+    actions = [
+        {"id": "e1", "kind": "upload", "node": 9, "role": "button",
+         "label": "Choose file — Attach", "ctx": {"field": "file"}},
+        {"id": "e2", "kind": "click", "node": 2, "role": "button", "label": "Go"},
+    ]
+    offered, _ = model.candidate_actions(actions, "upload a file", upload_names=())
+    assert [a["id"] for a in offered] == ["e2"]
+    elements, targets, _ = model.action_space(actions, upload_names=())
+    assert "UPLOAD" not in targets
+    offered, _ = model.candidate_actions(actions, "upload a file", upload_names=["a.pdf"])
+    assert "e1" in {a["id"] for a in offered}
+
+
+def test_uploads_are_ranked_regulars_not_controls():
+    """Upload actions join the ranked catalogue (kind bonus like select's),
+    not the always-offered control list — a page of file inputs cannot
+    starve the fill/click budget the way unranked controls could."""
+    actions = [
+        {"id": f"u{i}", "kind": "upload", "node": i, "role": "button",
+         "label": f"Choose file {i}", "ctx": {"field": "file"}}
+        for i in range(4)
+    ] + [
+        {"id": "f1", "kind": "fill", "node": 90, "role": "textbox", "label": "Search"},
+        {"id": "wait", "kind": "wait", "label": "Wait"},
+    ]
+    offered, _ = model.candidate_actions(actions, "upload", upload_names=["a.pdf"], limit=250)
+    assert {a["id"] for a in offered} == {"u0", "u1", "u2", "u3", "f1", "wait"}
+    _, targets, controls = model.action_space(offered, upload_names=["a.pdf"])
+    assert "UPLOAD" in targets and "WAIT" in controls
+
+
+def test_agent_upload_resolution_binds_declared_files_only(tmp_path):
+    """_resolve_upload maps the decision's file index to the allowlist —
+    a missing or out-of-range selection fails before any CDP call."""
+    f = tmp_path / "attach.txt"
+    f.write_text("data")
+    agent = loop.Agent.__new__(loop.Agent)
+    agent.uploads = [{"name": f.name, "path": str(f), "size": 4}]
+    assert agent._resolve_upload({"target": "3:1"})["path"] == str(f)
+    with pytest.raises(ValueError, match="no file selection"):
+        agent._resolve_upload({"target": "3"})
+    with pytest.raises(ValueError, match="outside the declared set"):
+        agent._resolve_upload({"target": "3:2"})
+    with pytest.raises(ValueError, match="outside the declared set"):
+        agent._resolve_upload({"target": "3:0"})
+
+
+def test_resolve_uploads_validates_the_allowlist(tmp_path, monkeypatch):
+    good = tmp_path / "a.txt"
+    good.write_text("x")
+    entries = loop._resolve_uploads([str(good), str(good)])  # duplicates dedup
+    assert len(entries) == 1 and entries[0]["name"] == "a.txt"
+    with pytest.raises(ValueError, match="does not exist"):
+        loop._resolve_uploads([str(tmp_path / "missing.bin")])
+    with pytest.raises(ValueError, match="regular file"):
+        loop._resolve_uploads([str(tmp_path)])
+    monkeypatch.setenv("JEV_UPLOADS", str(good))
+    assert loop._resolve_uploads(None)[0]["path"] == str(good.resolve())
+
+
+def test_classify_effect_new_kinds():
+    from jev_ultrafast.policy import Effect, classify_effect
+    assert classify_effect({"kind": "key", "key": "PageDown"}) == Effect.OBSERVE
+    assert classify_effect({"kind": "key", "key": "Home"}) == Effect.OBSERVE
+    # A non-whitelisted key is never silently autonomous.
+    assert classify_effect({"kind": "key", "key": "Enter"}) == Effect.UNKNOWN_COMMIT
+    assert classify_effect({"kind": "key"}) == Effect.UNKNOWN_COMMIT
+    assert classify_effect({"kind": "scroll", "node": 3}) == Effect.OBSERVE
+    # Upload classifies as an edit that escalates on the file-field context.
+    assert classify_effect({"kind": "upload", "ctx": {"field": "file"}}) == Effect.SUBMISSION
+    assert classify_effect({"kind": "upload", "ctx": {}}) == Effect.FORM_EDIT
+
+
+def test_fresh_guard_covers_new_node_kinds(monkeypatch):
+    """fresh() must give scroll-node and upload actions the per-node guard,
+    not just the page marker — a scrollable container mutating post-decision
+    is a stale target."""
+    calls = []
+
+    class FakeBrowser(browser.Browser):
+        def __init__(self):
+            pass
+
+        def _isolated(self, expression):
+            calls.append(expression)
+            return ["pk", "gr"]
+
+    b = FakeBrowser()
+    page = {"page_key": "pk", "marker": "m", "guards": {"7": "gr"}}
+    assert b.fresh(page, {"kind": "scroll", "node": 7}) is True
+    assert b.fresh(page, {"kind": "upload", "node": 7}) is True
+    assert b.fresh(page, {"kind": "key", "key": "PageDown"}) is False  # marker != page marker
+    # Node-bound actions compare against BOTH page key and node guard.
+    assert b.fresh({"page_key": "other", "guards": {"7": "gr"}}, {"kind": "scroll", "node": 7}) is False
+    assert b.fresh({"page_key": "pk", "guards": {"7": "changed"}}, {"kind": "scroll", "node": 7}) is False

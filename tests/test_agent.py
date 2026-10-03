@@ -1593,3 +1593,82 @@ def test_causal_policy_active_override_is_recorded_and_canary_excluded(runner, t
     # not a clean sample of the exploration policy under test.
     assert not any(e["event"] == "experiment_assigned" for e in events)
     assert CanaryMetrics.from_events(events, ExplorationPolicy().digest).tasks == 0
+
+
+def test_security_profile_unknown_value_fails_closed(monkeypatch):
+    from jev_ultrafast.privacy import security_profile
+
+    monkeypatch.setenv("JEV_SECURITY_PROFILE", "hardened-ish")
+    with pytest.raises(ValueError, match="JEV_SECURITY_PROFILE"):
+        security_profile()
+
+
+def test_strict_profile_refuses_public_routing(monkeypatch):
+    """strict refuses verbatim remote text — a weakening knob fails closed
+    naming the posture, never silently ignored."""
+    from jev_ultrafast.privacy import routing_level
+
+    monkeypatch.setenv("JEV_SECURITY_PROFILE", "strict")
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "public")
+    with pytest.raises(ValueError, match="strict"):
+        routing_level()
+    # sanitized and local-only remain reachable under strict
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "local-only")
+    assert routing_level() == "local-only"
+
+
+def test_strict_profile_refuses_privacy_off_under_any_routing(monkeypatch):
+    """Under standard, privacy=off is only incoherent with sanitized routing;
+    strict refuses the unredacted posture outright."""
+    from jev_ultrafast.privacy import routing_level
+
+    monkeypatch.setenv("JEV_SECURITY_PROFILE", "strict")
+    monkeypatch.setenv("JEV_MODEL_PRIVACY", "off")
+    monkeypatch.setenv("JEV_MODEL_ROUTING", "local-only")
+    with pytest.raises(ValueError, match="strict"):
+        routing_level()
+
+
+def test_strict_profile_refuses_insecure_transport_flag(monkeypatch):
+    from jev_ultrafast.privacy import assert_transport_secure
+
+    monkeypatch.setenv("JEV_SECURITY_PROFILE", "strict")
+    monkeypatch.setenv("JEV_ALLOW_INSECURE_TRANSPORT", "1")
+    with pytest.raises(ValueError, match="strict"):
+        assert_transport_secure("http://model.example.com/v1")
+    # standard still honors the explicit development flag
+    monkeypatch.delenv("JEV_SECURITY_PROFILE")
+    assert_transport_secure("http://model.example.com/v1")
+
+
+def test_strict_profile_implies_signed_evidence(tmp_path, monkeypatch):
+    from jev_ultrafast.dream import ExperienceStore
+    from jev_ultrafast.privacy import signed_evidence_required
+
+    monkeypatch.delenv("JEV_REQUIRE_SIGNED_EVIDENCE", raising=False)
+    assert signed_evidence_required() is False
+    monkeypatch.setenv("JEV_SECURITY_PROFILE", "strict")
+    assert signed_evidence_required() is True
+    assert ExperienceStore(tmp_path / "s.jsonl").require_signatures is True
+
+
+def test_strict_profile_closes_unbound_metrics_hatch(monkeypatch):
+    from jev_ultrafast.privacy import unbound_metrics_permitted
+
+    monkeypatch.delenv("JEV_ALLOW_UNBOUND_METRICS", raising=False)
+    assert unbound_metrics_permitted() is False
+    monkeypatch.setenv("JEV_ALLOW_UNBOUND_METRICS", "1")
+    assert unbound_metrics_permitted() is True
+    monkeypatch.setenv("JEV_SECURITY_PROFILE", "strict")
+    with pytest.raises(ValueError, match="strict"):
+        unbound_metrics_permitted()
+
+
+def test_strict_profile_refuses_trusted_input(monkeypatch):
+    monkeypatch.setattr(loop, "Browser", lambda *a, **k: Mock(observe=Mock(return_value=page())))
+    monkeypatch.setenv("JEV_SECURITY_PROFILE", "strict")
+    with pytest.raises(ValueError, match="strict"):
+        loop.Agent("http://x", "g", input_guarantee="trusted")
+    # atomic remains the strict execution mode
+    agent = loop.Agent("http://x", "g", input_guarantee="atomic")
+    assert agent.input_guarantee == "atomic"

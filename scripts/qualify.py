@@ -36,6 +36,10 @@ Layers:
 (1M fuzz cases, 1,000 crash kills, 100k-sequence grid). A stage that cannot
 run on this host (no Chrome, missing tool) is reported ``skipped`` — never
 ``passed`` — so the report honestly separates executed evidence from absence.
+Every check declares a ``requirement`` — ``mandatory`` (must run and pass),
+``environment-dependent`` (needs a host capability; a skip is honest
+absence, a run-and-fail is a real failure), or ``optional`` (advisory,
+never gates). Undeclared checks are treated as mandatory.
 Integrity is not provenance: a manifest that hashes correctly still says
 nothing about who produced it, and a validation pass says nothing about
 release authority.
@@ -67,7 +71,23 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 ROOT = Path(__file__).resolve().parent.parent
 PY = [sys.executable]
 _TALLY = re.compile(r"(\d+)\s+(passed|failed|skipped|deselected|xpassed|xfailed)")
-REPORT_SCHEMA = "jev-qualify/3"
+REPORT_SCHEMA = "jev-qualify/4"
+# Check requirement taxonomy (Phase 9): every check declares whether its
+# evidence is mandatory, gated on a host capability the runner may not
+# have (environment-dependent), or advisory-only. An undeclared check is
+# treated as mandatory — a missing declaration must never silently
+# downgrade a gate to advisory.
+_MANDATORY = "mandatory"
+_ENV_DEPENDENT = "environment-dependent"
+_OPTIONAL = "optional"
+REQUIREMENT_TAXONOMY = {
+    _MANDATORY: "must run and pass — absence of a run is absence of evidence",
+    _ENV_DEPENDENT: (
+        "requires a host capability (Chrome CDP, node, a signed tree); "
+        "a skip is honest absence, a run-and-fail is a real failure"
+    ),
+    _OPTIONAL: "advisory only — reported, never gates",
+}
 REPORT_SIG_SCHEMA = "jev-qualify-sig/1"
 REPORT_SIG_DOMAIN = b"jev-dream/qualify-report/v1:"
 
@@ -311,10 +331,12 @@ def _release_verdict(
 
     Bounded mode is a validation profile — it reports ``release_qualified``
     ``false`` unconditionally. Full mode requires every release condition:
-    signed manifest verified under pinned keys, every required check run and
-    passed (nothing skipped counts as evidence), and the qualification report
-    itself signed by a key the caller accepts. ``release_blockers`` names
-    each unsatisfied condition in deterministic order.
+    signed manifest verified under pinned keys, every gating check run and
+    passed (``mandatory`` and ``environment-dependent`` checks only —
+    ``optional`` checks report but never gate; nothing skipped counts as
+    evidence), and the qualification report itself signed by a key the
+    caller accepts. ``release_blockers`` names each unsatisfied condition
+    in deterministic order.
     """
     if not full:
         return False, ["bounded_mode"]
@@ -330,6 +352,12 @@ def _release_verdict(
     for stage in stages:
         for check in stage.get("checks", ()):
             status = check.get("status")
+            # Advisory checks report but never gate; undeclared checks are
+            # mandatory. Environment-dependent checks that skipped still
+            # block release — a capability the host lacked is evidence the
+            # release does not have, not evidence it earned.
+            if check.get("requirement", _MANDATORY) == _OPTIONAL:
+                continue
             if status in {"skipped", "failed"}:
                 blockers.append(f"{_check_slug(check.get('cmd'))}_{status}")
     if report_key_id is None:
@@ -423,21 +451,30 @@ def _write_markdown(report: dict, path: Path) -> None:
 def _stage(name: str, description: str, checks: list[dict]) -> dict:
     results = []
     for check in checks:
+        requirement = check.get("requirement", _MANDATORY)
         display = check["cmd"] if isinstance(check["cmd"], str) else " ".join(check["cmd"])
         if check.get("skip"):
             results.append({"cmd": display, "status": "skipped",
+                            "requirement": requirement,
                             "reason": check["skip"]})
             print(f"    skip   {display[:72]} ({check['skip']})", flush=True)
             continue
         print(f"    run    {display[:72]}", flush=True)
         if "fn" in check:
-            results.append(check["fn"]())
+            result = check["fn"]()
         else:
-            results.append(_run(check["cmd"], check.get("timeout", 1800)))
+            result = _run(check["cmd"], check.get("timeout", 1800))
+        result["requirement"] = requirement
+        results.append(result)
         print(f"    {results[-1]['status']:6} ({results[-1]['seconds']}s)",
               flush=True)
-    status = ("failed" if any(r["status"] == "failed" for r in results)
-              else "passed" if any(r["status"] == "passed" for r in results)
+    # Stage status is decided by gating checks only — an advisory check
+    # failing reports the failure without failing the stage. A stage made
+    # entirely of advisory checks falls back to the plain tally.
+    gating = [r for r in results if r.get("requirement") != _OPTIONAL]
+    decisive = gating or results
+    status = ("failed" if any(r["status"] == "failed" for r in decisive)
+              else "passed" if any(r["status"] == "passed" for r in decisive)
               else "skipped")
     return {"stage": name, "description": description, "status": status,
             "checks": results}
@@ -488,43 +525,58 @@ def main() -> int:
     # checks is not provenance); under --full an unsigned tree fails closed —
     # release qualification requires provenance, not just integrity.
     if manifest_signed or full:
-        sig_check = {"cmd": PY + ["scripts/sign_manifest.py", "--verify"]}
+        sig_check = {"cmd": PY + ["scripts/sign_manifest.py", "--verify"],
+                     "requirement": _ENV_DEPENDENT}
     else:
         sig_check = {"cmd": ["python3", "scripts/sign_manifest.py", "--verify"],
+                     "requirement": _ENV_DEPENDENT,
                      "skip": "unsigned tree — no release provenance to verify"}
     q0 = [
-        {"cmd": PY + ["scripts/update_manifest.py", "--check"]},
+        {"cmd": PY + ["scripts/update_manifest.py", "--check"],
+         "requirement": _MANDATORY},
+        # The trusted computing base (Phase 17): drift inside the TCB, or
+        # unclassified code under a trusted package prefix, fails closed.
+        {"cmd": PY + ["scripts/check_tcb.py"],
+         "requirement": _MANDATORY},
         sig_check,
-        {"cmd": PY + ["-m", "compileall", "-q", "jev_ultrafast", "tests"]},
-        {"cmd": PY + ["-m", "ruff", "check", "."]},
+        {"cmd": PY + ["-m", "compileall", "-q", "jev_ultrafast", "tests"],
+         "requirement": _MANDATORY},
+        {"cmd": PY + ["-m", "ruff", "check", "."],
+         "requirement": _MANDATORY},
     ]
     for js in ("jev_ultrafast/snapshot.js", "jev_ultrafast/static/app.js"):
-        q0.append({"cmd": [node, "--check", js]} if node
+        q0.append({"cmd": [node, "--check", js],
+                   "requirement": _ENV_DEPENDENT} if node
                   else {"cmd": ["node", "--check", js],
+                        "requirement": _ENV_DEPENDENT,
                         "skip": "node not on PATH"})
     q0 += [
-        {"cmd": ["uv", "lock", "--check"]},
-        {"cmd": ["uv", "build", "-q"]},
+        {"cmd": ["uv", "lock", "--check"], "requirement": _MANDATORY},
+        {"cmd": ["uv", "build", "-q"], "requirement": _MANDATORY},
         # Reproducibility: two consecutive builds must be byte-identical.
         # In-process so the gate needs no coreutils/BSD shasum on the host.
-        {"cmd": "uv build ×2 compare", "fn": _double_build},
+        {"cmd": "uv build ×2 compare", "fn": _double_build,
+         "requirement": _MANDATORY},
     ]
     stages.append(_stage("Q0-static", "manifest, compile, lint, syntax, lock, "
                          "build, reproducibility", q0))
 
     print("Q1 — deterministic offline correctness", flush=True)
     stages.append(_stage("Q1-offline", "full pytest suite + coverage floor",
-                         [{"cmd": PY + ["-m", "pytest", "-q"]}]))
+                         [{"cmd": PY + ["-m", "pytest", "-q"],
+                           "requirement": _MANDATORY}]))
 
     print("Q2 — browser execution guards", flush=True)
     stages.append(_stage("Q2-browser", "live Chrome guard suite + E2E scenario", [
         {"cmd": PY + ["scripts/check_guards.py"],
-         "timeout": 900} if chrome else
+         "timeout": 900, "requirement": _ENV_DEPENDENT} if chrome else
         {"cmd": ["python3", "scripts/check_guards.py"],
+         "requirement": _ENV_DEPENDENT,
          "skip": "no CDP endpoint reachable"},
         {"cmd": PY + ["scripts/e2e_check.py"],
-         "timeout": 900} if chrome else
+         "timeout": 900, "requirement": _ENV_DEPENDENT} if chrome else
         {"cmd": ["python3", "scripts/e2e_check.py"],
+         "requirement": _ENV_DEPENDENT,
          "skip": "no CDP endpoint reachable"},
     ]))
 
@@ -532,11 +584,15 @@ def main() -> int:
     stages.append(_stage("Q3-adversarial", "fuzz, crash injection, mutation "
                          "sweep, live race loops", [
         {"cmd": PY + ["scripts/fuzz_check.py", "--cases",
-                      "1000000" if full else "50000"]},
+                      "1000000" if full else "50000"],
+         "requirement": _MANDATORY},
         {"cmd": PY + ["scripts/crash_check.py", "--iterations",
-                      "1000" if full else "30"]},
-        {"cmd": PY + ["scripts/mutate_check.py"], "timeout": 3600},
-        {"cmd": PY + ["scripts/keydrill_check.py"]},
+                      "1000" if full else "30"],
+         "requirement": _MANDATORY},
+        {"cmd": PY + ["scripts/mutate_check.py"], "timeout": 3600,
+         "requirement": _MANDATORY},
+        {"cmd": PY + ["scripts/keydrill_check.py"],
+         "requirement": _MANDATORY},
         # Independent anchors are a qualification requirement, not optional
         # hardening: the anchor-enforcement slice must hold (rollback,
         # truncation, forged/missing anchor — all fail closed).
@@ -546,23 +602,27 @@ def main() -> int:
                       "tests/test_authority.py::test_missing_anchor_and_forged_anchor_fail_closed",
                       "tests/test_dream.py::test_registry_anchor_detects_snapshot_restore",
                       "tests/test_dream.py::test_registry_anchor_missing_and_unsigned_fail_closed",
-                      "tests/test_dream.py::test_registry_anchor_detects_deleted_registry"]},
+                      "tests/test_dream.py::test_registry_anchor_detects_deleted_registry"],
+         "requirement": _MANDATORY},
         {"cmd": PY + ["scripts/race_check.py", "--nav-iterations",
                       "1000" if full else "200", "--churn-iterations", "0"],
-         "timeout": 3600}
+         "timeout": 3600, "requirement": _ENV_DEPENDENT}
             if chrome else {"cmd": ["race_check --nav-iterations"],
+                            "requirement": _ENV_DEPENDENT,
                             "skip": "no CDP endpoint reachable"},
         {"cmd": PY + ["scripts/race_check.py", "--churn-iterations",
                       "10000" if full else "500", "--nav-iterations", "0"],
-         "timeout": 3600}
+         "timeout": 3600, "requirement": _ENV_DEPENDENT}
             if chrome else {"cmd": ["race_check --churn-iterations"],
+                            "requirement": _ENV_DEPENDENT,
                             "skip": "no CDP endpoint reachable"},
     ]))
 
     print("Q4 — statistical / recursive-improvement", flush=True)
     stages.append(_stage("Q4-statistical", "causal grid + propensity", [
         {"cmd": PY + ["scripts/simulate_causal.py", "--sequences",
-                      "100000" if full else "2000"], "timeout": 7200},
+                      "100000" if full else "2000"], "timeout": 7200,
+         "requirement": _MANDATORY},
     ]))
 
     overall = ("failed" if any(s["status"] == "failed" for s in stages)
@@ -609,6 +669,7 @@ def main() -> int:
         "release_qualified": release_qualified,
         "release_blockers": blockers,
         "release_required": bool(full),
+        "requirement_taxonomy": dict(REQUIREMENT_TAXONOMY),
         "environment": _env_digest(),
         "provenance": provenance,
         "stages": [{k: v for k, v in s.items() if k != "checks"}

@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..privacy import unbound_metrics_permitted
 from ..signing import ATTESTATION_DOMAIN as ATTESTATION_SIG_DOMAIN
 from ..signing import (
     PROMOTION_SIGNING_KEY_ENV,
@@ -40,11 +41,80 @@ if TYPE_CHECKING:
 
 __all__ = [
     'ATTESTATION_DOMAIN',
+    'POLICY_STATES',
+    'POLICY_TRANSITIONS',
     'PolicyRegistry',
 ]
 
 
 ATTESTATION_DOMAIN = "jev-dream/promotion-attestation/v1"  # content prefix (inside the digest)
+
+# The explicit promotion lifecycle (Phase 20). Every registry record
+# carries a declared ``status``; lifecycle moves walk the transition
+# table below rather than implicitly flipping flags, and a record whose
+# declared status contradicts its slot or flags fails closed at load.
+#
+#   staged     — replay-approved candidate awaiting canary qualification
+#   active     — the policy currently holding authority
+#   suspended  — active policy with authority withdrawn (health/violation)
+#   retired    — a record in history; authority it once held is released
+POLICY_STATES = ("staged", "active", "suspended", "retired")
+
+# The legal edges of the lifecycle. Promotion moves staged → active and
+# retires the incumbent (active or suspended); suspension and resume
+# shuttle active ↔ suspended; rollback moves retired → active and
+# retires whatever held the active slot. The two self-loops are the
+# idempotent edges: re-suspending a suspended policy or resuming an
+# active one is a race-safe no-op (a monitor re-checking a suspended
+# policy must not crash), never a state change. Every other edge is
+# illegal and fails closed — there is no path that mints authority
+# without the staged → evidence-bound → active sequence.
+POLICY_TRANSITIONS = {
+    "staged": ("active",),
+    "active": ("active", "suspended", "retired"),
+    "suspended": ("active", "suspended", "retired"),
+    "retired": ("active",),
+}
+
+
+def _assert_transition(current: str, target: str, label: str):
+    """Enforce the declared lifecycle: an edge outside
+    ``POLICY_TRANSITIONS`` is a corruption/bug — never a silent move."""
+    if target not in POLICY_TRANSITIONS.get(current, ()):
+        raise ValueError(
+            f"Illegal policy lifecycle transition {current} -> {target} "
+            f"for {label} record"
+        )
+
+
+def _slot_status(record: dict, slot: str) -> str:
+    """Derive a record's status from the slot it occupies and its flags."""
+    if slot == "staged":
+        return "staged"
+    if slot == "history":
+        return "retired"
+    return "suspended" if record.get("suspended") else "active"
+
+
+def _record_status(record: dict, slot: str) -> str:
+    """The record's canonical status, checked against its slot.
+
+    Records written before the field existed derive status from slot +
+    ``suspended`` (legacy migration; the next write persists it). A
+    declared status that is unknown, or that contradicts the slot's
+    derived status, is corruption — fail closed rather than let a forged
+    field repaint a record's authority."""
+    derived = _slot_status(record, slot)
+    declared = record.get("status")
+    if declared is None:
+        record["status"] = derived
+        return derived
+    if declared not in POLICY_STATES or declared != derived:
+        raise ValueError(
+            f"Policy registry {slot} record declares status "
+            f"{declared!r}, inconsistent with {derived!r}"
+        )
+    return declared
 
 
 class PolicyRegistry:
@@ -406,6 +476,17 @@ class PolicyRegistry:
         self._validate_record(payload.get("staged"), "staged")
         for index, record in enumerate(payload.get("history", [])):
             self._validate_record(record, f"history[{index}]")
+        # Lifecycle state machine (Phase 20): every record's declared
+        # status must agree with the slot it occupies — a contradictory
+        # field is corruption, a missing one is migrated from the slot.
+        for slot, record in (
+            ("active", payload.get("active")),
+            ("staged", payload.get("staged")),
+        ) + tuple(
+            ("history", r) for r in payload.get("history", [])
+        ):
+            if record:
+                _record_status(record, slot)
         # Promotion attestations: the active record must prove signed
         # qualification when verification keys are configured; staged and
         # history records are verified whenever they carry one.
@@ -482,6 +563,7 @@ class PolicyRegistry:
         payload["staged"] = {
             "policy": report.selected.to_dict(),
             "digest": report.selected.digest,
+            "status": "staged",
             "parent_digest": parent_digest,
             "replay_report_hash": _stable_hash(json.dumps(report.to_dict(), sort_keys=True, separators=(",", ":"))),
             "world_pool_digest": report.world_pool_digest,
@@ -509,10 +591,15 @@ class PolicyRegistry:
             decision = (gate or CanaryGate()).assess(evidence.baseline, evidence.candidate, evidence=evidence)
             if not decision.approved:
                 raise ValueError(f"Canary promotion rejected: {decision.reason}")
+            _assert_transition("staged", "active", "staged")
             previous = payload.get("active")
             if previous:
+                _assert_transition(
+                    _record_status(previous, "active"), "retired", "previous"
+                )
                 payload["history"].append({
                     **previous,
+                    "status": "retired",
                     "deactivated_at_ms": int(time.time() * 1000),
                     "deactivation_reason": "superseded",
                 })
@@ -532,6 +619,7 @@ class PolicyRegistry:
             }
             payload["active"] = {
                 **staged,
+                "status": "active",
                 "promoted_at_ms": promoted_at,
                 "promotion_revision": promotion_revision,
                 "suspended": False,
@@ -577,8 +665,9 @@ class PolicyRegistry:
         # Compatibility escape hatch, feature-gated twice: the caller must
         # pass the flag AND the environment must explicitly opt in, so no code
         # path can reach unbound promotion silently. The gate fails closed —
-        # absent or empty JEV_ALLOW_UNBOUND_METRICS rejects the call.
-        if os.environ.get("JEV_ALLOW_UNBOUND_METRICS") != "1":
+        # absent or empty JEV_ALLOW_UNBOUND_METRICS rejects the call, and
+        # JEV_SECURITY_PROFILE=strict refuses the hatch outright.
+        if not unbound_metrics_permitted():
             raise ValueError(
                 "Unbound canary metrics require JEV_ALLOW_UNBOUND_METRICS=1 in the "
                 "environment; normal activation is promote_from_store() with "
@@ -679,6 +768,10 @@ class PolicyRegistry:
             active = payload.get("active")
             if not active:
                 raise ValueError("No active policy to suspend")
+            _assert_transition(
+                _record_status(active, "active"), "suspended", "active"
+            )
+            active["status"] = "suspended"
             active["suspended"] = True
             active["suspended_at_ms"] = int(time.time() * 1000)
             active["suspension_reason"] = str(reason)[:512]
@@ -705,6 +798,10 @@ class PolicyRegistry:
             active = payload.get("active")
             if not active:
                 raise ValueError("No active policy to resume")
+            _assert_transition(
+                _record_status(active, "active"), "active", "active"
+            )
+            active["status"] = "active"
             active["suspended"] = False
             active.pop("suspended_at_ms", None)
             active.pop("suspension_reason", None)
@@ -740,12 +837,20 @@ class PolicyRegistry:
             target = history.pop(index)
             current = payload.get("active")
             if current:
+                _assert_transition(
+                    _record_status(current, "active"), "retired", "active"
+                )
                 history.append({
                     **current,
+                    "status": "retired",
                     "deactivated_at_ms": int(time.time() * 1000),
                     "deactivation_reason": "rollback",
                 })
             target = {k: v for k, v in target.items() if k not in {"deactivated_at_ms", "deactivation_reason"}}
+            _assert_transition(
+                _record_status(target, "history"), "active", "rollback target"
+            )
+            target["status"] = "active"
             target["suspended"] = False
             # A rolled-back record re-enters authority: when verification keys
             # are configured its existing attestations must hold against the
@@ -798,6 +903,9 @@ class PolicyRegistry:
         reference = CanaryMetrics(**reference_payload)
         observed = CanaryMetrics.from_events(store.load(), active["digest"], max_runs=recent_tasks)
         decision = (gate or HealthGate()).assess(reference, observed)
-        if not decision.healthy and suspend_on_fail:
+        # suspended -> suspended is not a legal transition: a policy whose
+        # authority is already withdrawn reports the unhealthy decision but
+        # cannot be suspended a second time.
+        if not decision.healthy and suspend_on_fail and not active.get("suspended"):
             self.suspend(decision.reason)
         return decision

@@ -38,9 +38,11 @@ These are Level-1/Level-2 learners in the DREAM stack:
   treats only established-harmful divergences as refuted, and keeps its
   provenance (``source: "randomized"``) separate from the observational
   ``ChoiceModel`` forever. ``ExperimentScheduler`` ranks unresolved
-  hypotheses by expected information gain per trial cost, and
-  ``CausalChoicePolicy`` combines the channels under operator-gated modes
-  (shadow → canary → active) — always as prioritization, never as authority.
+  hypotheses by a bounded heuristic score — practical importance,
+  remaining uncertainty, and evidence coverage — not a formal value of
+  information, and ``CausalChoicePolicy`` combines the channels under
+  operator-gated modes (shadow → canary → active) — always as
+  prioritization, never as authority.
 
 No model may fabricate a model choice or a browser outcome, and none is part
 of the trusted evidence path.

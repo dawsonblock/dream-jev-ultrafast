@@ -124,19 +124,19 @@ def _candidate_score(action, goal_tokens, order, exploration_policy=None, overla
     return overlap * 10 + kind_bonus - order / 100000
 
 
-def candidate_actions(actions, goal, limit=None, exploration_policy=None):
+def candidate_actions(actions, goal, limit=None, exploration_policy=None, upload_names=()):
     """Goal-aware, operation-balanced candidate selection.
 
-    System controls (scroll/wait) are retained. Per-kind quotas prevent one large
-    native dropdown from consuming the entire model action budget. A learned
-    ``ExplorationPolicy`` may additionally bound per-node fan-out and require a
-    minimum goal overlap; both stay replayable because trace candidates carry
-    the same ``node`` identity and sanitized overlap.
+    System controls (scroll/wait/key) are retained. Per-kind quotas prevent one
+    large native dropdown from consuming the entire model action budget. A
+    learned ``ExplorationPolicy`` may additionally bound per-node fan-out and
+    require a minimum goal overlap; both stay replayable because trace
+    candidates carry the same ``node`` identity and sanitized overlap.
     """
     limit = int(limit or getattr(exploration_policy, "model_action_limit", MODEL_ACTION_LIMIT))
     min_overlap = int(getattr(exploration_policy, "min_goal_overlap", 0) or 0)
     node_cap = int(getattr(exploration_policy, "duplicate_node_cap", 250) or 250)
-    controls = [a for a in actions if a.get("kind") not in {"click", "fill", "select"}]
+    controls = [a for a in actions if a.get("kind") not in {"click", "fill", "select", "upload"}]
     tokens = _goal_tokens(goal)
     # Overlap is computed once per action and shared by the min-overlap filter
     # and the scorer — scoring an unfiltered catalogue would otherwise re-run
@@ -144,7 +144,12 @@ def candidate_actions(actions, goal, limit=None, exploration_policy=None):
     regular = []
     overlaps = {}
     for i, a in enumerate(actions):
-        if a.get("kind") not in {"click", "fill", "select"}:
+        if a.get("kind") not in {"click", "fill", "select", "upload"}:
+            continue
+        # An upload target is only offerable when the operator declared files —
+        # without them the action names a capability that cannot execute, so it
+        # stays evidence in the observed catalogue but never reaches the model.
+        if a.get("kind") == "upload" and not upload_names:
             continue
         overlap = action_goal_overlap(a, tokens)
         if min_overlap and overlap < min_overlap:
@@ -162,6 +167,10 @@ def candidate_actions(actions, goal, limit=None, exploration_policy=None):
         "click": getattr(exploration_policy, "click_quota", 150),
         "fill": getattr(exploration_policy, "fill_quota", 45),
         "select": getattr(exploration_policy, "select_quota", 55),
+        # No dedicated upload quota field exists in the policy DSL, so uploads
+        # share the whole regular budget — exactly what quota_for("upload")
+        # returns to every caller, replay included.
+        "upload": limit,
     }
     selected, counts, used, node_counts = [], {k: 0 for k in quotas}, set(), {}
     regular_budget = max(0, limit - len(controls))
@@ -199,12 +208,14 @@ def candidate_actions(actions, goal, limit=None, exploration_policy=None):
     return result[:limit], max(0, len(actions) - len(result[:limit]))
 
 
-def action_space(actions):
+def action_space(actions, upload_names=()):
     """One index per observed element; each operation has its own valid target choices."""
     elements, indices, targets, controls = [], {}, {}, {}
-    operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT"}
+    operations = {"click": "CLICK", "fill": "TYPE_TEXT", "select": "SELECT", "upload": "UPLOAD"}
     for action in actions:
         kind = action["kind"]
+        if kind == "upload" and not upload_names:
+            continue
         if kind not in operations:
             controls[action["id"].upper()] = action
             continue
@@ -218,6 +229,8 @@ def action_space(actions):
             if kind == "select":
                 element["value"] = clean.get("current_value", "")
                 element["options"] = []
+            if kind == "upload":
+                element["files"] = []
             elements.append(element)
         index = indices[node]
         operation = operations[kind]
@@ -244,24 +257,40 @@ def action_space(actions):
                     "option_index": action.get("option_index"),
                 }
             )
-        group[target] = action
+            group[target] = action
+        elif kind == "upload":
+            # One target per declared file, mirroring select's option axis: the
+            # model chooses among basenames the operator declared — never a
+            # path — and dispatch resolves the index server-side.
+            for file_index, file_name in enumerate(upload_names):
+                file_target = f"{index}:{file_index + 1}"
+                element["files"].append({"index": file_target, "name": file_name})
+                group[file_target] = {
+                    **action,
+                    "file_index": file_index,
+                    "file_name": file_name,
+                }
+        else:
+            group[target] = action
     return elements, targets, controls
 
 
-def choose(state, goal, history, backend=None, exploration_policy=None, perception=None):
+def choose(state, goal, history, backend=None, exploration_policy=None, perception=None, upload_names=()):
     if perception is not None:
         # Caller (the agent loop) already reduced this exact page's actions —
         # reuse the same candidates/action space instead of re-sanitizing.
         candidates, omitted_for_model, elements, targets, controls = perception
     else:
         candidates, omitted_for_model = candidate_actions(
-            state["actions"], goal, exploration_policy=exploration_policy
+            state["actions"], goal, exploration_policy=exploration_policy,
+            upload_names=upload_names,
         )
-        elements, targets, controls = action_space(candidates)
+        elements, targets, controls = action_space(candidates, upload_names=upload_names)
     labels = {
         "CLICK": "Click an element, button, menu option, autocomplete suggestion, or calendar day.",
         "TYPE_TEXT": "Enter or replace text in an editable field. A small LLM will supply the value from the goal.",
         "SELECT": "Select one observed option from a native single-select dropdown.",
+        "UPLOAD": "Attach one of the declared files to a file input.",
     }
     operations = {key: labels[key] for key in targets}
     operations.update({key: value["label"] for key, value in controls.items()})
@@ -285,6 +314,8 @@ def choose(state, goal, history, backend=None, exploration_policy=None, percepti
                 "current_value": clean.get("current_value", clean.get("value", "")),
                 **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
             }
+            if operation == "UPLOAD":
+                criteria[index]["file"] = clean.get("file_name", "")
         questions[operation.lower() + "_target"] = {
             "type": "choice",
             "criteria": criteria,

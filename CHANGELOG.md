@@ -4,7 +4,9 @@ Detailed release history for Jev Ultrafast. Cut releases live on the
 [GitHub releases page](https://github.com/dawsonblock/dream-jev-ultrafast/releases);
 this file documents what changed and why, in the project's own words.
 
-## Unreleased — exact-action generalization and experimental-unit enforcement
+## Unreleased
+
+### exact-action generalization and experimental-unit enforcement
 
 A fifth-pass scientific audit found two causal-evidence gaps plus a ranking
 ambiguity, all fixed inside the existing causal layer:
@@ -64,7 +66,7 @@ ambiguity, all fixed inside the existing causal layer:
   before registration existed keep the cell-derived family and report
   `hypothesis_registered: False` rather than borrowing authority.
 
-## v0.9.2 — adversarial-page authority binding
+### adversarial-page authority binding
 
 A fourth-pass source audit found that the authority plane was weaker at the
 *mutation* boundary than at the *decision* boundary, plus provenance and
@@ -124,7 +126,144 @@ privacy gaps in the release tooling:
   live agent state — an in-process consumer could mutate internals through
   the returned dict. The snapshot is now fully detached.
 
-## v0.9.2 — qualification correctness
+### security profiles, replay verdicts, and qualification taxonomy
+
+- **Named security profiles bound how the knobs compose**
+  (`JEV_SECURITY_PROFILE`). The individual controls — routing level,
+  privacy mode, insecure-transport flag, input guarantee, signed-evidence
+  requirement, unbound-metrics hatch — were grown one defect at a time,
+  and no single declaration described the posture a qualified run should
+  hold. `standard` (the default) is the status quo; `strict` refuses
+  `JEV_MODEL_ROUTING=public` and `JEV_MODEL_PRIVACY=off` under any
+  routing level, refuses `JEV_ALLOW_INSECURE_TRANSPORT` even where it
+  would apply, refuses `JEV_INPUT_GUARANTEE=trusted` (atomic
+  isolated-world execution only), keeps `JEV_ALLOW_UNBOUND_METRICS`
+  closed, and implies `JEV_REQUIRE_SIGNED_EVIDENCE`. A knob weakening
+  below the declared profile fails closed naming the profile — never
+  silently ignored — and an unrecognized profile value is itself a
+  misconfiguration that fails closed.
+- **Replay verdicts are named, not just penalized.** Each replayed world
+  now reports `verdict` — `verified_success`, `measured_terminal`,
+  `coverage_miss`, `blocked`, or `inconclusive` — and `ReplayMetrics`
+  carries `verdicts` counts alongside the existing score fields. A world
+  the policy simply declined to act on is now distinguishable from one
+  that ran to a measured terminal outcome, and an inconclusive world
+  (insufficient evidence to classify) is no longer conflated with either.
+- **`import jev_ultrafast` no longer starts the browser stack.** The
+  browser-coupled exports (`Agent`, `Browser`, `run`) resolve lazily via
+  `__getattr__`, so the learning and DREAM layers import without pulling
+  in the CDP harness; `from jev_ultrafast import Agent` behaves exactly
+  as before.
+- **`qualify.py` checks declare their requirement.** Each check reports
+  `requirement` — `mandatory`, `environment-dependent` (needs a host
+  capability; a skip is an honest absence, never a pass), or `optional`
+  (advisory, never gates the verdict) — and the summary tallies them.
+  Checks that predate the taxonomy read as `mandatory`, which is the
+  conservative interpretation.
+- **Scheduler terminology corrected.** The exploration scheduler's
+  heuristic is a novelty/coverage prior; docs no longer call it
+  "information gain", which is a measured quantity the heuristic does
+  not compute.
+
+### trusted base, policy language, lifecycle, and health monitors
+
+- **The trusted computing base is now a machine-checkable boundary**
+  (`jev_ultrafast/tcb.py`, `scripts/check_tcb.py`). `TCB_FILES` names the
+  individually trusted files — execution, authority/approval, privacy,
+  evidence, replay scoring, causal estimation, promotion, signing,
+  qualification tooling — and `TCB_PACKAGE_PREFIXES` makes every file
+  under `jev_ultrafast/_dream/` and `_learning/` trusted by
+  construction, so code can never be *non*-TCB inside the trusted
+  packages by accident. `check_tcb.py` (a mandatory Q0 check) fails
+  closed on missing or drifted TCB files, on TCB files absent from the
+  signed manifest, and on package members the manifest does not cover.
+- **`ExplorationPolicy` is a declared DSL, not an incidental
+  dataclass.** `_FIELD_SPECS` declares every field's type and inclusive
+  envelope once — validation, `from_dict`, `behavior_digest`, and
+  introspection via `ExplorationPolicy.schema()` all derive from it.
+  Type violations (a string or bool where an integer is declared, a
+  non-dict payload) are declared `ValueError` rejections, never leaked
+  `TypeError`s; the envelopes themselves are unchanged.
+- **Mutation is structural as well as scalar.** `mutate_policies` still
+  walks each knob bidirectionally, and now also emits envelope-boundary
+  probes, joint moves of coupled knob groups (patience, kind budgets,
+  selectivity), single-knob ablations back to the class default, and
+  knock-outs zeroing each kind prior — every candidate still inside the
+  declared DSL, still deduplicated by `behavior_digest`.
+- **The promotion lifecycle is an explicit state machine**
+  (`POLICY_STATES`, `POLICY_TRANSITIONS`). Records carry a declared
+  `status` — `staged`, `active`, `suspended`, `retired` — every
+  transition walks the declared edge table (`_assert_transition`), and a
+  record whose declared status contradicts its slot or flags fails
+  closed at load even without trust keys. Idempotent self-loops keep
+  re-suspend and re-resume race-safe; records written before the field
+  existed derive status from slot at load.
+- **Health monitoring sees the crash matrix.** `CanaryMetrics` gains
+  `abandoned_runs` (starts that never produced a measured outcome) and
+  `crash_runs` (the candidate-attributable subset — browser crashes,
+  agent exceptions, indeterminate executions), computed under exactly
+  the promotion-path membership filter. `HealthGate` checks attrition
+  *before* task sufficiency — a policy dying on every start can no
+  longer read as "insufficient data" — and now monitors the same
+  dimensions the promotion gate measured: failure-rate drift,
+  zero-success collapse, and latency/action/token regressions, on top of
+  the existing success and risk monitors. Older canary blocks rebuild
+  with zero defaults and stay verifiable.
+
+### browser coverage: frames, shadow DOM, tabs, keyboard scroll, upload
+
+The observation/execution loop grew the five capabilities the baseline
+called out, each under the same authority invariants rather than beside
+them:
+
+- **Same-origin frames and open shadow roots are traversed.** The
+  snapshot walks every reachable document (depth/breadth caps bound the
+  walk); elements inside them get the same node identity, guard
+  recording, page-key membership (re-queried *live* on every guard call
+  — a mid-press appended input still invalidates), effect context, and
+  text inclusion as top-document controls. Hit-tests run in the
+  element's own document *and* the top document through `viewRect`
+  frame-chain translation, so an overlay in either document is a
+  `covered` rejection; `ownerDocument` scoping fixes focus/selection/
+  `execCommand` for frame fills and `aria-labelledby` for shadow
+  scopes. Cross-origin frames are counted (`unreachable_frames`) and
+  never traversed; closed shadow roots remain indistinguishable from
+  "no shadow" — honest gaps, not silent ones.
+- **Popup/new-tab ownership.** `Browser` tracks the owned tab cluster
+  (targets whose opener chain leads back to the session, transitively).
+  `observe()` adopts the newest owned tab — the page a click produced is
+  the page the user sees — and falls back to the surviving opener when a
+  popup closes; `close()` tears down the whole cluster. `act()` never
+  syncs: a decision always executes on the tab it was made on.
+- **Keyboard scroll.** Whitelisted scroll keys (PageDown/PageUp/Home/End)
+  dispatch through real CDP key events after an editable-focus check
+  that descends the frame chain — a scroll key landing in a field would
+  edit, so it refuses as stale instead. Non-whitelisted keys classify
+  `unknown_commit` and gate like any unclassified commit.
+- **Nested scroll containers.** Scrollable elements holding actionable
+  content earn guarded `scroll` node actions executed by in-world
+  `scrollBy` inside the same atomic validate-and-mutate turn as
+  click/fill — no physical input to spoof, no fixed wheel coordinate to
+  miss the inner scroller.
+- **File upload through an operator allowlist.** File inputs are
+  offered as `upload` actions; `Agent(uploads=[...])` / `JEV_UPLOADS`
+  declares the attachable set (validated as real regular files at
+  construction, ≤32, deduplicated). `UPLOAD` targets carry
+  `element:file_index` like select options — the model names a declared
+  basename, never a path — and dispatch resolves the index server-side,
+  revalidates page and guard in-world, then sets `input.files` through
+  `DOM.setFileInputFiles`. It is non-transactional by construction
+  (there is no in-world setter), so strict profile refuses declared
+  uploads outright, a lost acknowledgement is `IndeterminateMutation`,
+  and the approval digest binds path+size.
+
+## v0.9.2
+
+Three workstreams shipped together as v0.9.2 (the release cut in
+`f59f2b5`); they are kept as separate subsections rather than separate
+version headings — the `v0.9.2` label is unique to this release.
+
+### qualification correctness
 
 A third-pass audit went after scientific-method defects rather than authority
 defects: the executor held, but several places the evidence could not carry
@@ -210,7 +349,7 @@ the claims being made on it. All ten recommendations implemented:
   `model.py`. `.env.example` documents `JEV_MODEL_ROUTING`,
   `JEV_ALLOW_INSECURE_TRANSPORT`, and `JEV_INPUT_GUARANTEE`.
 
-## v0.9.2 — audit remediation
+### audit remediation
 
 A second-pass audit found four defects that mattered precisely because everything else was already tight: none of them let the model or learner self-authorize, but each one stretched a claim the evidence could not fully carry.
 
@@ -224,7 +363,7 @@ A second-pass audit found four defects that mattered precisely because everythin
 - **`scripts/update_manifest.py` is the manifest's canonical generator.** `MANIFEST.sha256` was previously regenerated by hand; the script covers tracked plus untracked-non-ignored files in a worktree (a not-yet-staged release file can no longer be silently dropped), falls back to the manifest's own file list in packaged trees without `.git`, and `--check` is the portable byte-exact equivalent of `sha256sum -c` for hosts without coreutils.
 - **Qualification volume executed.** The Monte-Carlo grid ran at the full 100,000 sequences/point (false-beneficial ≤0.02% under every null; multiplicity probe shows 0/2000 sequences with a false `beneficial` at 100 simultaneous null divergences); the evidence store was driven to 1.57M events under two concurrent writers with a clean verify; `scripts/crash_check.py` adds a SIGKILL-during-append recovery probe (30 kills, every post-crash state verified); and the live guard suite reaches 47 checks — adding fill-onchange navigation, document.write teardown during fill/select, onpointerdown navigation, native form-submit navigation, history.replaceState, and a continuous-DOM-churn TOCTOU block that produced 25 correct-target clicks with zero wrong-target mutations.
 
-## v0.9.2 — qualification volume
+### qualification volume
 
 - **`scripts/race_check.py`** runs the interrupted-mutation loop at volume (1,000 iterations: 1000 executed, zero stale) and the TOCTOU continuous-churn loop at 10,000 iterations (4,890 correct-target, 5,110 rejected, zero wrong-target mutations).
 - **`scripts/crash_check.py`** is the kill-during-write probe; **`scripts/bench.py`** captures the §50 percentile baselines; **`scripts/env_digest.py`** emits the §3 environment digest (OS/kernel/Python/Node/Chrome/commit/tree/lock/suite).

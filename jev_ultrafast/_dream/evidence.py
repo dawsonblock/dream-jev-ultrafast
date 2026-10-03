@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 
+from ..privacy import signed_evidence_required
 from ..signing import ANCHOR_DOMAIN, EvidenceSigner, verify_keys_from_env, verify_signature
 from .common import (
     SCHEMA_VERSION,
@@ -73,7 +74,12 @@ class ExperienceStore:
         self.verify_keys = keys
         # Single-key form retained for callers inspecting configuration.
         self.verify_key = next(iter(keys)) if len(keys) == 1 else None
-        self.require_signatures = bool(require_signatures or os.environ.get("JEV_REQUIRE_SIGNED_EVIDENCE"))
+        # require_signatures is the explicit knob; JEV_REQUIRE_SIGNED_EVIDENCE
+        # opts in via the environment; JEV_SECURITY_PROFILE=strict implies it
+        # — a hardened posture cannot consume unsigned evidence as provenance.
+        self.require_signatures = bool(
+            require_signatures or signed_evidence_required()
+        )
 
     @staticmethod
     def _event_hash(payload: dict) -> str:

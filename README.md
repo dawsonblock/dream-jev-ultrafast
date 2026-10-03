@@ -123,6 +123,8 @@ The shim binds `127.0.0.1` and applies the demo server's request hardening (Host
 
 `JEV_INPUT_GUARANTEE=trusted` (or `Agent(input_guarantee="trusted")`) routes clicks/fills through the real-CDP-input path for sites that ignore synthetic `isTrusted=false` events. It is a declaration, not a fallback: a silent no-op synthetic click cannot be distinguished from one that landed, so the system escalates automatically only when the atomic path provably did not mutate.
 
+`JEV_SECURITY_PROFILE` bounds how the security knobs compose. `standard` (the default) is the status quo. `strict` is the hardened posture: `JEV_MODEL_ROUTING=public` and `JEV_MODEL_PRIVACY=off` are refused under any routing level, `JEV_ALLOW_INSECURE_TRANSPORT` fails closed even where it would apply, `trusted` input guarantee is refused (atomic execution only), the `JEV_ALLOW_UNBOUND_METRICS` promotion escape hatch stays closed, and signed evidence is required as if `JEV_REQUIRE_SIGNED_EVIDENCE=1`. A knob weakening below the declared profile fails closed naming the profile — it is never silently ignored; use `standard` explicitly to keep a weakening flag.
+
 ## Use the library
 
 ```python
@@ -255,7 +257,7 @@ The bundled **7,073 ms** Google Flights video and paired performance artifacts w
 
 In six alternating runs with identical models and settings, both versions passed **3/3**; median task time went **9.450 s → 7.092 s** (−25%) and median browser protocol calls **1,092 → 101**. Three repeats of one task on one profile — not a general reliability benchmark. The same policy opened the requested Wikipedia article in **2.798 s** and passed a local hotel search/filter in **1.896 s**. Runs, failures, source hashes, and measurement boundaries are in [performance.md](docs/performance.md).
 
-A `DONE` choice is `claimed_done` unless a caller-supplied verifier passes. The DOM reader handles common HTML/ARIA controls — shadow roots, frames, canvas, uploads, pop-ups, nested scrolling, and multi-select widgets are out of scope. DREAM-Jev is an empirical replay system, not a latent world model: learned priors prioritize among empirically evaluated candidates and can never count as qualification evidence. The default canary thresholds are a deployment gate, not statistical proof — raise task count and diversity for your domain.
+A `DONE` choice is `claimed_done` unless a caller-supplied verifier passes. The DOM reader handles common HTML/ARIA controls plus same-origin frames, open shadow roots, nested scroll containers, keyboard scroll, allowlisted file upload (`Agent(uploads=[...])` / `JEV_UPLOADS`), and popup adoption — cross-origin frames, closed shadow roots, canvas, browser dialogs, drag/drop, arbitrary keyboard widgets, and multi-select remain out of scope. DREAM-Jev is an empirical replay system, not a latent world model: learned priors prioritize among empirically evaluated candidates and can never count as qualification evidence. The default canary thresholds are a deployment gate, not statistical proof — raise task count and diversity for your domain.
 
 ## Development
 

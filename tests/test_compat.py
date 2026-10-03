@@ -104,13 +104,15 @@ def test_policy_and_mutation_digests_unchanged():
     assert dream.ExplorationPolicy().digest == (
         "aae1c8f45eb2e7c2e5f1a1dd6102615eb25b69c244d28bea7141181b0cd62226"
     )
+    # The scalar candidates still lead — Phase 19 appends structural
+    # moves after them, so the count and tail evolve by design.
     digests = [m.digest for m in dream.mutate_policies(dream.ExplorationPolicy())]
-    assert len(digests) == 52
+    assert len(digests) == 73
     assert digests[0] == (
         "828e8d89efb0a08a89f622dad00f2b4678e9e9c6e85c7b26dbdef41547dcad94"
     )
     assert digests[-1] == (
-        "424ad83c9d47f646b4291677db1d6a4e9cb21cbada0d7964a2763b20c4ebed9e"
+        "4e426b56863aca83c12495c373ea13f83ba8f715bc4bf043ac12a3cbe34ec1f1"
     )
 
 
@@ -149,3 +151,32 @@ def test_causal_serialization_and_statistics_unchanged():
     assert dreamlearn._bernoulli_kl(0.3, 0.7) == 0.33891914415488134
     assert dreamlearn._wilson_interval(0.5, 40) == (
         0.35199278797099753, 0.6480072120290025)
+
+
+def test_package_import_does_not_pull_browser_stack():
+    """Phase 10: importing the package must not require a browser runtime.
+
+    ``Agent``/``Browser`` bind lazily — the learning and dream layers stay
+    usable on hosts with no CDP stack. Verified in a subprocess so the
+    suite's own imports cannot contaminate module state.
+    """
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, jev_ultrafast; "
+            "assert 'jev_ultrafast.browser' not in sys.modules; "
+            "assert 'jev_ultrafast.agent' not in sys.modules; "
+            "assert 'browser_harness' not in sys.modules; "
+            "assert 'Browser' in dir(jev_ultrafast); "
+            "import jev_ultrafast.dreamlearn, jev_ultrafast.dream; "
+            "from jev_ultrafast import Agent, Browser; "
+            "assert Agent.__name__ == 'Agent'",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr

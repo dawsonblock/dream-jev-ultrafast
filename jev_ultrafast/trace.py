@@ -66,7 +66,7 @@ class DreamTraceRecorder:
             **event,
         })
 
-    def start(self, page: dict, policy):
+    def start(self, page: dict, policy, *, upload_count: int = 0):
         if self.started:
             return
         self.started = True
@@ -79,6 +79,12 @@ class DreamTraceRecorder:
             "policy_digest": policy.digest if policy else None,
             "task_family": self.task_family,
             "instance_id": self.instance_id,
+            # Size of the operator-declared upload allowlist for this run.
+            # Upload actions exist in the observed catalogue whenever the
+            # page has a file input but only enter the *offered* catalogue
+            # when files were declared — replay re-derives the offered set
+            # from this recorded availability, never from a guess.
+            "upload_count": max(0, int(upload_count)),
         })
 
     def transition(

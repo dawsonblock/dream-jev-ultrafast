@@ -2189,3 +2189,44 @@ def test_resolve_reports_preregistration_status():
     )
     assert legacy_estimate["effect_status"] == estimate["effect_status"]
     assert legacy_estimate["hypothesis_registered"] is False
+
+
+def test_declaration_flood_dilutes_never_concentrates_alpha():
+    """Phase 23: an adversary cannot manufacture significance by flooding
+    the registered family — each junk declaration shrinks the per-
+    comparison alpha share, so a marginal effect degrades to unresolved
+    rather than inheriting authority."""
+    observed = _trials("candidate", 14, 11, "c", task_family="f", site="h",
+                       proposal_effect="navigate")
+    observed += _trials("control", 14, 6, "k", task_family="f", site="h",
+                        proposal_effect="navigate")
+    alone = CounterfactualTrials.fit(list(observed))
+    alone_entry = next(iter(alone.estimate().values()))
+    alone_status = alone_entry["effect_status"]
+
+    flooded_events = list(observed)
+    for index in range(400):
+        # Junk declarations: every distinct context joins the registered
+        # family even though none can ever form a cell — the run is
+        # censored before any transition.
+        meta = _trial_meta(
+            f"junk{index}", "candidate", task_family=f"junkfam{index}",
+            site=f"junksite{index}", proposal_effect="navigate")
+        flooded_events += [
+            {"event": "run_started", "run_id": f"j{index}",
+             "task_key": "t", "goal": "g", "task_family": f"junkfam{index}"},
+            {"event": "experiment_assigned", "run_id": f"j{index}",
+             "task_key": "t", "experiment": meta},
+            {"event": "run_finished", "run_id": f"j{index}",
+             "task_key": "t", "status": "aborted",
+             "reason": "operator_cancel"},
+        ]
+    flooded = CounterfactualTrials.fit(flooded_events)
+    flooded_entry = next(iter(flooded.estimate().values()))
+    assert flooded_entry["hypothesis_count"] == 401
+    assert alone_entry["hypothesis_count"] == 1
+    # The dilution direction is one-way: flooding can only make
+    # classification *harder* to pass, never easier.
+    order = {"insufficient_data": 0, "unresolved": 1,
+             "beneficial": 2, "harmful": 2}
+    assert order[flooded_entry["effect_status"]] <= order[alone_status]

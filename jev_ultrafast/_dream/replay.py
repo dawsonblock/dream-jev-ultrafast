@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     'RecordedTransition',
+    'REPLAY_VERDICTS',
     'ReplayResult',
     'ReplaySimulator',
     'ReplayWorld',
@@ -24,6 +25,25 @@ __all__ = [
     'split_manifest_digest',
     'split_worlds',
 ]
+
+
+# Per-world replay verdicts (Phase 13): exactly one per evaluated world,
+# never conflated. ``verified_success`` — the recorded terminal was
+# verifier-confirmed done; ``measured_terminal`` — a recorded terminal was
+# reached but was not verified success (the world's measured ending, kept
+# distinct from replay-imposed stops); ``coverage_miss`` — the candidate
+# policy's offered catalogue excluded the action the recording actually
+# took, so the counterfactual is *truncated evidence*, not a measured
+# failure; ``blocked`` — replay's own no-progress window fired;
+# ``inconclusive`` — the trajectory ended before any terminal event, so
+# replay ran out of evidence entirely.
+REPLAY_VERDICTS = (
+    "verified_success",
+    "measured_terminal",
+    "coverage_miss",
+    "blocked",
+    "inconclusive",
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +72,11 @@ class RecordedTransition:
     selected_propensity: float | None = None
     experiment: dict | None = None
     causal_override: dict | None = None
+    # Whether the run declared an upload allowlist (recorded on run_started).
+    # Upload actions sit in the observed catalogue whenever the page has a
+    # file input; they were only offerable — and are only re-offerable —
+    # when this is true.
+    uploads_declared: bool = False
 
 
 @dataclass
@@ -103,6 +128,11 @@ class ReplayWorld:
             run_policy = None
             if start.get("policy") is not None:
                 run_policy = ExplorationPolicy.from_dict(start["policy"])
+            # The run's recorded upload availability — observed evidence, not
+            # something replay may infer. Traces without it predate upload
+            # support and can carry no upload candidates, so the default of
+            # "not declared" is fail-closed, not a guess.
+            uploads_declared = bool(start.get("upload_count"))
             run_tcbs = {e.get("tcb_version") for e in run_events}
             if len(run_tcbs) != 1:
                 raise ValueError(f"Run {run_id} crosses DREAM TCB versions")
@@ -154,7 +184,9 @@ class ReplayWorld:
                     # The recorded policy must be able to re-derive the catalogue
                     # the model was offered from the observed catalogue, or the
                     # trace evidence is inconsistent.
-                    expected_offered = ReplaySimulator._retained_candidates(run_policy, event_candidates)
+                    expected_offered = ReplaySimulator._retained_candidates(
+                        run_policy, event_candidates, uploads_declared=uploads_declared
+                    )
                     if stored_offered is not None and candidate_catalog_digest(expected_offered) != stored_offered:
                         raise ValueError(f"Run {run_id} has an offered catalogue digest mismatch")
                     if event.get("offered_count") is not None and int(event["offered_count"]) != len(
@@ -212,6 +244,7 @@ class ReplayWorld:
                         else len(event_candidates)
                     ),
                     experiment=event.get("experiment"),
+                    uploads_declared=uploads_declared,
                     causal_override=event.get("causal_override"),
                 )
                 transitions.append(tr)
@@ -303,10 +336,16 @@ class ReplaySimulator:
         step_limit = min(policy.max_actions, max_steps or policy.max_actions)
         no_progress = 0
         for step_index, transition in enumerate(world.trajectory[:step_limit]):
-            offered = self._retained_candidates(policy, transition.candidate_actions)
+            offered = self._retained_candidates(
+                policy, transition.candidate_actions,
+                uploads_declared=transition.uploads_declared,
+            )
             summary["offered_candidates"] += len(offered)
             if transition.selected_id not in {item["id"] for item in offered}:
                 summary["coverage_misses"] += 1
+                # Truncated evidence: the policy cannot even replay the
+                # recorded path — not a measured failure of the policy.
+                summary["verdict"] = "coverage_miss"
                 break
             summary["actions"] += 1
             summary["model_calls"] += transition.model_calls
@@ -598,27 +637,43 @@ class ReplaySimulator:
                 summary["status"] = transition.terminal
                 summary["verified"] = transition.verified
                 summary["success"] = transition.terminal == "done" and transition.verified
+                summary["verdict"] = (
+                    "verified_success" if summary["success"] else "measured_terminal"
+                )
                 break
             if no_progress >= policy.no_progress_window:
                 summary["status"] = "blocked"
+                summary["verdict"] = "blocked"
                 break
         summary["covered_steps"] = summary["actions"]
         return summary
 
     @staticmethod
-    def _retained_candidates(policy: ExplorationPolicy, candidates: Iterable[dict]) -> list[dict]:
+    def _retained_candidates(
+        policy: ExplorationPolicy,
+        candidates: Iterable[dict],
+        *,
+        uploads_declared: bool = False,
+    ) -> list[dict]:
         """Re-derive the offered catalogue; must match model.candidate_actions.
 
         Stored ``goal_overlap`` is computed on sanitized labels, as is live
         scoring, so the replayed catalogue is identical to what the model was
         offered online. Candidates lacking ``node`` metadata (older schema)
         are treated as unique nodes so ``duplicate_node_cap`` cannot merge them.
+        ``uploads_declared`` is the run's recorded allowlist state: an upload
+        target is only offerable when the operator declared files — replay
+        must apply the same filter it cannot otherwise reconstruct.
         """
         candidates = [dict(c) for c in candidates if c.get("id")]
-        controls = [c for c in candidates if c.get("kind") not in {"click", "fill", "select"}]
+        controls = [c for c in candidates if c.get("kind") not in {"click", "fill", "select", "upload"}]
         regular = []
         for index, candidate in enumerate(candidates):
-            if candidate.get("kind") not in {"click", "fill", "select"}:
+            if candidate.get("kind") not in {"click", "fill", "select", "upload"}:
+                continue
+            # Mirrors the live upload_names filter: observed evidence, never
+            # offerable to the model without declared files.
+            if candidate.get("kind") == "upload" and not uploads_declared:
                 continue
             overlap = max(0, int(candidate.get("goal_overlap", 0)))
             if overlap < policy.min_goal_overlap:
@@ -640,7 +695,13 @@ class ReplaySimulator:
             return ("n", node) if node is not None else ("~", index)
 
         ranked = sorted(regular, key=score, reverse=True)
-        quotas = {"click": policy.click_quota, "fill": policy.fill_quota, "select": policy.select_quota}
+        quotas = {
+            "click": policy.click_quota,
+            "fill": policy.fill_quota,
+            "select": policy.select_quota,
+            # Mirrors live quota_for("upload") — the whole regular budget.
+            "upload": policy.model_action_limit,
+        }
         regular_budget = max(0, policy.model_action_limit - len(controls))
         counts = {kind: 0 for kind in quotas}
         node_counts: dict = {}
@@ -693,6 +754,9 @@ class ReplaySimulator:
             "risk_events": 0,
             "coverage_misses": coverage_miss,
             "covered_steps": 0,
+            # Default verdict: a world that ends without any explicit exit
+            # ran out of recorded evidence — inconclusive, never a failure.
+            "verdict": "coverage_miss" if coverage_miss else "inconclusive",
             "est_tokens": 0.0,
             "est_latency_ms": 0.0,
             "predicted_change": 0.0,
@@ -723,6 +787,13 @@ class ReplaySimulator:
         misses = sum(s["coverage_misses"] for s in summaries)
         potential = actions + misses
         coverage = actions / potential if potential else (1.0 if worlds else 0.0)
+        # Verdict tally (Phase 13): every world reports exactly one verdict —
+        # truncated evidence (coverage_miss / inconclusive) is counted apart
+        # from measured endings, never silently read as failure.
+        verdicts = {v: 0 for v in REPLAY_VERDICTS}
+        for s in summaries:
+            verdict = s.get("verdict")
+            verdicts[verdict if verdict in verdicts else "inconclusive"] += 1
 
         def score(token_total, latency_total):
             return (
@@ -763,6 +834,7 @@ class ReplaySimulator:
             estimated_tokens=int(round(est_tokens)),
             estimated_latency_ms=int(round(est_latency)),
             estimated_score=estimated_score,
+            verdicts=verdicts,
         )
 
 

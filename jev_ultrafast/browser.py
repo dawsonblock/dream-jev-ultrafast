@@ -49,12 +49,17 @@ class Browser:
         self.session = None
         self.world_context = None
         self.world_frame = None
+        # Owned tab lineage: the created target plus every popup whose opener
+        # chain leads back to it (transitively). observe() adopts the newest
+        # owned tab — the page a click produced is the page the user now sees —
+        # and falls back to the surviving opener when a popup closes. act()
+        # never syncs: a decision always executes on the tab it was made on.
+        self.tab_order = []
         try:
             ensure_daemon()
-            self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
-            self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
-            self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
-            self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+            target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
+            self.tab_order = [target]
+            self._attach(target)
             self.call("Page.navigate", url=url)
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
@@ -65,6 +70,37 @@ class Browser:
         except Exception:
             self.close()
             raise
+
+    def _attach(self, target):
+        self.target = target
+        self.session = cdp("Target.attachToTarget", targetId=target, flatten=True)["sessionId"]
+        self.call("Emulation.setDeviceMetricsOverride", width=1120, height=780, deviceScaleFactor=1, mobile=False)
+        self.call("Emulation.setFocusEmulationEnabled", enabled=True)
+        self.world_context = None
+        self.world_frame = None
+
+    def _sync_targets(self):
+        """Adopt the newest owned tab, or fall back to a surviving opener."""
+        infos = (cdp("Target.getTargets") or {}).get("targetInfos") or []
+        pages = {i["targetId"]: i for i in infos if i.get("type") == "page" and i.get("targetId")}
+        owned = set(self.tab_order)
+        order = [t for t in self.tab_order if t in pages]
+        # Popups claim ownership transitively: a popup opened by our popup is
+        # still part of this session's tab cluster.
+        changed = True
+        while changed:
+            changed = False
+            for info in infos:
+                tid = info.get("targetId")
+                if tid in pages and tid not in owned and info.get("openerId") in owned:
+                    owned.add(tid)
+                    order.append(tid)
+                    changed = True
+        self.tab_order = order
+        if not order:
+            raise BrowserError("Every owned tab is closed")
+        if order[-1] != self.target:
+            self._attach(order[-1])
 
     def call(self, method, **params):
         if not self.session:
@@ -128,6 +164,11 @@ class Browser:
         )
 
     def observe(self, screenshot=True):
+        # Tab ownership lives at the observe boundary only: a click that opened
+        # a popup means the *next* perception must describe the page the user
+        # now sees, while a pending decision always executes on the tab it was
+        # made on.
+        self._sync_targets()
         if getattr(self, "after_input", None):
             action, self.after_input = self.after_input, None
             try:
@@ -142,7 +183,9 @@ class Browser:
                         if (stopped) return;
                         const ids=(field?.getAttribute('aria-controls')||field?.getAttribute('aria-owns')||'')
                           .split(/\\s+/).filter(Boolean);
-                        const roots=ids.length ? ids.map(id=>document.getElementById(id)).filter(Boolean) : [document];
+                        const scope=(field&&field.getRootNode&&field.getRootNode())||document;
+                        const byId=id=>scope.getElementById?scope.getElementById(id):null;
+                        const roots=ids.length ? ids.map(byId).filter(Boolean) : [scope];
                         const options=roots.flatMap(root=>[...root.querySelectorAll('[role="option"]')]);
                         if (++frames>=2 && (!autocomplete || options.some(e=>{
                           const r=e.getBoundingClientRect();
@@ -177,10 +220,8 @@ class Browser:
 
     def fresh(self, page, action=None):
         try:
-            if action is not None and action.get("kind") in {"click", "select", "fill"}:
+            if action is not None and type(action.get("node")) is int and action.get("kind") != "wait":
                 node = action.get("node")
-                if type(node) is not int:
-                    return False
                 current = self._isolated(
                     "(() => { const c=globalThis.__jevFastV2; "
                     f"return c ? [c.pageKey(),c.guard(c.nodes.get({node}))] : null; }})()"
@@ -190,7 +231,7 @@ class Browser:
         except StalePage:
             return False
 
-    def act(self, action, page, text=None, guarantee=None):
+    def act(self, action, page, text=None, guarantee=None, file_path=None):
         if not self.fresh(page, action):
             raise StalePage("Page changed since this decision. Observe again.")
         if action["kind"] == "wait":
@@ -210,6 +251,7 @@ class Browser:
                 "expected": expected,
                 "text": text,
                 "guarantee": guarantee or "atomic",
+                "file_path": file_path,
             }
         )
         self.after_input = action if action["kind"] != "wait" else None
@@ -218,16 +260,18 @@ class Browser:
     def close(self):
         # Best-effort teardown: a dead daemon must not mask the error that
         # triggered cleanup or leak through __exit__/__init__ failure paths.
-        if self.target:
+        # Every owned tab closes — a popup we adopted is still ours.
+        targets = list(dict.fromkeys(getattr(self, "tab_order", None) or ([self.target] if self.target else [])))
+        for target in targets:
             try:
-                cdp("Target.closeTarget", targetId=self.target)
+                cdp("Target.closeTarget", targetId=target)
             except Exception:
                 pass
-            finally:
-                self.target = None
-                self.session = None
-                self.world_context = None
-                self.world_frame = None
+        self.target = None
+        self.session = None
+        self.world_context = None
+        self.world_frame = None
+        self.tab_order = []
 
 
 def fingerprint(state):
@@ -282,11 +326,85 @@ def browser_operation(request):
             raise StalePage(f"Document changed during evaluation: {reason.splitlines()[0][:200]}")
         return result.get("result", {}).get("value")
 
+    # Keyboard-scroll keys: a bounded whitelist executed through real CDP key
+    # events. Anything outside this set is not a scroll — and never offered.
+    KEY_VK = {"PageDown": 34, "PageUp": 33, "End": 35, "Home": 36}
+
     if operation == "act":
         action = request["action"]
         kind = action["kind"]
-        if kind == "scroll":
+        if kind == "scroll" and action.get("node") is None:
             call("Input.dispatchMouseEvent", type="mouseWheel", x=550, y=650, deltaX=0, deltaY=action["delta"])
+        elif kind == "key":
+            key = action.get("key")
+            if key not in KEY_VK:
+                raise ValueError("Unsupported key action")
+            # A scroll key landing on editable focus moves the caret or changes
+            # a value — an edit, not a scroll. Focus can live inside a frame's
+            # document, so descend the activeElement chain through every
+            # same-origin frame before dispatching.
+            editable_focus = evaluate(
+                "(()=>{let d=document,a=d.activeElement,depth=0;"
+                "while(a&&(a.tagName==='IFRAME'||a.tagName==='FRAME')&&depth++<8){"
+                "try{d=a.contentDocument;if(!d)break;a=d.activeElement;}catch(_){break;}}"
+                "return !!(a&&(a.isContentEditable||/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)));})()"
+            )
+            if editable_focus:
+                raise StalePage(
+                    "An editable element holds keyboard focus; a scroll key "
+                    "would edit, not scroll. Observe again."
+                )
+            vk = KEY_VK[key]
+            call("Input.dispatchKeyEvent", type="rawKeyDown", key=key, code=key,
+                 windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk)
+            call("Input.dispatchKeyEvent", type="keyUp", key=key, code=key,
+                 windowsVirtualKeyCode=vk, nativeVirtualKeyCode=vk)
+        elif kind == "upload":
+            if type(action.get("node")) is not int:
+                raise ValueError("Invalid observed node")
+            expected = request.get("expected")
+            if not expected or expected.get("guard") is None:
+                raise StalePage("Missing execution guard. Observe again.")
+            file_path = request.get("file_path")
+            if not file_path:
+                raise ValueError("upload requires an operator-resolved file path")
+            # Upload is non-transactional by construction: input.files can only
+            # be set through DOM.setFileInputFiles (page JS has no in-world
+            # setter), so the guard runs in-world immediately before the
+            # browser-level mutation — the same trust class as trusted input,
+            # under whichever guarantee was configured.
+            probe = (
+                """((input) => {
+                  const {action,expected}=input, c=globalThis.__jevFastV2;
+                  const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+                  if (!c || !same(c.pageKey(),expected.page_key)) return null;
+                  const e=c.nodes.get(action.node);
+                  if (!e?.isConnected || !same(c.guard(e),expected.guard)) return null;
+                  if (e.tagName!=='INPUT' || String(e.type).toLowerCase()!=='file' ||
+                      e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]')) return null;
+                  return e;
+                })(""" + json.dumps({"action": action, "expected": expected}) + ")"
+            )
+            try:
+                response = call("Runtime.evaluate", expression=probe,
+                                contextId=context_id, returnByValue=False)
+            except RuntimeError as exc:
+                raise StalePage("Upload target validation was interrupted. Observe again.") from exc
+            if response.get("exceptionDetails"):
+                raise StalePage("Upload target validation failed in-page. Observe again.")
+            remote = response.get("result") or {}
+            if remote.get("subtype") != "node" or not remote.get("objectId"):
+                raise StalePage("Upload target changed or is no longer a file input. Observe again.")
+            try:
+                call("DOM.setFileInputFiles", files=[file_path], objectId=remote["objectId"])
+            except RuntimeError as exc:
+                # A lost acknowledgement cannot be distinguished from an
+                # applied file list — the upload may already have crossed into
+                # the page, so the outcome is indeterminate, never retried.
+                raise IndeterminateMutation(
+                    "File-upload dispatch was not acknowledged; the outcome is "
+                    "unknown and must not be retried."
+                ) from exc
         elif kind != "wait":
             if type(action.get("node")) is not int:
                 raise ValueError("Invalid observed node")
@@ -299,6 +417,14 @@ def browser_operation(request):
             # and pre-release revalidation (needed for isTrusted-gated sites,
             # non-transactional by nature).
             guarantee = request.get("guarantee") or "atomic"
+            # Geometry note: elements may live in a same-origin frame document
+            # or shadow root. The inner hit-test runs in the element's OWN
+            # document (its rect is in that viewport); the offscreen check,
+            # outer hit-test, and returned trusted-input coordinates use
+            # viewRect's frame-chain translation into TOP viewport space —
+            # which is the coordinate space Input.dispatchMouseEvent consumes.
+            # For shadow-DOM targets elementFromPoint retargets to the host, so
+            # the host counts as the element's own surface.
             guarded = (
                 """((input) => {
                   const {action,expected,guarantee,text}=input, c=globalThis.__jevFastV2;
@@ -310,11 +436,27 @@ def browser_operation(request):
                       !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return {error:'unavailable'};
                   if (action.kind==='fill' && (e.readOnly || e.getAttribute('aria-readonly')==='true'))
                     return {error:'readonly'};
-                  const r=e.getBoundingClientRect(), x=r.x+r.width/2, y=r.y+r.height/2;
+                  const doc=e.ownerDocument||document, win=doc.defaultView||window;
+                  const root=e.getRootNode&&e.getRootNode(), host=root&&root.host?root.host:null;
+                  const r=e.getBoundingClientRect(), rx=r.x+r.width/2, ry=r.y+r.height/2;
+                  const v=typeof c.viewRect==='function'?c.viewRect(e):{x:r.x,y:r.y,w:r.width,h:r.height};
+                  const x=v.x+v.w/2, y=v.y+v.h/2;
                   if (!r.width || !r.height || x<0 || y<0 || x>=innerWidth || y>=innerHeight)
                     return {error:'offscreen'};
-                  const hit=document.elementFromPoint(x,y);
-                  if (!hit || !(hit===e || e.contains(hit))) return {error:'covered'};
+                  const hit=doc.elementFromPoint(rx,ry);
+                  if (!hit || !(hit===e || e.contains(hit) || (host && (hit===host || host.contains(hit)))))
+                    return {error:'covered'};
+                  let frame=null, w=win;
+                  while (w && w!==w.parent) { frame=w.frameElement; w=w.parent; }
+                  if (frame) {
+                    const outer=document.elementFromPoint(x,y);
+                    if (!outer || !(outer===frame || frame.contains(outer))) return {error:'covered'};
+                  }
+                  if (action.kind==='scroll') {
+                    if (typeof e.scrollBy!=='function') return {error:'unsupported'};
+                    e.scrollBy({top:Number(action.delta)||0,left:0,behavior:'instant'});
+                    return {x,y,scrolled:true,scrollTop:e.scrollTop};
+                  }
                   if (action.kind==='select') {
                     if (e.tagName!=='SELECT' || e.multiple || !Number.isInteger(action.option_index))
                       return {error:'unsupported-select'};
@@ -335,18 +477,18 @@ def browser_operation(request):
                       return {x,y,clicked:true};
                     }
                     if (action.kind==='fill') {
-                      let active=document.activeElement;
+                      let active=doc.activeElement;
                       if (!(active && (active===e || e.contains(active)))) {
                         if (typeof e.focus !== 'function') return {error:'unsupported'};
-                        e.focus(); active=document.activeElement;
+                        e.focus(); active=doc.activeElement;
                       }
                       if (!(active && (active===e || e.contains(active)))) return {error:'focus'};
                       try {
                         if ('value' in e && e.setSelectionRange) e.setSelectionRange(0, String(e.value).length);
-                        else { const s=getSelection(), rg=document.createRange();
+                        else { const s=win.getSelection(), rg=doc.createRange();
                                rg.selectNodeContents(e); s.removeAllRanges(); s.addRange(rg); }
                       } catch (_) {}
-                      if (!document.execCommand || !document.execCommand('insertText', false, text))
+                      if (!doc.execCommand || !doc.execCommand('insertText', false, text))
                         return {error:'insert'};
                       const v='value' in e ? String(e.value) : String(e.innerText||'');
                       return {x,y,inserted:true,matched:v===text,value:v.slice(0,1024)};
@@ -360,13 +502,14 @@ def browser_operation(request):
                 "guarantee": guarantee, "text": request.get("text") or "",
             }
             # The guarded script mutates only at the end: select writes the
-            # option unconditionally; click/fill mutate under "atomic" inside
-            # the same turn. Under "trusted" the script only validates and
-            # reports coordinates — no mutation — so interruption stays a
-            # recoverable StalePage there.
+            # option and scroll runs scrollBy unconditionally — in-world
+            # execution is their only form — while click/fill mutate under
+            # "atomic" inside the same turn. Under "trusted" a click/fill
+            # script only validates and reports coordinates — no mutation —
+            # so interruption stays a recoverable StalePage there.
             target = evaluate(
                 guarded + json.dumps(payload) + ")",
-                mutating=kind == "select" or guarantee == "atomic",
+                mutating=kind in ("select", "scroll") or guarantee == "atomic",
             )
             if not isinstance(target, dict) or not target or target.get("error"):
                 # Every explicit {error: ...} return is provably pre-mutation
@@ -377,7 +520,7 @@ def browser_operation(request):
                 # validation-only (trusted) call the script provably never
                 # mutated, so a missing result is just a failed check.
                 if not isinstance(target, dict) or not target.get("error"):
-                    if kind == "select" or guarantee == "atomic":
+                    if kind in ("select", "scroll") or guarantee == "atomic":
                         raise IndeterminateMutation(
                             "Dropdown execution returned no result; inspect before retrying."
                             if kind == "select"
@@ -390,11 +533,23 @@ def browser_operation(request):
                     # Escalate to the trusted-input path for this element.
                     guarantee = "trusted"
                     payload["guarantee"] = "trusted"
-                    target = evaluate(guarded + json.dumps(payload) + ")")
+                    target = evaluate(
+                        guarded + json.dumps(payload) + ")",
+                        mutating=kind == "scroll",
+                    )
                     if not isinstance(target, dict) or not target or target.get("error"):
                         raise StalePage("Target changed, became unavailable, or is covered. Observe again.")
                 else:
                     raise StalePage("Target changed, became unavailable, or is covered. Observe again.")
+            elif kind == "scroll":
+                # scrollBy already ran inside the guarded turn — an element
+                # scroll has no physical-input form, so the in-world scroll IS
+                # the execution under either guarantee, the same trust class as
+                # upload. It must never reach the trusted click dispatch below:
+                # an OBSERVE-classified scroll is not a press+release.
+                if target.get("scrolled"):
+                    return {"executed": action["id"]}
+                raise StalePage("Scroll execution returned no result. Observe again.")
             elif kind != "select" and guarantee == "atomic":
                 if target.get("clicked"):
                     return {"executed": action["id"]}
@@ -407,7 +562,7 @@ def browser_operation(request):
                         )
                     return {"executed": action["id"]}
                 raise StalePage("Atomic execution returned no mutation result. Observe again.")
-            if kind != "select" and guarantee == "trusted":
+            if kind not in ("select", "scroll") and guarantee == "trusted":
                 x, y = target["x"], target["y"]
                 # Authority integrity: the physical input must land on the same
                 # semantic target that passed validation. Re-check page identity,
@@ -423,11 +578,20 @@ def browser_operation(request):
                       if (!e?.isConnected || !same(c.guard(e),expected.guard)) return false;
                       if (e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]') ||
                           !e.checkVisibility({checkOpacity:true,checkVisibilityCSS:true})) return false;
+                      const doc=e.ownerDocument||document;
+                      const root=e.getRootNode&&e.getRootNode(), host=root&&root.host?root.host:null;
                       const r=e.getBoundingClientRect();
-                      if (!r.width || !r.height || Math.abs(r.x+r.width/2-x)>2 || Math.abs(r.y+r.height/2-y)>2)
+                      const v=typeof c.viewRect==='function'?c.viewRect(e):{x:r.x,y:r.y};
+                      if (!r.width || !r.height || Math.abs(v.x+r.width/2-x)>2 || Math.abs(v.y+r.height/2-y)>2)
                         return false;
+                      // x,y are top-viewport coordinates: hit-test in the top
+                      // document against the outermost frame element when the
+                      // target lives inside a frame, otherwise directly.
+                      let frame=null, w=doc.defaultView;
+                      while (w && w!==w.parent) { frame=w.frameElement; w=w.parent; }
                       const hit=document.elementFromPoint(x,y);
-                      return !!(hit && (hit===e || e.contains(hit)));
+                      if (frame) return !!(hit && (hit===frame || frame.contains(hit)));
+                      return !!(hit && (hit===e || e.contains(hit) || (host && (hit===host || host.contains(hit)))));
                     })(""" + json.dumps({"action": action, "expected": expected, "x": x, "y": y}) + ")"
                 )
                 if not evaluate(precheck):
@@ -487,18 +651,19 @@ def browser_operation(request):
                           if (e.readOnly || e.getAttribute('aria-readonly')==='true' ||
                               e.matches(':disabled') || e.closest('[aria-disabled="true"],[inert]'))
                             return {error:'readonly'};
-                          let active=document.activeElement;
+                          const doc=e.ownerDocument||document, win=doc.defaultView||window;
+                          let active=doc.activeElement;
                           if (!(active && (active===e || e.contains(active)))) {
                             if (e.focus) e.focus();
-                            active=document.activeElement;
+                            active=doc.activeElement;
                           }
                           if (!(active && (active===e || e.contains(active)))) return {error:'focus'};
                           try {
                             if ('value' in e && e.setSelectionRange) e.setSelectionRange(0, String(e.value).length);
-                            else { const s=getSelection(), r=document.createRange();
+                            else { const s=win.getSelection(), r=doc.createRange();
                                    r.selectNodeContents(e); s.removeAllRanges(); s.addRange(r); }
                           } catch (_) {}
-                          if (!document.execCommand || !document.execCommand('insertText', false, text))
+                          if (!doc.execCommand || !doc.execCommand('insertText', false, text))
                             return {error:'insert'};
                           const value = 'value' in e ? String(e.value) : String(e.innerText || '');
                           return {inserted:true, matched:value===text, value:value.slice(0,1024)};

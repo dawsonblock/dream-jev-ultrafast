@@ -34,7 +34,13 @@ from .model import (
     field_text,
 )
 from .policy import DefaultActionPolicy, assess_payload, classify_effect
-from .privacy import action_goal_overlap, redact_text, sanitize_url, tokenize
+from .privacy import (
+    action_goal_overlap,
+    redact_text,
+    sanitize_url,
+    security_profile,
+    tokenize,
+)
 from .questions import MAX_STEPS
 from .signing import verify_keys_from_env
 from .trace import DreamTraceRecorder, compact_candidate
@@ -96,6 +102,35 @@ def _model_call(fn, *args, **kwargs):
     return fn(*args, **{k: v for k, v in kwargs.items() if k in params})
 
 
+def _resolve_uploads(uploads):
+    """Operator-declared upload allowlist.
+
+    The model only ever sees basenames and an index; the filesystem path is
+    resolved and validated here, at construction, never from page or model
+    input. ``JEV_UPLOADS`` (a ``os.pathsep``-separated list) supplies the same
+    set when the caller leaves the parameter unset.
+    """
+    if uploads is None:
+        raw = os.environ.get("JEV_UPLOADS", "")
+        uploads = [part for part in raw.split(os.pathsep) if part.strip()] if raw.strip() else []
+    entries, seen = [], set()
+    for item in uploads:
+        path = Path(str(item).strip()).expanduser()
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            raise ValueError(f"upload path does not exist: {item}") from None
+        if not resolved.is_file():
+            raise ValueError(f"upload path is not a regular file: {item}")
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        entries.append({"name": resolved.name, "path": str(resolved), "size": resolved.stat().st_size})
+    if len(entries) > 32:
+        raise ValueError("at most 32 upload files may be declared")
+    return entries
+
+
 class Agent:
     def __init__(
         self,
@@ -116,6 +151,7 @@ class Agent:
         experiment=None,
         experiment_verify_keys=None,
         input_guarantee=None,
+        uploads=None,
     ):
         task = goals.strip() if isinstance(goals, str) else "\n".join(goals).strip()
         if not task:
@@ -135,6 +171,25 @@ class Agent:
         if guarantee not in {"atomic", "trusted"}:
             raise ValueError(
                 "input_guarantee must be 'atomic' or 'trusted'"
+            )
+        # Evaluate unconditionally so a misspelled JEV_SECURITY_PROFILE fails
+        # closed at agent construction rather than only when trusted input
+        # happens to be requested.
+        profile = security_profile()
+        if guarantee == "trusted" and profile == "strict":
+            raise ValueError(
+                "JEV_SECURITY_PROFILE=strict refuses trusted input — only "
+                "atomic isolated-world execution is a hardened posture."
+            )
+        # The upload allowlist is operator configuration, not page data: each
+        # entry is resolved to a real regular file here so dispatch never maps
+        # model or page input onto the filesystem.
+        self.uploads = _resolve_uploads(uploads)
+        if self.uploads and profile == "strict":
+            raise ValueError(
+                "JEV_SECURITY_PROFILE=strict refuses file upload — "
+                "DOM.setFileInputFiles is a browser-mediated mutation with no "
+                "in-world transactional form."
             )
         self.input_guarantee = guarantee
         self.decision_backend = decision_backend
@@ -251,7 +306,10 @@ class Agent:
             self.record_dir.mkdir(parents=True, exist_ok=True)
             (self.record_dir / "000000.jpg").write_bytes(base64.b64decode(page["screenshot"]))
         if self.dream_recorder:
-            self.dream_recorder.start(page, self.exploration_policy)
+            self.dream_recorder.start(
+                page, self.exploration_policy,
+                upload_count=len(getattr(self, "uploads", None) or ()),
+            )
 
     def _perception(self):
         """Candidate catalogue + action space for the current page, computed once.
@@ -273,10 +331,12 @@ class Agent:
             and cache[2] is policy
         ):
             return cache[3:]
+        upload_names = [entry["name"] for entry in getattr(self, "uploads", None) or ()]
         candidates, omitted = candidate_actions(
-            page["actions"], self.state["goal"], exploration_policy=policy
+            page["actions"], self.state["goal"], exploration_policy=policy,
+            upload_names=upload_names,
         )
-        elements, targets, controls = action_space(candidates)
+        elements, targets, controls = action_space(candidates, upload_names=upload_names)
         result = (candidates, omitted, elements, targets, controls)
         self._perception_cache = (page["actions"], self.state["goal"], policy, *result)
         return result
@@ -286,7 +346,7 @@ class Agent:
         ordered_nodes = []
         for action in candidates:
             node = action.get("node")
-            if action.get("kind") in {"click", "fill", "select"} and node not in ordered_nodes:
+            if action.get("kind") in {"click", "fill", "select", "upload"} and node not in ordered_nodes:
                 ordered_nodes.append(node)
         # Annotate copies — the cached elements are shared with the model
         # request body and must never grow inspector-only keys.
@@ -305,6 +365,23 @@ class Agent:
                 "raw_action_count": self.state["page"].get("raw_action_count", len(self.state["page"]["actions"])),
             },
         }
+
+    def _resolve_upload(self, decision):
+        """Bind an UPLOAD decision target to its declared file.
+
+        UPLOAD targets carry ``element_index:file_index`` exactly like select's
+        option axis; the file index resolves strictly inside the operator
+        allowlist — the model can only name a declared file, never a path.
+        """
+        target = str((decision or {}).get("target") or "")
+        try:
+            file_index = int(target.split(":")[1]) - 1
+        except (IndexError, TypeError, ValueError):
+            raise ValueError("UPLOAD decision carries no file selection") from None
+        uploads = getattr(self, "uploads", None) or []
+        if not 0 <= file_index < len(uploads):
+            raise ValueError("UPLOAD file selection is outside the declared set")
+        return uploads[file_index]
 
     def _elapsed(self):
         if self.state.get("started_at") is None:
@@ -1073,7 +1150,7 @@ class Agent:
                         self.dream_recorder.finish(status="blocked", verified=False)
                     raise ValueError(f"Action denied by policy: {policy_result.reason}")
 
-            text, helper = None, None
+            text, helper, file_path, payload_preview = None, None, None, None
             if action["kind"] == "fill":
                 if not state["browser"].fresh(page):
                     raise StalePage("Page changed before text generation. Choose again.")
@@ -1088,10 +1165,24 @@ class Agent:
                     text, helper = field_text(context)
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
+                payload_preview = text
+            elif action["kind"] == "upload":
+                if not state["browser"].fresh(page):
+                    raise StalePage("Page changed before file selection. Choose again.")
+                entry = self._resolve_upload(decision)
+                file_path = entry["path"]
+                payload_preview = entry["name"]
 
             payload_result = None
             payload_digest = None
-            if text is not None:
+            if file_path is not None:
+                # The approved payload is the resolved file itself — the grant
+                # binds path+size, so a file swapped after approval can never
+                # be the file the operator reviewed.
+                payload_digest = hashlib.sha256(
+                    f"{file_path}\n{entry['size']}".encode("utf-8")
+                ).hexdigest()
+            elif text is not None:
                 payload_digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 if getattr(self, "policy", None):
                     # The target pass ran on page-supplied metadata, which a
@@ -1139,7 +1230,7 @@ class Agent:
                         # The exact generated value under review, so the
                         # approval screen can show precisely what the grant
                         # covers — the digest alone is opaque to a human.
-                        "payload_preview": text,
+                        "payload_preview": payload_preview,
                         # A trial assigned this step keeps its provenance across
                         # the approval pause; reject still drops the assignment.
                         "experiment": experiment_meta,
@@ -1180,7 +1271,8 @@ class Agent:
                 )
             try:
                 state["browser"].act(
-                    action, page, text=text, guarantee=self.input_guarantee
+                    action, page, text=text, guarantee=self.input_guarantee,
+                    file_path=file_path,
                 )
             except StalePage:
                 # Provably pre-mutation: safe to re-perceive — say so in the

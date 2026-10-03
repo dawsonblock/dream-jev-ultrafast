@@ -2251,3 +2251,67 @@ def test_fits_and_replay_are_deterministic(tmp_path):
         worlds, ExplorationPolicy(), trials=CounterfactualTrials.fit(events))
     assert a.selected.digest == b.selected.digest
     assert a.trials_digest == b.trials_digest
+
+
+def test_release_optional_check_never_blocks():
+    """Advisory checks report honestly but cannot gate release: a failed or
+    skipped optional check produces no blocker."""
+    qualify = _load_qualify_module()
+    stages = [
+        {"stage": "Q-test",
+         "checks": [
+             {"cmd": "pytest", "status": "passed", "requirement": "mandatory"},
+             {"cmd": "flaky_probe.py", "status": "failed",
+              "requirement": "optional"},
+             {"cmd": "timing_probe.py", "status": "skipped",
+              "requirement": "optional"},
+         ]},
+    ]
+    qualified, blockers = _qualified(qualify, stages)
+    assert qualified is True
+    assert blockers == []
+
+
+def test_release_undeclared_check_is_mandatory():
+    """A check with no requirement declaration is never silently advisory —
+    it gates like any mandatory check."""
+    qualify = _load_qualify_module()
+    stages = [
+        {"stage": "Q-test",
+         "checks": [{"cmd": "python3 scripts/e2e_check.py",
+                     "status": "skipped"}]},
+    ]
+    qualified, blockers = _qualified(qualify, stages)
+    assert qualified is False
+    assert "browser_e2e_skipped" in blockers
+
+
+def test_release_environment_dependent_skip_still_blocks():
+    """An environment-dependent check that could not run is absent evidence —
+    release cannot proceed without it, exactly as before the taxonomy."""
+    qualify = _load_qualify_module()
+    stages = [
+        {"stage": "Q2-browser",
+         "checks": [{"cmd": "python3 scripts/check_guards.py",
+                     "status": "skipped",
+                     "requirement": "environment-dependent",
+                     "reason": "no CDP endpoint reachable"}]},
+    ]
+    qualified, blockers = _qualified(qualify, stages)
+    assert qualified is False
+    assert "browser_suite_skipped" in blockers
+
+
+def test_stage_status_ignores_optional_failures():
+    """Stage status is decided by gating checks only: an advisory failure is
+    reported, not a stage failure."""
+    qualify = _load_qualify_module()
+    stage = qualify._stage("Q-test", "taxonomy", [
+        {"cmd": ["python3", "-c", "pass"], "requirement": "mandatory"},
+        {"cmd": ["python3", "-c", "import sys; sys.exit(1)"],
+         "requirement": "optional"},
+    ])
+    assert stage["status"] == "passed"
+    by_req = {c["requirement"]: c["status"] for c in stage["checks"]}
+    assert by_req["mandatory"] == "passed"
+    assert by_req["optional"] == "failed"

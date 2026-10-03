@@ -81,9 +81,14 @@ _COMMIT_LABELS = re.compile(
 # Authority rank used to pick the strictest applicable classification.
 _AUTHORITY_RANK = {"allow": 0, "require_approval": 1, "deny": 2}
 
-_EDIT_KINDS = {"fill", "select"}
+_EDIT_KINDS = {"fill", "select", "upload"}
 _TOGGLE_ROLES = {"checkbox", "radio", "switch", "option", "menuitemradio"}
 _EDITOR_ROLES = {"textbox", "combobox", "searchbox", "spinbutton"}
+
+# 'key' actions are observation-class only while they stay scroll keys — the
+# same authority class as wheel/scrollBy. Anything outside this whitelist is
+# an unclassified commit and gates like one.
+_SCROLL_KEYS = {"PageDown", "PageUp", "End", "Home"}
 
 # Per-target field kind (ctx.field from snapshot.js) → minimum effect for a
 # fill/select landing on it. Entering data is itself a disclosure event: page
@@ -146,6 +151,10 @@ def classify_effect(action) -> Effect:
     kind = action.get("kind")
     if kind in {"scroll", "wait"}:
         return Effect.OBSERVE
+    if kind == "key":
+        # Only whitelisted scroll keys classify as observation; an arbitrary
+        # keypress is an unclassifiable commit, never silently autonomous.
+        return Effect.OBSERVE if action.get("key") in _SCROLL_KEYS else Effect.UNKNOWN_COMMIT
 
     ctx = action.get("ctx") or {}
     label = str(action.get("label") or "")

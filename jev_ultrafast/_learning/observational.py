@@ -152,7 +152,7 @@ class CostModel:
 
 
 def _transitions(events: Iterable[dict]):
-    """Yield ``(transition_event, run_policy, terminal, verified_done, outcome, family)``.
+    """Yield ``(transition_event, run_policy, terminal, verified_done, outcome, family, uploads_declared)``.
 
     Run context supplies the policy needed to re-derive the offered catalogue
     (the rank coordinate the models train on) and the run's outcome class —
@@ -186,17 +186,22 @@ def _transitions(events: Iterable[dict]):
         outcome = _run_outcome(final)
         run_verified = outcome == "success"
         family = str(start.get("task_family") or "").strip().lower() if start else ""
+        # Recorded upload availability for this run — needed to re-derive the
+        # offered catalogue exactly as live candidate_actions did.
+        uploads_declared = bool(start.get("upload_count")) if start else False
         transitions = [e for e in run_events if e.get("event") == "transition"]
         for index, event in enumerate(transitions):
             terminal = index == len(transitions) - 1 and final is not None
             verified_done = bool(terminal and run_verified)
-            yield event, policy, terminal, verified_done, outcome, family
+            yield event, policy, terminal, verified_done, outcome, family, uploads_declared
     for event in loose:
         if event.get("event") == "transition":
-            yield event, None, False, False, "legacy", ""
+            yield event, None, False, False, "legacy", "", False
 
 
-def _selected_offered_rank(event: dict, policy: ExplorationPolicy | None) -> int | None:
+def _selected_offered_rank(
+    event: dict, policy: ExplorationPolicy | None, *, uploads_declared: bool = False
+) -> int | None:
     """Rank of the recorded action in the catalogue the model was offered.
 
     New traces record ``selected_offered_rank`` explicitly. For older evidence
@@ -217,7 +222,7 @@ def _selected_offered_rank(event: dict, policy: ExplorationPolicy | None) -> int
         # observed position IS the offered rank.
         return next((i for i, c in enumerate(candidates) if c.get("id") == selected_id), None)
     if policy is not None:
-        offered = ReplaySimulator._retained_candidates(policy, candidates)
+        offered = ReplaySimulator._retained_candidates(policy, candidates, uploads_declared=uploads_declared)
         return next((i for i, c in enumerate(offered) if c.get("id") == selected_id), None)
     return None
 
@@ -241,7 +246,7 @@ def _fit_cells(events: Iterable[dict], label) -> tuple[dict, dict, dict, int, in
     kind_counts: dict[str, list[int]] = {}
     positive_total = 0
     samples = 0
-    for event, policy, terminal, verified_done, outcome, family in _transitions(events):
+    for event, policy, terminal, verified_done, outcome, family, uploads_declared in _transitions(events):
         selected = event.get("selected") or {}
         kind = str(selected.get("kind") or "unknown")
         selected_id = selected.get("id")
@@ -250,7 +255,7 @@ def _fit_cells(events: Iterable[dict], label) -> tuple[dict, dict, dict, int, in
             (int(c.get("goal_overlap", 0)) for c in candidates if c.get("id") == selected_id),
             0,
         )
-        rank = _selected_offered_rank(event, policy)
+        rank = _selected_offered_rank(event, policy, uploads_declared=uploads_declared)
         positive = label(event, terminal, verified_done, outcome)
         if positive is None:
             continue

@@ -20,6 +20,7 @@ __all__ = [
     'CanaryGate',
     'CanaryMetrics',
     'CanaryRunSummary',
+    '_canary_abandoned',
     '_canary_run_summaries',
     '_metrics_from_canary_runs',
     '_sign_test_p_value',
@@ -42,6 +43,14 @@ class CanaryMetrics:
     task_keys: tuple[str, ...] = ()
     family_keys: tuple[str, ...] = ()
     instance_ids: tuple[str, ...] = ()
+    # Abandoned starts (Phase 21): runs begun under this digest that never
+    # produced a measured outcome — aborted ``run_finished`` or none at
+    # all. ``crash_runs`` is the candidate-attributable subset (browser
+    # crash, agent exception, indeterminate execution). They are excluded
+    # from task rates exactly as before — but they are *visible* now, so a
+    # death-spiral cannot read as merely "insufficient data".
+    abandoned_runs: int = 0
+    crash_runs: int = 0
 
     @property
     def success_rate(self) -> float:
@@ -54,6 +63,16 @@ class CanaryMetrics:
     @property
     def risk_rate(self) -> float:
         return self.risk_events / self.tasks if self.tasks else 0.0
+
+    @property
+    def abandoned_fraction(self) -> float:
+        started = self.tasks + self.abandoned_runs
+        return self.abandoned_runs / started if started else 0.0
+
+    @property
+    def crash_fraction(self) -> float:
+        started = self.tasks + self.abandoned_runs
+        return self.crash_runs / started if started else 0.0
 
     @property
     def avg_latency_ms(self) -> float:
@@ -76,13 +95,21 @@ class CanaryMetrics:
         max_runs: int | None = None,
         since_ms: int | None = None,
     ) -> "CanaryMetrics":
+        events = list(events)
         runs = _canary_run_summaries(events, policy_digest, since_ms=since_ms)
+        abandoned = _canary_abandoned(events, policy_digest, since_ms=since_ms)
         if max_runs is not None:
             # ``-0`` slices to the whole list, so a non-positive limit must not
             # silently mean "all runs" — it must mean none.
             limit = int(max_runs)
             runs = runs[-limit:] if limit > 0 else []
-        return _metrics_from_canary_runs(runs)
+            abandoned = abandoned[-limit:] if limit > 0 else []
+        metrics = _metrics_from_canary_runs(runs)
+        return cls(
+            **{**asdict(metrics),
+               "abandoned_runs": len(abandoned),
+               "crash_runs": sum(1 for _t, crash in abandoned if crash)}
+        )
 
 
 @dataclass(frozen=True)
@@ -166,6 +193,53 @@ def _canary_run_summaries(
         ))
     summaries.sort(key=lambda run: (run.finished_at_ms, run.run_id))
     return summaries
+
+
+# Abort reasons where the runtime itself died mid-flight — a signal the
+# policy being observed may have caused. Operator cancels, network and
+# timeout censors, and recorder shutdowns stay pure censors: they say
+# nothing about the policy.
+_CRASH_REASONS = frozenset(
+    {"browser_crash", "agent_exception", "indeterminate_execution"}
+)
+
+
+def _canary_abandoned(
+    events: Iterable[dict], policy_digest: str, *, since_ms: int | None = None
+) -> list[tuple[int, bool]]:
+    """The runs ``_canary_run_summaries`` deliberately drops, kept visible.
+
+    Exactly the same membership filter (digest, experiment exclusion,
+    causal-override exclusion) applied to runs that produced no measured
+    outcome — ``aborted`` finishes and runs with no ``run_finished`` at
+    all. Returns ``(finished_at_ms, is_crash)`` sorted by finish time so
+    callers can window them the same way they window completed runs."""
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for event in events:
+        if event.get("run_id"):
+            grouped[event["run_id"]].append(event)
+    abandoned = []
+    for run_id, run_events in grouped.items():
+        run_events.sort(key=lambda e: (e.get("sequence", 0), e.get("recorded_at_ms", 0)))
+        start = next((e for e in run_events if e.get("event") == "run_started"), None)
+        if not start or start.get("policy_digest") != policy_digest:
+            continue
+        if any(event.get("experiment") for event in run_events) or any(
+            event.get("event") == "causal_policy_applied" for event in run_events
+        ):
+            continue
+        final = next((e for e in reversed(run_events) if e.get("event") == "run_finished"), None)
+        if final is not None and final.get("status") != "aborted":
+            continue  # a measured terminal outcome — not abandoned
+        finished_at_ms = max(
+            int((final or run_events[-1]).get("recorded_at_ms", 0)),
+            int(start.get("recorded_at_ms", 0)),
+        )
+        if since_ms is not None and finished_at_ms < since_ms:
+            continue
+        abandoned.append((finished_at_ms, str((final or {}).get("reason") or "") in _CRASH_REASONS))
+    abandoned.sort()
+    return abandoned
 
 
 def _metrics_from_canary_runs(runs: Iterable[CanaryRunSummary]) -> CanaryMetrics:

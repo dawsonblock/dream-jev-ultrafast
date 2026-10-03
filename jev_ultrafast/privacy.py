@@ -80,6 +80,73 @@ ROUTING_LEVELS = ("local-only", "sanitized", "public")
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 
+# ---------------------------------------------------------------------------
+# Security posture profiles (Phase 11).
+#
+# The individual knobs were grown one defect at a time; a profile is the
+# declared posture that bounds how they may compose — the defect class this
+# closes is "two separately named flags silently weakening together".
+#
+#   standard — (default) every knob honored independently, plus the existing
+#              coherence guards (e.g. sanitized routing refuses privacy=off).
+#   strict   — hardened posture: refuses verbatim remote text (routing
+#              `public`), refuses redaction disabled outright, refuses the
+#              insecure-transport flag even when it would apply, refuses
+#              trusted (non-atomic) input, keeps the unbound-metrics escape
+#              hatch closed, and requires signed evidence without an extra
+#              flag. A knob explicitly weakening below the profile fails
+#              closed naming the conflict — never silently ignored.
+# ---------------------------------------------------------------------------
+
+SECURITY_PROFILES = ("standard", "strict")
+_PRIVACY_OFF = {"off", "none", "0", "false"}
+
+
+def security_profile() -> str:
+    """The declared security posture (``JEV_SECURITY_PROFILE``).
+
+    ``standard`` is the historical default — every knob read independently
+    with its own coherence guards. ``strict`` is the hardened posture that
+    refuses the weakening combinations a qualified run should never reach.
+    An unrecognized value is a misconfiguration — fail closed.
+    """
+    profile = os.environ.get("JEV_SECURITY_PROFILE", "standard").strip().lower()
+    if profile not in SECURITY_PROFILES:
+        raise ValueError(
+            f"JEV_SECURITY_PROFILE must be one of {', '.join(SECURITY_PROFILES)}"
+        )
+    return profile
+
+
+def signed_evidence_required() -> bool:
+    """Whether unsigned evidence must fail closed.
+
+    ``JEV_REQUIRE_SIGNED_EVIDENCE`` opts in under any profile; ``strict``
+    implies the requirement — a hardened posture cannot consume unsigned
+    evidence and call it provenance.
+    """
+    return bool(
+        os.environ.get("JEV_REQUIRE_SIGNED_EVIDENCE")
+        or security_profile() == "strict"
+    )
+
+
+def unbound_metrics_permitted() -> bool:
+    """Whether the unbound-metrics promotion escape hatch may open.
+
+    ``strict`` keeps the hatch closed unconditionally — bound paired canary
+    evidence is not optional under a hardened posture; under ``standard``
+    it still requires the explicit ``JEV_ALLOW_UNBOUND_METRICS=1`` opt-in.
+    """
+    if security_profile() == "strict":
+        raise ValueError(
+            "JEV_SECURITY_PROFILE=strict keeps the unbound-metrics escape "
+            "hatch closed — promotion requires bound paired canary evidence "
+            "via promote_from_store()."
+        )
+    return os.environ.get("JEV_ALLOW_UNBOUND_METRICS") == "1"
+
+
 def routing_level():
     level = os.environ.get("JEV_MODEL_ROUTING", "sanitized").strip().lower()
     if level not in ROUTING_LEVELS:
@@ -88,7 +155,19 @@ def routing_level():
         raise ValueError(
             f"JEV_MODEL_ROUTING must be one of {', '.join(ROUTING_LEVELS)}"
         )
-    if level == "sanitized" and _mode() in {"off", "none", "0", "false"}:
+    if security_profile() == "strict":
+        if _mode() in _PRIVACY_OFF:
+            raise ValueError(
+                "JEV_SECURITY_PROFILE=strict refuses JEV_MODEL_PRIVACY=off — "
+                "redaction is not optional under a hardened posture."
+            )
+        if level == "public":
+            raise ValueError(
+                "JEV_SECURITY_PROFILE=strict refuses JEV_MODEL_ROUTING=public "
+                "— verbatim goal text to a remote endpoint is not a strict "
+                "posture. Use sanitized or local-only."
+            )
+    if level == "sanitized" and _mode() in _PRIVACY_OFF:
         # The two flags must not compose into raw remote transmission:
         # "sanitized" is the promise that outbound text passed the redaction
         # pass, and privacy=off disables that pass while remote endpoints
@@ -124,13 +203,21 @@ def assert_transport_secure(url):
     Loopback HTTP is fine (same machine); a remote http:// endpoint would
     carry the Authorization header and the entire model context in cleartext.
     ``JEV_ALLOW_INSECURE_TRANSPORT=1`` is the explicit dangerous-development
-    escape hatch — never set it for a qualified run.
+    escape hatch — never set it for a qualified run. Under
+    ``JEV_SECURITY_PROFILE=strict`` the hatch itself is refused: the flag
+    may not weaken the posture even where it would apply.
     """
     parts = urlsplit(str(url))
     scheme = parts.scheme.lower()
     if scheme == "https" or loopback_endpoint(url):
         return
     if scheme == "http" and os.environ.get("JEV_ALLOW_INSECURE_TRANSPORT") == "1":
+        if security_profile() == "strict":
+            raise ValueError(
+                "JEV_SECURITY_PROFILE=strict refuses "
+                "JEV_ALLOW_INSECURE_TRANSPORT — remote model traffic over "
+                "plaintext http is not a strict posture."
+            )
         return
     raise ValueError(
         f"Refusing {'plaintext ' if scheme == 'http' else 'non-TLS '}"

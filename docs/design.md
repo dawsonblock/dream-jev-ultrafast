@@ -50,7 +50,7 @@ The text helper remains separately configurable through the OpenAI-compatible `T
 
 ## Remaining browser coverage limits
 
-The reader covers common HTML and ARIA controls but not the browser's full accessibility algorithm. Cross-origin/same-origin frames, shadow roots, canvas-only interfaces, nested scrolling, pop-up tabs, uploads, browser dialogs, drag/drop, arbitrary keyboard widgets, and native multi-select controls remain outside v0.4. Those are coverage gaps, not reasons to weaken the isolated-world or verification invariants.
+The reader covers common HTML and ARIA controls but not the browser's full accessibility algorithm. Since v0.10 the reader also traverses same-origin frame documents and open shadow roots, scrolls nested containers through guarded in-world `scrollBy`, offers whitelisted keyboard scroll (PageDown/PageUp/Home/End), attaches declared files through `DOM.setFileInputFiles` under an operator allowlist, and adopts popup/new-tab targets whose opener chain belongs to the session. Cross-origin frames, closed shadow roots, canvas-only interfaces, browser dialogs, drag/drop, arbitrary keyboard widgets, and native multi-select controls remain outside the loop — counted (`unreachable_frames`) where detectable, never traversed silently. Those are coverage gaps, not reasons to weaken the isolated-world or verification invariants.
 
 
 ## v0.4 DREAM-Jev qualification boundary

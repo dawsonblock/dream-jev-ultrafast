@@ -193,6 +193,46 @@ def test_fill_atomic_insert_paths(monkeypatch):
     assert not any(m.startswith("Input.") for m, _ in calls if m != "Input.dispatchMouseEvent")
 
 
+def test_trusted_nested_scroll_executes_in_world_without_click(monkeypatch):
+    """scrollBy already ran inside the guarded turn — an element scroll has
+    no physical-input form, so it must never reach the trusted click
+    dispatch: an OBSERVE-classified scroll is not a press+release."""
+    calls = []
+    monkeypatch.setattr(
+        browser, "cdp",
+        _fake_cdp(calls, [{"x": 5, "y": 5, "scrolled": True, "scrollTop": 120}]),
+    )
+    result = browser_operation(_op({"id": "e", "kind": "scroll", "node": 1, "delta": 600}))
+    assert result == {"executed": "e"}
+    # Exactly one evaluation — the guarded scroll itself. No pre-press checks,
+    # no mouse press/release rides on a scroll.
+    assert [m for m, _ in calls] == ["Runtime.evaluate"]
+
+
+def test_atomic_nested_scroll_executes_inside_the_guarded_turn(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        browser, "cdp",
+        _fake_cdp(calls, [{"x": 5, "y": 5, "scrolled": True, "scrollTop": 120}]),
+    )
+    result = browser_operation(
+        _op({"id": "e", "kind": "scroll", "node": 1, "delta": 600}, guarantee="atomic")
+    )
+    assert result == {"executed": "e"}
+    assert [m for m, _ in calls] == ["Runtime.evaluate"]
+
+
+def test_trusted_scroll_lost_ack_is_indeterminate(monkeypatch):
+    """The guarded scrollBy may already have run when its acknowledgement is
+    lost — a node scroll is mutating under *every* guarantee, so interruption
+    is indeterminate and never a retryable StalePage."""
+    def lost(method, session_id=None, **kwargs):
+        raise RuntimeError("Connection lost")
+    monkeypatch.setattr(browser, "cdp", lost)
+    with pytest.raises(IndeterminateMutation, match="must not be retried"):
+        browser_operation(_op({"id": "e", "kind": "scroll", "node": 1, "delta": 600}))
+
+
 # --- evidence store: torn tail, rotation, domain separation -----------------
 
 def _minimal_event():
@@ -577,7 +617,7 @@ def test_consistent_anchor_passes_and_reanchor_restores(tmp_path):
 
 # --- unknown kinds and the payload authority signal ------------------------
 
-@pytest.mark.parametrize("kind", ["upload", "script", "future_mutation", "drag", "hotkey"])
+@pytest.mark.parametrize("kind", ["script", "future_mutation", "drag", "hotkey"])
 def test_unknown_mutation_kinds_fail_closed(kind):
     """Audit regression: an unrecognized kind classifies UNKNOWN_COMMIT and
     must escalate — the v0.6 kind shortcut let it pass as ``allow``."""

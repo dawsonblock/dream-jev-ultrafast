@@ -349,8 +349,10 @@ class DreamImprover:
                 for proposal in summary.get("experiment_proposals", ())
             ]
             # The scheduler decides which *unresolved* hypothesis is worth a
-            # real browser experiment (expected information gain × practical
-            # importance ÷ evidence coverage); settled hypotheses are dropped
+            # real browser experiment (practical importance × remaining
+            # uncertainty ÷ evidence coverage — a bounded heuristic score,
+            # not a formal value of information); settled hypotheses are
+            # dropped
             # entirely. Without a scheduler the historical expected-delta
             # order is the fallback. A proposal is a hypothesis to test under
             # the real authority plane, not a finding.
