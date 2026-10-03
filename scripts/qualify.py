@@ -1,9 +1,22 @@
 """Staged qualification pipeline (qualification §64).
 
-Runs the qualification gates in layer order and emits a ``jev-qualify/2``
-report — the single artifact a release decision reads. ``--sign``/``JEV_QUALIFY_SIGNING_KEY``
-binds it to a release authority (``jev-qualify-sig/1``); ``--verify-report``
-checks a signed report fail-closed under pinned keys.
+Runs the qualification gates in layer order and emits a ``jev-qualify/3``
+report — the single artifact a release decision reads. The report separates
+three claims that used to be conflated in ``overall``:
+
+- ``validation_status`` — did the stages run here pass? (the old ``overall``)
+- ``provenance_status`` — is the source manifest signed and verified under
+  pinned keys? (``unsigned`` | ``verified`` | ``failed``)
+- ``release_qualified`` — the release verdict. Always ``false`` for a bounded
+  run: bounded validation is not a release profile. ``--full`` requires every
+  listed condition — signed+verified manifest under pinned keys, every
+  required stage run and passed, the report itself signed, and the signature
+  verifying under a pinned accepted key — else ``release_blockers`` names
+  what failed closed.
+
+``--sign``/``JEV_QUALIFY_SIGNING_KEY`` binds the report to a release
+authority (``jev-qualify-sig/1``); ``--verify-report`` checks a signed report
+fail-closed under pinned keys.
 
     uv run python scripts/qualify.py [--full] [--out report.json]
         [--report-md VALIDATION.generated.md] [--sign SEED_HEX]
@@ -23,6 +36,9 @@ Layers:
 (1M fuzz cases, 1,000 crash kills, 100k-sequence grid). A stage that cannot
 run on this host (no Chrome, missing tool) is reported ``skipped`` — never
 ``passed`` — so the report honestly separates executed evidence from absence.
+Integrity is not provenance: a manifest that hashes correctly still says
+nothing about who produced it, and a validation pass says nothing about
+release authority.
 """
 
 import argparse
@@ -51,6 +67,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 ROOT = Path(__file__).resolve().parent.parent
 PY = [sys.executable]
 _TALLY = re.compile(r"(\d+)\s+(passed|failed|skipped|deselected|xpassed|xfailed)")
+REPORT_SCHEMA = "jev-qualify/3"
 REPORT_SIG_SCHEMA = "jev-qualify-sig/1"
 REPORT_SIG_DOMAIN = b"jev-dream/qualify-report/v1:"
 
@@ -76,6 +93,26 @@ def _sign_report(report: dict, seed_hex: str) -> dict:
     return report
 
 
+def _report_signature_valid(report: dict, keys: set[str]) -> bool:
+    """True iff the report's signature block verifies under ``keys``."""
+    sig = report.get("signature") if isinstance(report, dict) else None
+    if not isinstance(sig, dict) or sig.get("schema") != REPORT_SIG_SCHEMA:
+        return False
+    digest = _report_digest(report)
+    if sig.get("report_digest") != digest or sig.get("key_id") not in keys:
+        return False
+    try:
+        Ed25519PublicKey.from_public_bytes(
+            bytes.fromhex(sig["key_id"])
+        ).verify(
+            bytes.fromhex(str(sig.get("signature"))),
+            REPORT_SIG_DOMAIN + digest.encode("ascii"),
+        )
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
 def _verify_report(path: Path, keys: set[str]) -> int:
     try:
         report = json.loads(path.read_text(encoding="utf-8"))
@@ -95,17 +132,11 @@ def _verify_report(path: Path, keys: set[str]) -> int:
     if sig.get("key_id") not in keys:
         print("report signed by an unexpected key", file=sys.stderr)
         return 1
-    try:
-        Ed25519PublicKey.from_public_bytes(
-            bytes.fromhex(sig["key_id"])
-        ).verify(
-            bytes.fromhex(str(sig.get("signature"))),
-            REPORT_SIG_DOMAIN + digest.encode("ascii"),
-        )
-    except (InvalidSignature, ValueError):
+    if not _report_signature_valid(report, keys):
         print("report signature verification failure", file=sys.stderr)
         return 1
-    print(f"report verified under key {str(sig['key_id'])[:16]}…")
+    print(f"report verified under key {str(sig['key_id'])[:16]}…"
+          f" — release_qualified={report.get('release_qualified')}")
     return 0
 
 
@@ -218,6 +249,98 @@ def _manifest_provenance() -> dict:
     return block
 
 
+def _provenance_status(provenance: dict, q0_stage: dict | None) -> str:
+    """unsigned | verified | failed — from the manifest signature *and* the
+    Q0 gate's actual verification verdict, never from file existence alone."""
+    if not provenance.get("manifest_signed"):
+        return "unsigned"
+    verdict = None
+    for check in (q0_stage or {}).get("checks", ()):
+        if "sign_manifest.py" in str(check.get("cmd")):
+            verdict = check.get("status")
+    if verdict == "passed":
+        return "verified"
+    if verdict == "skipped":
+        return "unsigned"  # an unverified signature is no provenance
+    return "failed"
+
+
+# Stable blocker slugs per check command — the report names *what* failed or
+# was absent, not just which stage box contained it.
+_CHECK_SLUGS = (
+    ("update_manifest.py", "manifest_integrity"),
+    ("sign_manifest.py", "manifest_signature"),
+    ("compileall", "compile"),
+    ("ruff", "ruff"),
+    ("node --check", "js_syntax"),
+    ("uv lock", "lockfile"),
+    ("×2", "reproducible_build"),
+    ("uv build", "build"),
+    ("check_guards.py", "browser_suite"),
+    ("e2e_check.py", "browser_e2e"),
+    ("race_check.py", "race_check"),
+    ("fuzz_check.py", "fuzz_suite"),
+    ("crash_check.py", "crash_injection"),
+    ("mutate_check.py", "mutation_sweep"),
+    ("keydrill_check.py", "key_drill"),
+    ("simulate_causal.py", "causal_grid"),
+    ("test_authority.py", "anchor_suite"),
+    ("test_dream.py", "anchor_suite"),
+    ("pytest", "pytest_suite"),
+)
+
+
+def _check_slug(cmd) -> str:
+    text = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
+    for needle, slug in _CHECK_SLUGS:
+        if needle in text:
+            return slug
+    return re.sub(r"[^a-z0-9]+", "_", text.strip().lower()).strip("_")[:48] or "check"
+
+
+def _release_verdict(
+    stages: list[dict],
+    *,
+    full: bool,
+    provenance: dict,
+    provenance_status: str,
+    report_key_id: str | None,
+    accepted_keys: set[str],
+) -> tuple[bool, list[str]]:
+    """Release qualification is a separate claim from validation.
+
+    Bounded mode is a validation profile — it reports ``release_qualified``
+    ``false`` unconditionally. Full mode requires every release condition:
+    signed manifest verified under pinned keys, every required check run and
+    passed (nothing skipped counts as evidence), and the qualification report
+    itself signed by a key the caller accepts. ``release_blockers`` names
+    each unsatisfied condition in deterministic order.
+    """
+    if not full:
+        return False, ["bounded_mode"]
+    blockers: list[str] = []
+    if not (ROOT / "MANIFEST.sha256").exists():
+        blockers.append("manifest_missing")
+    if not provenance.get("manifest_signed"):
+        blockers.append("unsigned_manifest")
+    elif provenance_status == "failed":
+        blockers.append("untrusted_manifest_key")
+    elif provenance_status != "verified":
+        blockers.append("manifest_signature_unverified")
+    for stage in stages:
+        for check in stage.get("checks", ()):
+            status = check.get("status")
+            if status in {"skipped", "failed"}:
+                blockers.append(f"{_check_slug(check.get('cmd'))}_{status}")
+    if report_key_id is None:
+        blockers.append("report_unsigned")
+    elif not accepted_keys:
+        blockers.append("report_verify_keys_missing")
+    elif report_key_id not in accepted_keys:
+        blockers.append("report_key_untrusted")
+    return not blockers, blockers
+
+
 def _pytest_tally(stage: dict) -> dict:
     """Extract pass/fail/skip counts from the pytest check's tail lines."""
     tally = {}
@@ -236,14 +359,24 @@ def _write_markdown(report: dict, path: Path) -> None:
     prose elsewhere is commentary.
     """
     env = report["environment"]
+    validation = report.get("validation_status", report.get("overall"))
+    qualified = bool(report.get("release_qualified"))
     lines = [
         "# Validation report (generated)",
         "",
         "Generated by `scripts/qualify.py` — do not edit by hand. Every count",
         "below comes from the run that produced this file.",
         "",
+        f"## Validation: **{str(validation).upper()}** — "
+        f"Release qualified: **{'YES' if qualified else 'NO'}**",
+        "",
         f"- schema: `{report['schema']}` / mode: `{report['mode']}`",
-        f"- overall: **{report['overall']}**",
+        f"- validation_status: `{validation}`",
+        f"- provenance_status: `{report.get('provenance_status')}`",
+        f"- release_qualified: `{qualified}`",
+        "- release_blockers: "
+        + (", ".join(f"`{b}`" for b in report.get("release_blockers") or [])
+           or "none"),
         f"- generated_at_ms: {report['generated_at_ms']}",
         "",
         "## Provenance",
@@ -437,24 +570,65 @@ def main() -> int:
                else "partial")
     for s in stages:
         s["test_tally"] = _pytest_tally(s)
+    provenance = _manifest_provenance()
+    provenance_status = _provenance_status(
+        provenance, next((s for s in stages if s["stage"] == "Q0-static"), None)
+    )
+    # Release authority: the report must be signed AND its signature must
+    # verify under a key the caller pinned as accepted — a signature over
+    # the wrong key, or one nobody can check, is not provenance.
+    seed = args.sign or os.environ.get("JEV_QUALIFY_SIGNING_KEY", "").strip()
+    accepted_keys = {k.strip() for k in args.key if k and k.strip()}
+    accepted_keys.update(
+        k.strip()
+        for k in os.environ.get("JEV_QUALIFY_VERIFY_KEYS", "").split(",")
+        if k.strip()
+    )
+    report_key_id = None
+    if seed:
+        report_key_id = Ed25519PrivateKey.from_private_bytes(
+            bytes.fromhex(seed.strip())
+        ).public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+    release_qualified, blockers = _release_verdict(
+        stages,
+        full=full,
+        provenance=provenance,
+        provenance_status=provenance_status,
+        report_key_id=report_key_id,
+        accepted_keys=accepted_keys,
+    )
     report = {
-        "schema": "jev-qualify/2",
+        "schema": REPORT_SCHEMA,
         "mode": "full" if full else "bounded",
         "generated_at_ms": int(time.time() * 1000),
+        # ``overall`` is retained as the deprecated alias of
+        # ``validation_status`` for one release; consumers must migrate.
         "overall": overall,
+        "validation_status": overall,
+        "provenance_status": provenance_status,
+        "release_qualified": release_qualified,
+        "release_blockers": blockers,
+        "release_required": bool(full),
         "environment": _env_digest(),
-        "provenance": _manifest_provenance(),
+        "provenance": provenance,
         "stages": [{k: v for k, v in s.items() if k != "checks"}
                    | {"checks": [{k: v for k, v in c.items() if k != "tail"}
                                  for c in s["checks"]]}
                    for s in stages],
     }
-    # The report binds source artifact + environment; signing binds it to a
-    # release authority — a detached or mutated report must not be readable
-    # as qualified evidence for some other tree.
-    seed = args.sign or os.environ.get("JEV_QUALIFY_SIGNING_KEY", "").strip()
+    # The report binds source artifact + environment + the release verdict;
+    # signing binds all of it to a release authority — a detached or mutated
+    # report must not be readable as qualified evidence for some other tree.
     if seed:
         _sign_report(report, seed)
+        if accepted_keys and not _report_signature_valid(report, accepted_keys):
+            # A just-produced signature that fails verification is a defect,
+            # not a release: report honestly what happened — unsigned, with
+            # the blocker recorded — rather than emitting broken evidence.
+            report.pop("signature", None)
+            report["release_qualified"] = False
+            if "report_signature_invalid" not in report["release_blockers"]:
+                report["release_blockers"].append("report_signature_invalid")
     text = json.dumps(report, indent=2, sort_keys=True)
     if args.out:
         Path(args.out).write_text(text + "\n")
@@ -462,9 +636,17 @@ def main() -> int:
     if args.report_md:
         _write_markdown(report, Path(args.report_md))
         print(f"validation report → {args.report_md}")
-    print(f"\nqualification: {overall.upper()}")
+    print(f"\nvalidation: {overall.upper()}")
+    print(f"release qualified: {'YES' if report['release_qualified'] else 'NO'}")
+    for blocker in report["release_blockers"]:
+        print(f"  blocker: {blocker}")
     for s in stages:
         print(f"  {s['status']:7} {s['stage']} — {s['description']}")
+    # Bounded runs exit on validation alone; --full is a release profile —
+    # release qualification failure is a non-zero exit even when every stage
+    # executed cleanly.
+    if full:
+        return 0 if report["release_qualified"] else 1
     return 0 if overall == "passed" else 1
 
 

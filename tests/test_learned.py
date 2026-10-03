@@ -2055,6 +2055,168 @@ def test_qualify_report_signing_round_trip(tmp_path):
     assert qualify._verify_report(unsigned, {signer.key_id}) == 1
 
 
+# -------------------------------------------------- release qualification
+#
+# Validation status, provenance status, and release qualification are three
+# separate claims. "passed" must never be misreadable as "release qualified".
+
+
+def _stages(*check_specs):
+    """Fake stage list: each tuple is (cmd_substring, status)."""
+    return [{
+        "stage": "Q-test",
+        "checks": [{"cmd": cmd, "status": status} for cmd, status in check_specs],
+    }]
+
+
+def _qualified(qualify, stages, *, full=True, signed=True, p_status="verified",
+               key_id="aa" * 32, keys=None):
+    return qualify._release_verdict(
+        stages,
+        full=full,
+        provenance={"manifest_signed": signed},
+        provenance_status=p_status,
+        report_key_id=key_id,
+        accepted_keys={key_id} if keys is None else keys,
+    )
+
+
+def test_release_bounded_never_qualified():
+    """A bounded run may report validation passed — but bounded volumes are
+    not a release profile, so release_qualified is always false."""
+    qualify = _load_qualify_module()
+    stages = _stages(("pytest", "passed"))
+    qualified, blockers = _qualified(qualify, stages, full=False,
+                                     signed=False, p_status="unsigned")
+    assert qualified is False
+    assert blockers == ["bounded_mode"]
+
+
+def test_release_full_unsigned_manifest_blocks():
+    """Full qualification with no MANIFEST.sig is not a release — the tree
+    has integrity evidence but no provenance."""
+    qualify = _load_qualify_module()
+    stages = _stages(("pytest", "passed"), ("check_guards.py", "passed"))
+    qualified, blockers = _qualified(
+        qualify, stages, signed=False, p_status="unsigned")
+    assert qualified is False
+    assert "unsigned_manifest" in blockers
+
+
+def test_release_full_untrusted_manifest_key_blocks():
+    """A manifest signature that fails verification under pinned keys is
+    failed provenance, not absent provenance."""
+    qualify = _load_qualify_module()
+    stages = _stages(("pytest", "passed"))
+    qualified, blockers = _qualified(
+        qualify, stages, signed=True, p_status="failed")
+    assert qualified is False
+    assert "untrusted_manifest_key" in blockers
+
+
+def test_release_full_unsigned_report_blocks():
+    """A verified manifest is not enough — the qualification report itself
+    must carry release authority."""
+    qualify = _load_qualify_module()
+    stages = _stages(("pytest", "passed"))
+    qualified, blockers = _qualified(qualify, stages, key_id=None)
+    assert qualified is False
+    assert "report_unsigned" in blockers
+
+
+def test_release_full_report_key_untrusted_blocks():
+    """A report signed by a key outside the accepted set is not release
+    authority even when cryptographically valid."""
+    qualify = _load_qualify_module()
+    stages = _stages(("pytest", "passed"))
+    qualified, blockers = _qualified(
+        qualify, stages, key_id="bb" * 32, keys={"aa" * 32})
+    assert qualified is False
+    assert "report_key_untrusted" in blockers
+
+
+def test_release_full_requires_no_verify_keys_blocks():
+    """Signing without configured accepted keys: the signature cannot be
+    verified against anything pinned — fail closed."""
+    qualify = _load_qualify_module()
+    stages = _stages(("pytest", "passed"))
+    qualified, blockers = _qualified(qualify, stages, keys=set())
+    assert qualified is False
+    assert "report_verify_keys_missing" in blockers
+
+
+def test_release_full_skipped_mandatory_stage_blocks():
+    """A skipped stage is absence of evidence — a full release cannot
+    proceed while a required suite never ran."""
+    qualify = _load_qualify_module()
+    stages = [
+        {"stage": "Q2-browser",
+         "checks": [{"cmd": "python3 scripts/check_guards.py",
+                     "status": "skipped",
+                     "reason": "no CDP endpoint reachable"}]},
+    ]
+    qualified, blockers = _qualified(qualify, stages)
+    assert qualified is False
+    assert "browser_suite_skipped" in blockers
+
+
+def test_release_full_failed_stage_names_the_check():
+    qualify = _load_qualify_module()
+    stages = _stages(("fuzz_check.py", "failed"))
+    qualified, blockers = _qualified(qualify, stages)
+    assert qualified is False
+    assert "fuzz_suite_failed" in blockers
+
+
+def test_release_full_clean_run_qualified():
+    """All conditions met → release_qualified. This is the only shape a
+    release decision may consume."""
+    qualify = _load_qualify_module()
+    stages = _stages(
+        ("update_manifest.py", "passed"), ("sign_manifest.py", "passed"),
+        ("pytest", "passed"), ("check_guards.py", "passed"),
+    )
+    qualified, blockers = _qualified(qualify, stages)
+    assert qualified is True
+    assert blockers == []
+
+
+def test_release_verdict_tampered_report_stays_invalid(tmp_path):
+    """Mutation after signing invalidates verification — a report edited
+    post-signature (even to flip release_qualified) fails closed."""
+    qualify = _load_qualify_module()
+    signer = EvidenceSigner.from_hex("11" * 32)
+    report = {"schema": "jev-qualify/3", "mode": "full",
+              "validation_status": "passed", "release_qualified": False,
+              "release_blockers": ["unsigned_manifest"]}
+    qualify._sign_report(report, "11" * 32)
+    assert qualify._report_signature_valid(report, {signer.key_id}) is True
+    # Flip the verdict after signing — the digest no longer covers the file.
+    forged = dict(report)
+    forged["release_qualified"] = True
+    forged["release_blockers"] = []
+    assert qualify._report_signature_valid(forged, {signer.key_id}) is False
+    path = tmp_path / "forged.json"
+    path.write_text(json.dumps(forged))
+    assert qualify._verify_report(path, {signer.key_id}) == 1
+
+
+def test_provenance_status_tracks_the_q0_verdict():
+    """provenance_status comes from the actual verification check, never
+    from file existence alone."""
+    qualify = _load_qualify_module()
+    q0_pass = {"checks": [{"cmd": ["x", "sign_manifest.py", "--verify"],
+                           "status": "passed"}]}
+    q0_fail = {"checks": [{"cmd": ["x", "sign_manifest.py", "--verify"],
+                           "status": "failed"}]}
+    assert qualify._provenance_status(
+        {"manifest_signed": True}, q0_pass) == "verified"
+    assert qualify._provenance_status(
+        {"manifest_signed": True}, q0_fail) == "failed"
+    assert qualify._provenance_status(
+        {"manifest_signed": False}, q0_pass) == "unsigned"
+
+
 def test_assignment_propensity_distribution_is_correct():
     """T-800: the arm draw is `rng.random() < rate`. Over 100k seeded draws
     (fully deterministic — no flake surface) the observed candidate-arm

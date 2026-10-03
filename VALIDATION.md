@@ -291,6 +291,45 @@ Also wired: `TrialChoiceModel.choose`/`rank`/`predict`/`refuted`, `CausalChoiceP
 
 Gates re-run on this tree: `uv run pytest` **368 passed** (five new regressions covering each fix), `uv run ruff check .` clean, `node --check` clean, `compileall` clean, `uv lock --check` clean, `uv build` green, `MANIFEST.sha256` verified.
 
+## Staged hardening program (post-0.9.2, unreleased)
+
+A staged implementation program over the 0.9.2 tree; each phase lands as a
+separate commit. `BASELINE.md` freezes the pre-change snapshot (tree/test
+identity, call graphs, stratum hierarchy, qualification semantics, TCB
+inventory).
+
+- **Causal probability propagation corrected**: `CausalChoicePolicy.proposal`
+  previously reconstructed a candidate's implied success probability as
+  `0.5 + expected_delta` — an assumed control rate (0.80 + 0.10 reported as
+  0.60, not 0.90). `TrialChoiceModel.rank` now propagates `control_p`,
+  `p_progress`, `uncertainty`, and `delta_ci` derived at the estimation
+  layer as `clamp(control_p + delta, 0, 1)`; a supported contrast without a
+  valid finite control arm yields `p_progress: null` rather than a
+  fabricated number, and observational/causal probabilities stay named and
+  separate on the proposal.
+- **Active causal authority is stratum-gated**: `active` mode now requires
+  established randomized evidence from a context-specific stratum —
+  `family+site`, `site`, or `family` (`active_trial_levels`, validated
+  against known levels at construction). Pooled randomized evidence remains
+  a hypothesis/nomination channel: it annotates in `shadow` and may nominate
+  a randomized `canary`, but can never mark a proposal `executable`. Entries
+  carry `execution_blocker` naming the failed condition
+  (`no_causal_evidence`, `insufficient_support`, `unresolved`,
+  `below_effect_threshold`, `missing_probability`, `pooled_only`,
+  `unsupported_stratum`, `harmful`), and established-harmful divergences are
+  refused canary nomination rather than consuming real trials.
+- **Release qualification is cryptographically closed**: `jev-qualify/3`
+  reports separate `validation_status` (did the stages pass) from
+  `provenance_status` (`unsigned`/`verified`/`failed`, read off the actual
+  Q0 signature-gate verdict — never file existence) and `release_qualified`.
+  A bounded run always reports `release_qualified: false` (`bounded_mode`);
+  `--full` requires a verified `MANIFEST.sig` under pinned keys, every
+  required check run and passed (a skip is absence, not evidence), the
+  report itself signed, and the signature verifying under a pinned accepted
+  key — each failure lands in `release_blockers` and exits non-zero. The
+  signature binds the canonical report including the release verdict, so
+  post-signing mutation invalidates verification.
+
 ## Deployment gate
 
 Before production activation:
