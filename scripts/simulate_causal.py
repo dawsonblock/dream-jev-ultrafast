@@ -71,7 +71,7 @@ def _cp_upper(x: int, n: int, *, conf: float = 0.95) -> float:
     return (lo + hi) / 2.0
 
 
-def trial_events(run_id, arm, *, success, propensity, rng, base):
+def trial_events(run_id, arm, *, success, propensity):
     """One randomized trial as run_started + experiment_assigned + transition +
     run_finished, shaped exactly like the agent records it."""
     meta = {
@@ -109,24 +109,22 @@ def trial_events(run_id, arm, *, success, propensity, rng, base):
 
 def simulate_sequence(rng, *, n_per_arm, delta, base, propensity,
                       censor_candidate=0.0, censor_control=0.0):
-    """One experiment sequence: n_per_arm assigned to each arm under a known
-    true delta (candidate arm success = base + delta). ``censor_*`` are
-    per-arm probabilities that a run ends ``aborted`` — measured-outcome
-    censoring, the missing-data stress."""
+    """One randomized sequence with 2*n_per_arm units and known assignment
+    probability. The arm counts are binomial, not fixed: forcing equal counts
+    would condition on assignment and misrepresent extreme propensities.
+    ``censor_*`` are per-arm probabilities that a run ends ``aborted``."""
     events = []
-    for i in range(n_per_arm):
-        events += trial_events(f"c{i}", "candidate",
-                               success=rng.random() < base + delta,
-                               propensity=propensity, rng=rng, base=base)
-        if rng.random() < censor_candidate:
-            events[-1] = {"event": "run_finished", "run_id": f"c{i}",
-                          "task_key": "t", "status": "aborted",
-                          "reason": "operator_cancel"}
-        events += trial_events(f"k{i}", "control",
-                               success=rng.random() < base,
-                               propensity=1.0 - propensity, rng=rng, base=base)
-        if rng.random() < censor_control:
-            events[-1] = {"event": "run_finished", "run_id": f"k{i}",
+    for i in range(2 * n_per_arm):
+        arm = "candidate" if rng.random() < propensity else "control"
+        run_id = f"r{i}"
+        arm_success = base + delta if arm == "candidate" else base
+        events += trial_events(
+            run_id, arm, success=rng.random() < arm_success,
+            propensity=propensity,
+        )
+        censor_probability = censor_candidate if arm == "candidate" else censor_control
+        if rng.random() < censor_probability:
+            events[-1] = {"event": "run_finished", "run_id": run_id,
                           "task_key": "t", "status": "aborted",
                           "reason": "operator_cancel"}
     return events
@@ -176,7 +174,7 @@ def multiplicity_probe(sequences, *, divergences, n_per_arm, base, seed):
                     meta_events = trial_events(
                         f"s{seq}d{d}{'c' if arm == 'candidate' else 'k'}{i}", arm,
                         success=rng.random() < p_succ,
-                        propensity=0.5, rng=rng, base=base)
+                        propensity=0.5)
                     for event in meta_events:
                         # The stratum lives on the experiment meta — the
                         # assignment record's task_family is what cells key on.
@@ -283,12 +281,12 @@ def main() -> int:
                      and _err_upper(c["beneficial"], n) <= alpha,
                      (c["harmful"] / n, _err_upper(c["beneficial"], n))),
                  n_per_arm=300, delta=-0.30, base=0.8, propensity=0.5)
-    run_scenario("IPW  +0.30  n=300  p=0.10", seqs=p_seqs,
+    run_scenario("IPW  +0.30  n=3000  p=0.10", seqs=p_seqs,
                  expect="power >= 0.50 under extreme weights",
                  bound_desc="beneficial >= 0.50",
                  verdict=lambda c, n: (c["beneficial"] / n >= 0.50,
                                        c["beneficial"] / n),
-                 n_per_arm=300, delta=0.30, base=0.5, propensity=0.10)
+                 n_per_arm=3000, delta=0.30, base=0.5, propensity=0.10)
 
     print("G4 — censoring")
     run_scenario("informative censor 40/0  null  n=100", seqs=p_seqs,

@@ -1259,9 +1259,9 @@ class CounterfactualTrials:
             # interval is for reporting, not for deciding that an experiment
             # is settled after being peeked at every batch. The sequence is
             # epoch-stitched (see ``_arm_cs_bounds``): the family's alpha is
-            # spent k^-3/2 over epochs 2^{k-1} <= n < 2^k rather than over
-            # integer looks, so tau grows like ln log n — late evidence
-            # stays decisive instead of being priced out of the budget.
+            # spent k^-3/2 over epochs 2^{k-1} <= Σw² < 2^k rather than over
+            # integer looks, so tau grows like ln log Σw² — late evidence
+            # stays decisive without retrospectively rescaling IPW weights.
             cand_lo, cand_hi = _arm_cs_bounds(
                 candidate["trials"], _arm_wsum(bucket["candidate"]),
                 _arm_wsq(bucket["candidate"]), _arm_ws(bucket["candidate"]),
@@ -1273,8 +1273,10 @@ class CounterfactualTrials:
                 family_alpha=family_alpha,
             )
             entry["sequential_alpha"] = _epoch_alpha(
-                max(_epoch_index(candidate["trials"]),
-                    _epoch_index(control["trials"])),
+                max(
+                    _epoch_index(_arm_wsq(bucket["candidate"])),
+                    _epoch_index(_arm_wsq(bucket["control"])),
+                ),
                 base=family_alpha)
             entry["delta_cs"] = [cand_lo - ctrl_hi, cand_hi - ctrl_lo]
         else:
