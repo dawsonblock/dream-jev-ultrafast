@@ -112,7 +112,7 @@ def _kl_bound(p_hat: float, n: int, tau: float, *, upper: bool) -> float:
 
 
 def _epoch_index(n: float) -> int:
-    """Stitching epoch of sample size ``n``: the k with ``2^{k-1} <= n < 2^k``."""
+    """Stitching epoch of intrinsic time ``n``: ``2^{k-1} <= n < 2^k``."""
     return max(1, int(math.log2(max(1.0, float(n)))) + 1)
 
 
@@ -131,11 +131,15 @@ def _arm_cs_bounds(
     ``E[e^{λ·w·(Y−p)}] <= e^{λ²w²/8}`` for any fixed ``λ``: the process
     ``exp(λS_n − λ²·W2_n/8)`` is a nonnegative supermartingale and Ville's
     inequality makes the *linear* boundary ``λ·W2_n/8 + τ/λ`` hold
-    simultaneously for every ``n`` at probability ``e^{−τ}``. Spending a
-    summable ``k^{−3/2}/ζ(3/2)`` budget over epochs ``[2^{k−1}, 2^k)`` —
-    each epoch's ``λ`` tuned at its start — covers all looks, both arms and
+    simultaneously for every ``n`` at probability ``e^{−τ}``. Epochs are
+    indexed by the predictable quadratic variation ``W2_n = Σw²`` rather
+    than the observation count. Spending a summable
+    ``k^{−3/2}/ζ(3/2)`` budget over epochs ``[2^{k−1}, 2^k)`` — each epoch's
+    ``λ`` tuned at its deterministic start — covers all looks, both arms and
     both tails under ``family_alpha``:
-    ``τ_k = ln(4·ζ(3/2)·k^{3/2}/family_alpha)``.
+    ``τ_k = ln(4·ζ(3/2)·k^{3/2}/family_alpha)``. Since inverse-propensity
+    weights are known before each outcome, this remains valid for varying
+    propensities without retrospectively rescaling past increments.
 
     Spending alpha per *epoch* rather than per integer look is what rescues
     statistical power: the per-look spend drove ``τ ~ 1.5·ln n``, while
@@ -146,17 +150,7 @@ def _arm_cs_bounds(
     """
     if analyzed <= 0 or wsum <= 0:
         return 0.0, 1.0
-    # Weight scale is free: p_hat = ws/wsum is invariant under w -> w/c, so
-    # normalize the fixed IPW weights to unit mean before applying the
-    # bound. An IPW arm at propensity 0.25 carries w = 4 everywhere —
-    # without normalization the martingale pays for that scale as if the
-    # weights carried real dispersion. (Normalization is a deterministic
-    # property of the recorded weight vector, not a data-adaptive choice.)
-    scale = wsum / analyzed
-    wsum = float(analyzed)
-    wsq = wsq / (scale * scale)
-    ws = ws / scale
-    k = _epoch_index(analyzed)
+    k = _epoch_index(wsq)
     alpha = _epoch_alpha(k, base=family_alpha)
     tau = math.log(4.0 / alpha) if alpha > 0 else math.inf
     lam = math.sqrt(8.0 * tau / (2.0 ** (k - 1)))

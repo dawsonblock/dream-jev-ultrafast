@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from .common import _stable_hash
+import hashlib
+import hmac
+import os
 
 __all__ = [
     'TERMINATION_REASONS',
@@ -263,7 +265,7 @@ def _ctx_semantics(ctx) -> str:
 
 
 def action_key(kind=None, effect=None, role=None, label=None, *,
-               site=None, ctx=None) -> str | None:
+               site=None, ctx=None, secret: bytes | str | None = None) -> str | None:
     """Stable semantic identity of one concrete action, across runs.
 
     Treatment-signature coordinates answer "was an action of this *class*
@@ -271,20 +273,33 @@ def action_key(kind=None, effect=None, role=None, label=None, *,
     *this exact action* randomized?" — the distinction between an established
     class effect and treatment-class exchangeability assumed for a
     never-randomized control. The key binds site, operation kind, effect
-    class, element role, the action's authority-semantics context, and the
-    action's label digested *before* privacy redaction: two controls whose
-    labels redact to the same placeholder (``alice@…`` / ``bob@…`` →
-    ``[email]``) or that share redacted text under different semantics are
-    still different keys. The raw label is normalized and hashed locally —
-    only the digest ever leaves the process, never the text — and an action
-    with no readable identity at all returns ``None``, never a fabricated
-    identity.
+    class, element role, the action's authority-semantics context, and an
+    HMAC of the normalized label. The label digest is keyed so low-entropy
+    labels cannot be dictionary-guessed from stored evidence. A persistent
+    32-byte secret is required (``JEV_ACTION_KEY`` as 64 hex characters, or
+    the explicit ``secret`` argument); without one, or without a readable
+    label, this returns ``None`` rather than creating a guessable identity.
     """
     if label is None or not str(label).strip():
         return None
     text = " ".join(str(label).split()).lower()
     if not text:
         return None
+    if secret is None:
+        configured = os.environ.get("JEV_ACTION_KEY")
+        if not configured:
+            return None
+        try:
+            secret = bytes.fromhex(configured)
+        except ValueError as exc:
+            raise ValueError("JEV_ACTION_KEY must be a 64-character hexadecimal secret") from exc
+    elif isinstance(secret, str):
+        try:
+            secret = bytes.fromhex(secret)
+        except ValueError as exc:
+            raise ValueError("action_key secret must be a hexadecimal secret") from exc
+    if len(secret) != 32:
+        raise ValueError("action_key secret must be exactly 32 bytes")
     components = (
         _coord(str(site or "unknown").lower()),
         str(kind or "unknown").replace("|", " ") or "unknown",
@@ -293,7 +308,8 @@ def action_key(kind=None, effect=None, role=None, label=None, *,
         text,
         _ctx_semantics(ctx),
     )
-    return _stable_hash("|".join(components))
+    message = b"jev/action-key/v1:" + "|".join(components).encode("utf-8")
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
 
 
 _SIGNATURE_DROP_FIELDS = (

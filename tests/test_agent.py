@@ -1570,6 +1570,7 @@ def test_causal_policy_active_override_is_recorded_and_canary_excluded(runner, t
     from jev_ultrafast.dreamlearn import CausalChoicePolicy, TrialChoiceModel
     from jev_ultrafast.trace import DreamTraceRecorder
 
+    monkeypatch.setenv("JEV_ACTION_KEY", bytes(range(32)).hex())
     store = ExperienceStore(tmp_path / "exp.jsonl")
     runner.dream_recorder = DreamTraceRecorder(store, goal="Find a book")
     runner.dream_recorder.start(runner.state["page"], ExplorationPolicy())

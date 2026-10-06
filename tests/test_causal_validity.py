@@ -150,6 +150,11 @@ def _cell(events, *, family="", site=""):
     raise AssertionError(f"no cell for family={family!r} site={site!r}")
 
 
+@pytest.fixture(autouse=True)
+def _action_key_secret(monkeypatch):
+    monkeypatch.setenv("JEV_ACTION_KEY", bytes(range(32)).hex())
+
+
 # ------------------------------------------- support vs. effect certainty
 
 
@@ -1740,6 +1745,68 @@ def test_active_executes_on_family_and_site_strata():
     site_entry = _active_entry(site_policy, site="h")
     assert site_entry["causal"]["trial_level"] == "site"
     assert site_entry["executable"] is True
+
+
+def test_action_keys_require_and_use_a_keyed_secret(monkeypatch):
+    from jev_ultrafast.dreamlearn import action_key
+
+    monkeypatch.delenv("JEV_ACTION_KEY")
+    assert action_key(kind="click", label="Checkout") is None
+    first = action_key(kind="click", label="Checkout", secret=bytes(range(32)))
+    second = action_key(kind="click", label="Checkout", secret=bytes(range(1, 33)))
+    assert first is not None
+    assert first != second
+
+
+def test_confidence_sequence_uses_unscaled_weight_quadratic_variation():
+    import math
+
+    from jev_ultrafast._learning.confidence import (
+        _arm_cs_bounds,
+        _epoch_alpha,
+        _epoch_index,
+    )
+
+    analyzed, wsum, wsq, ws = 8, 12.0, 20.0, 9.0
+    family_alpha = 0.05
+    k = _epoch_index(wsq)
+    tau = math.log(4.0 / _epoch_alpha(k, base=family_alpha))
+    lam = math.sqrt(8.0 * tau / (2.0 ** (k - 1)))
+    radius = (lam * wsq / 8.0 + tau / lam) / wsum
+    expected = (max(0.0, ws / wsum - radius), min(1.0, ws / wsum + radius))
+
+    assert _arm_cs_bounds(
+        analyzed, wsum, wsq, ws, family_alpha=family_alpha
+    ) == pytest.approx(expected)
+
+
+def test_causal_simulation_samples_arms_at_the_configured_propensity():
+    import random
+
+    from scripts.simulate_causal import simulate_sequence
+
+    propensity = 0.25
+    events = simulate_sequence(
+        random.Random(1234),
+        n_per_arm=2000,
+        delta=0.1,
+        base=0.5,
+        propensity=propensity,
+    )
+    assignments = [
+        event["experiment"]
+        for event in events
+        if event.get("event") == "experiment_assigned"
+    ]
+    candidate_count = sum(meta["arm"] == "candidate" for meta in assignments)
+
+    assert len(assignments) == 4000
+    assert 900 <= candidate_count <= 1100
+    assert all(
+        meta["assignment_probability"]
+        == (propensity if meta["arm"] == "candidate" else 1.0 - propensity)
+        for meta in assignments
+    )
 
 
 def test_active_never_executes_on_pooled_evidence():
